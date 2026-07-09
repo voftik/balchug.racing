@@ -13,7 +13,8 @@
    Любая ошибка LLM не блокирует пайплайн — остаётся слой 1.
 
 Окружение: LLM_API_KEY, LLM_MODEL (деф. google/gemini-3.5-flash),
-           LLM_BASE_URL (деф. https://openrouter.ai/api/v1).
+           LLM_BASE_URL (деф. https://openrouter.ai/api/v1),
+           LLM_PROXY (опц. http(s)-прокси, если провайдер блокирует IP сервера).
 
 Использование:
     import annotator
@@ -58,17 +59,18 @@ def find_event(date_str):
 
 
 def guess_session_type(ev, date_str, start_hms, duration_sec):
-    if duration_sec and duration_sec >= RACE_MIN_SEC:
-        return "Гонка"
     if not ev:
         return "Трансляция"
     if date_str < ev["race_date"]:
-        return "Тренировка"
+        return "Тренировка"          # тренировочные/квалификационные дни до гонки
+    # день гонки
+    if duration_sec and duration_sec >= RACE_MIN_SEC:
+        return "Гонка"
     try:
         hour = int(start_hms.split(":")[0])
     except Exception:
         hour = 12
-    if date_str == ev["race_date"] and hour < 12:
+    if hour < 12:
         return "Квалификация"
     return "Трансляция"
 
@@ -179,7 +181,14 @@ def _llm_refine(ev, date_str, start_hms, duration_sec, stype_guess, video_path, 
             "HTTP-Referer": "https://balchug.racing",
             "X-Title": "Balchug Racing Annotator",
         })
-    with urllib.request.urlopen(req, timeout=180) as resp:
+    proxy = os.environ.get("LLM_PROXY", "").strip()
+    if proxy:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        resp_ctx = opener.open(req, timeout=180)
+    else:
+        resp_ctx = urllib.request.urlopen(req, timeout=180)
+    with resp_ctx as resp:
         data = json.loads(resp.read().decode("utf-8"))
     txt = data["choices"][0]["message"]["content"] or ""
     m = re.search(r"\{.*\}", txt, re.S)
