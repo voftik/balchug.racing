@@ -1,0 +1,599 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>BALCHUG Racing — Onboard Live</title>
+<meta name="theme-color" content="#1B365D" />
+<link rel="icon" type="image/png" href="/assets/favicon.png" />
+<link rel="preload" href="/assets/russoone-cyrillic.woff2" as="font" type="font/woff2" crossorigin />
+<link rel="preload" href="/assets/russoone-latin.woff2" as="font" type="font/woff2" crossorigin />
+<style>
+  /* ===== Фирменный шрифт (self-hosted) ===== */
+  @font-face { font-family:'Russo One'; font-style:normal; font-weight:400; font-display:swap;
+    src:url('/assets/russoone-cyrillic.woff2') format('woff2');
+    unicode-range:U+0301,U+0400-045F,U+0490-0491,U+04B0-04B1,U+2116; }
+  @font-face { font-family:'Russo One'; font-style:normal; font-weight:400; font-display:swap;
+    src:url('/assets/russoone-latin-ext.woff2') format('woff2');
+    unicode-range:U+0100-02BA,U+1E00-1EFF,U+2020,U+20A0-20AB,U+2C60-2C7F,U+A720-A7FF; }
+  @font-face { font-family:'Russo One'; font-style:normal; font-weight:400; font-display:swap;
+    src:url('/assets/russoone-latin.woff2') format('woff2');
+    unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+2000-206F,U+20AC,U+2122,U+2212; }
+
+  :root {
+    --navy:#1B365D; --navy-2:#122846; --navy-3:#0c1c33; --red:#F0143D; --red-2:#ff2d52;
+    --white:#fff; --paper:#FAFBFC; --line:#E4E9F0; --muted:#6E7E98; --muted-2:#B5BFCD; --ok:#28d17c;
+    --display:'Russo One','Arial Narrow',Arial,sans-serif;
+    --body:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;
+  }
+  *{box-sizing:border-box;} html,body{height:100%;margin:0;}
+  body{font-family:var(--body);color:var(--navy);background:var(--paper);min-height:100%;
+    display:flex;flex-direction:column;-webkit-font-smoothing:antialiased;
+    background-image:
+      radial-gradient(900px 500px at 88% -10%,rgba(240,20,61,.06),transparent 60%),
+      radial-gradient(900px 600px at 0% 0%,rgba(27,54,93,.06),transparent 55%),
+      repeating-linear-gradient(115deg,rgba(27,54,93,.022) 0 2px,transparent 2px 26px);}
+  .wrap{width:100%;max-width:1280px;margin:0 auto;padding:0 22px;}
+  .display{font-family:var(--display);letter-spacing:.04em;text-transform:uppercase;}
+
+  /* Header */
+  header{border-bottom:1px solid var(--line);background:rgba(255,255,255,.86);
+    backdrop-filter:saturate(1.2) blur(8px);position:sticky;top:0;z-index:20;}
+  .head-inner{display:flex;align-items:center;gap:18px;padding:16px 0;}
+  .brand{display:flex;align-items:center;gap:14px;min-width:0;}
+  .brand img{height:26px;width:auto;display:block;}
+  .brand .sep{width:1px;height:26px;background:var(--line);}
+  .brand .kicker{font-family:var(--display);font-size:12px;letter-spacing:.18em;text-transform:uppercase;
+    color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .brand .kicker b{color:var(--red);}
+  .brand{text-decoration:none;}
+  .head-inner{flex-wrap:wrap;}
+  .nav{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
+  .nav a{font-family:var(--display);text-transform:uppercase;letter-spacing:.07em;font-size:11.5px;
+    color:var(--navy);text-decoration:none;padding:8px 12px;border-radius:6px;border:1px solid transparent;transition:.15s;white-space:nowrap;}
+  .nav a:hover{background:#eef1f6;border-color:var(--line);}
+  .nav a.active{background:var(--navy);color:#fff;}
+  .fnav{display:flex;gap:14px;flex-wrap:wrap;}
+  .fnav a{font-size:12.5px;color:var(--muted);text-decoration:none;}
+  .fnav a:hover{color:var(--red);}
+  .head-right{margin-left:auto;display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end;}
+  .head-right .live-pill{margin-left:0;}
+  .vchip{display:inline-flex;align-items:center;gap:6px;font-family:var(--display);
+    font-size:12.5px;letter-spacing:.05em;padding:8px 12px;border-radius:4px;border:1px solid var(--line);
+    background:var(--white);color:var(--muted);white-space:nowrap;}
+  .vchip b{color:var(--navy);font-weight:700;}
+  .live-pill{margin-left:auto;display:inline-flex;align-items:center;gap:9px;font-family:var(--display);
+    font-size:12.5px;letter-spacing:.12em;text-transform:uppercase;padding:8px 14px;border-radius:4px;
+    border:1px solid var(--line);background:var(--white);color:var(--muted);transition:.25s;}
+  .live-pill .dot{width:9px;height:9px;border-radius:50%;background:var(--muted-2);}
+  .live-pill.live{color:#fff;background:var(--red);border-color:var(--red);}
+  .live-pill.live .dot{background:#fff;box-shadow:0 0 0 0 rgba(255,255,255,.7);animation:pulse 1.4s infinite;}
+  .live-pill.connecting{color:var(--navy);border-color:var(--navy);}
+  .live-pill.connecting .dot{background:var(--red);animation:blink 1s steps(2) infinite;}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(255,255,255,.7);}70%{box-shadow:0 0 0 7px rgba(255,255,255,0);}100%{box-shadow:0 0 0 0 rgba(255,255,255,0);}}
+  @keyframes blink{50%{opacity:.25;}}
+
+  /* Title */
+  main{flex:1;padding:26px 0 40px;}
+  .titlebar{display:flex;align-items:baseline;gap:16px;margin-bottom:18px;flex-wrap:wrap;}
+  .titlebar h1{font-family:var(--display);text-transform:uppercase;letter-spacing:.03em;
+    font-size:clamp(24px,4vw,40px);line-height:.98;margin:0;color:var(--navy);position:relative;padding-left:18px;}
+  .titlebar h1::before{content:"";position:absolute;left:0;top:6%;bottom:6%;width:6px;background:var(--red);transform:skewX(-12deg);}
+  .titlebar .sub{font-family:var(--display);font-size:12.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);}
+
+  /* Layout: video + right panel */
+  .stage-grid{display:grid;grid-template-columns:minmax(0,1fr) 330px;gap:18px;align-items:start;}
+  @media (max-width:980px){ .stage-grid{grid-template-columns:1fr;} }
+  /* На широком экране: видео-панель тянется по высоте правых карточек (выравнивание низа) */
+  @media (min-width:981px){
+    .stage-grid{align-items:stretch;}
+    .video-col{display:flex;}
+    .video-col .stage{display:flex;flex-direction:column;width:100%;}
+    .video-col .video-wrap{flex:1;aspect-ratio:auto;min-height:0;}
+    .video-col video{object-fit:contain;}
+    .panel{height:100%;}
+  }
+
+  /* Video stage */
+  .stage{background:var(--navy);border-radius:10px;overflow:hidden;border:1px solid var(--navy-2);
+    box-shadow:0 30px 70px -28px rgba(27,54,93,.55);position:relative;}
+  .stage::before{content:"";position:absolute;top:0;left:0;right:0;height:4px;z-index:5;
+    background:linear-gradient(90deg,var(--red) 0 38%,var(--navy-3) 38% 40%,var(--red) 40% 44%,transparent 44%);}
+  .video-wrap{position:relative;width:100%;aspect-ratio:16/9;background:#05080d;}
+  video{width:100%;height:100%;display:block;background:#05080d;}
+  .corner{position:absolute;z-index:4;pointer-events:none;font-family:var(--display);
+    font-size:10.5px;letter-spacing:.16em;color:rgba(255,255,255,.55);}
+  .corner.tl{top:14px;left:16px;} .corner.tr{top:14px;right:16px;color:rgba(240,20,61,.9);}
+  .corner.tl::before{content:"";display:inline-block;width:18px;height:1px;background:rgba(255,255,255,.4);vertical-align:middle;margin-right:8px;}
+
+  .overlay{position:absolute;inset:0;z-index:3;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    gap:16px;text-align:center;padding:24px;transition:opacity .35s;
+    background:radial-gradient(700px 360px at 50% 45%,rgba(27,54,93,.35),rgba(5,8,13,.92));}
+  .overlay.hidden{opacity:0;pointer-events:none;}
+  .gauge{width:46px;height:46px;border-radius:50%;border:3px solid rgba(255,255,255,.14);border-top-color:var(--red);animation:spin .9s linear infinite;}
+  @keyframes spin{to{transform:rotate(360deg);}}
+  .overlay h2{margin:0;font-family:var(--display);text-transform:uppercase;letter-spacing:.06em;font-size:18px;color:#fff;}
+  .overlay p{margin:0;max-width:440px;color:rgba(255,255,255,.62);font-size:13.5px;line-height:1.55;}
+  /* progress bar для пребуфера */
+  .pbar{width:230px;max-width:70%;height:6px;border-radius:999px;background:rgba(255,255,255,.14);overflow:hidden;}
+  .pbar > i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--red),var(--red-2));transition:width .25s;}
+
+  /* Transport bar под видео */
+  .controls{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:var(--navy-2);
+    border-top:1px solid rgba(255,255,255,.06);padding:12px 14px;}
+  button{appearance:none;cursor:pointer;font-family:var(--display);text-transform:uppercase;letter-spacing:.08em;
+    font-size:12px;display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:0 15px;height:38px;border-radius:5px;
+    border:1px solid rgba(255,255,255,.16);background:rgba(255,255,255,.05);color:#fff;transition:.16s;}
+  button:hover{border-color:rgba(255,255,255,.4);background:rgba(255,255,255,.1);}
+  button:disabled{opacity:.4;cursor:not-allowed;}
+  button:disabled:hover{border-color:rgba(255,255,255,.16);background:rgba(255,255,255,.05);}
+  button.primary{background:var(--red);border-color:var(--red);}
+  button.primary:hover{background:var(--red-2);border-color:var(--red-2);}
+  .controls .spacer{margin-left:auto;}
+
+  /* Right panel */
+  .panel{display:flex;flex-direction:column;gap:14px;padding-bottom:5px;}
+  .card{background:var(--navy-2);border:1px solid rgba(255,255,255,.06);border-radius:10px;padding:15px 15px 16px;color:#fff;}
+  .card h3{margin:0 0 13px;font-family:var(--display);text-transform:uppercase;letter-spacing:.12em;font-size:12px;
+    color:#fff;display:flex;align-items:center;gap:9px;}
+  .card h3 .ic{width:7px;height:14px;background:var(--red);transform:skewX(-12deg);display:inline-block;border-radius:1px;}
+
+  /* Buffer card */
+  .buf-top{display:flex;align-items:center;gap:10px;margin-bottom:11px;}
+  .buf-badge{font-family:var(--display);text-transform:uppercase;letter-spacing:.1em;font-size:9.5px;padding:4px 9px;
+    border-radius:999px;color:#06121f;background:#ffd23f;transition:.25s;}
+  .buf-badge.low{background:var(--red);color:#fff;} .buf-badge.high{background:var(--ok);color:#06121f;}
+  .buf-val{margin-left:auto;font-family:var(--display);color:#fff;font-size:21px;line-height:1;}
+  .buf-val i{font-style:normal;font-size:10px;color:var(--muted-2);margin-left:4px;letter-spacing:.12em;text-transform:uppercase;}
+  .buffer-range{-webkit-appearance:none;appearance:none;width:100%;height:9px;border-radius:999px;outline:none;cursor:pointer;margin:0;
+    background:linear-gradient(90deg,#F0143D 0%,#FF855D 32%,#ffd23f 58%,#28d17c 100%);box-shadow:inset 0 0 0 1px rgba(255,255,255,.14);}
+  .buffer-range::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:24px;height:24px;border-radius:50%;
+    background:#fff;border:3px solid var(--navy);box-shadow:0 2px 9px rgba(0,0,0,.5),0 0 0 1px rgba(255,255,255,.45);cursor:grab;transition:transform .12s;}
+  .buffer-range::-webkit-slider-thumb:active{transform:scale(1.14);cursor:grabbing;}
+  .buffer-range::-moz-range-thumb{width:22px;height:22px;border-radius:50%;background:#fff;border:3px solid var(--navy);box-shadow:0 2px 9px rgba(0,0,0,.5);cursor:grab;}
+  .buffer-range:disabled{opacity:.55;cursor:not-allowed;}
+  .buf-ends{display:flex;justify-content:space-between;align-items:flex-start;margin-top:9px;gap:10px;}
+  .buf-ends .end{display:flex;flex-direction:column;font-family:var(--display);text-transform:uppercase;letter-spacing:.05em;font-size:10px;}
+  .buf-ends .end small{font-family:var(--body);text-transform:none;letter-spacing:0;font-size:10px;color:var(--muted-2);margin-top:2px;}
+  .buf-ends .end.low{color:#ff5a78;align-items:flex-start;} .buf-ends .end.high{color:#5fe3a0;align-items:flex-end;text-align:right;}
+  .buf-hint{margin:11px 0 0;color:var(--muted-2);font-size:11.5px;line-height:1.55;}
+  .buf-hint b{color:#fff;}
+
+  /* Auto switch */
+  .switch-row{display:flex;align-items:center;gap:11px;margin-top:14px;padding-top:13px;border-top:1px solid rgba(255,255,255,.08);}
+  .switch{position:relative;width:44px;height:24px;flex:none;}
+  .switch input{opacity:0;width:0;height:0;position:absolute;}
+  .switch .track{position:absolute;inset:0;background:rgba(255,255,255,.16);border-radius:999px;transition:.2s;}
+  .switch .track::before{content:"";position:absolute;width:18px;height:18px;border-radius:50%;background:#fff;left:3px;top:3px;transition:.2s;}
+  .switch input:checked + .track{background:var(--ok);}
+  .switch input:checked + .track::before{transform:translateX(20px);}
+  .switch-row .lbl{font-family:var(--display);text-transform:uppercase;letter-spacing:.08em;font-size:11px;}
+  .switch-row .lbl small{display:block;font-family:var(--body);text-transform:none;letter-spacing:0;color:var(--muted-2);font-size:10.5px;margin-top:2px;}
+
+  /* Quality selector */
+  .qrow{display:flex;gap:7px;flex-wrap:wrap;}
+  .qbtn{flex:1 1 auto;min-width:58px;height:34px;padding:0;font-size:11.5px;}
+  .qbtn.active{background:var(--red);border-color:var(--red);color:#fff;}
+  .qnote{margin:10px 0 0;color:var(--muted-2);font-size:11px;}
+  .qnote b{color:#fff;}
+
+  /* Telemetry */
+  .tele{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:rgba(255,255,255,.08);border-radius:7px;overflow:hidden;}
+  .tcell{background:var(--navy-2);padding:9px 11px;}
+  .tcell .k{font-family:var(--display);font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted-2);}
+  .tcell .v{font-family:var(--display);font-size:15px;color:#fff;margin-top:3px;}
+  .tcell .v.red{color:var(--red-2);} .tcell .v.ok{color:#5fe3a0;}
+
+  /* Footer */
+  footer{border-top:1px solid var(--line);background:var(--white);}
+  .foot-inner{display:flex;align-items:center;gap:14px;padding:18px 0;flex-wrap:wrap;}
+  .foot-inner .fbrand{font-family:var(--display);text-transform:uppercase;letter-spacing:.12em;font-size:12.5px;color:var(--navy);}
+  .foot-inner .fbrand b{color:var(--red);}
+  .foot-inner .fmeta{margin-left:auto;color:var(--muted);font-size:12px;}
+  .foot-inner a{color:var(--navy);text-decoration:none;border-bottom:1px solid var(--line);}
+  .foot-inner a:hover{color:var(--red);border-color:var(--red);}
+
+  .reveal{opacity:0;transform:translateY(10px);animation:rise .6s cubic-bezier(.2,.7,.2,1) forwards;}
+  .d1{animation-delay:.05s;} .d2{animation-delay:.14s;} .d3{animation-delay:.22s;}
+  @keyframes rise{to{opacity:1;transform:none;}}
+  @media (prefers-reduced-motion:reduce){.reveal{animation:none;opacity:1;transform:none;}}
+  @media (max-width:620px){ .brand .kicker{display:none;} }
+</style>
+</head>
+<body>
+  <header>
+    <div class="wrap head-inner">
+      <a class="brand" href="/">
+        <img src="/assets/logo.svg" alt="BALCHUG Racing" />
+        <span class="sep"></span>
+        <span class="kicker">Onboard&nbsp;<b>//</b>&nbsp;Live</span>
+      </a>
+      <nav class="nav">
+        <a href="/" class="active">Онборд</a>
+        <a href="/telemetry/">Телеметрия трассы</a>
+        <a href="/smp-races/">Гонки SMP</a>
+        <a href="/smp-live/">Live сезона</a>
+        <a href="/weather/">Радар осадков</a>
+        <a href="/archive/">Архив</a>
+      </nav>
+      <div class="head-right">
+        <div id="pill" class="live-pill"><span class="dot"></span><span id="pillText">Подключение</span></div>
+        <div id="viewers" class="vchip" title="Сейчас смотрят трансляцию">👁 <b id="vcount">—</b></div>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div class="wrap">
+      <div class="titlebar">
+        <h1 class="reveal d1">Бортовая камера</h1>
+        <span class="sub reveal d1">Прямая трансляция из&nbsp;болида</span>
+      </div>
+
+      <div class="stage-grid">
+        <!-- Видео -->
+        <div class="video-col reveal d2">
+          <div class="stage">
+            <div class="video-wrap">
+              <video id="video" playsinline controls></video>
+              <span class="corner tl display">CAM&nbsp;01 · ONBOARD</span>
+              <span class="corner tr display" id="recDot">● REC</span>
+              <div id="overlay" class="overlay">
+                <div class="gauge" id="gauge"></div>
+                <h2 id="ovTitle">Ожидание сигнала</h2>
+                <p id="ovText">Как только болид выйдет в эфир, видео появится здесь автоматически.</p>
+                <div class="pbar" id="pbarWrap" style="display:none"><i id="pbar"></i></div>
+              </div>
+            </div>
+            <div class="controls">
+              <button id="liveBtn" class="primary" title="Догнать прямой эфир">▶ В прямой эфир</button>
+              <button id="muteBtn" title="Звук">Звук: выкл</button>
+              <button id="fsBtn" class="spacer" title="Полный экран">⛶ Во весь экран</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Правая панель -->
+        <aside class="panel reveal d3">
+          <!-- Буфер -->
+          <div class="card">
+            <h3><span class="ic"></span> Стабильность</h3>
+            <div class="buf-top">
+              <span class="buf-badge" id="bufBadge">Баланс</span>
+              <span class="buf-val"><span id="bufVal">30</span><i>сек</i></span>
+            </div>
+            <input type="range" id="bufRange" class="buffer-range" min="5" max="50" step="1" value="30"
+                   aria-label="Буфер: меньше задержка или больше стабильность" />
+            <div class="buf-ends">
+              <span class="end low">⚡ Меньше<small>задержки</small></span>
+              <span class="end high">Стабильнее 🛡<small>к рывкам</small></span>
+            </div>
+            <p class="buf-hint" id="bufHint">
+              Плеер отстаёт от&nbsp;эфира на&nbsp;<b>30&nbsp;сек</b>. Больше буфер&nbsp;— реже фризы, выше задержка.
+            </p>
+            <div class="switch-row">
+              <label class="switch"><input type="checkbox" id="autoChk" /><span class="track"></span></label>
+              <span class="lbl">Авто-режим<small id="autoNote">подстраивает буфер при фризах</small></span>
+            </div>
+          </div>
+
+          <!-- Качество -->
+          <div class="card">
+            <h3><span class="ic"></span> Качество</h3>
+            <div class="qrow" id="qrow"><button class="qbtn active" data-lvl="-1">Авто</button></div>
+            <p class="qnote" id="qnote">Сейчас: <b id="qcur">—</b></p>
+          </div>
+
+          <!-- Телеметрия -->
+          <div class="card">
+            <h3><span class="ic"></span> Телеметрия</h3>
+            <div class="tele">
+              <div class="tcell"><div class="k">Задержка (факт)</div><div class="v red" id="tLat">—</div></div>
+              <div class="tcell"><div class="k">Буфер впереди</div><div class="v" id="tBuf">—</div></div>
+              <div class="tcell"><div class="k">Канал</div><div class="v" id="tBw">—</div></div>
+              <div class="tcell"><div class="k">Качество</div><div class="v" id="tQ">—</div></div>
+              <div class="tcell"><div class="k">Фризов</div><div class="v" id="tStall">0</div></div>
+              <div class="tcell"><div class="k">Статус</div><div class="v ok" id="tState">—</div></div>
+            </div>
+          </div>
+        </aside>
+      </div>
+    </div>
+  </main>
+
+  <footer>
+    <div class="wrap foot-inner">
+      <span class="fbrand">BALCHUG <b>RACING</b></span>
+      <nav class="fnav">
+        <a href="/">Онборд</a>
+        <a href="/telemetry/">Телеметрия трассы</a>
+        <a href="/smp-races/">Гонки SMP</a>
+        <a href="/smp-live/">Live сезона</a>
+        <a href="/weather/">Радар осадков</a>
+        <a href="/archive/">Архив</a>
+        <a href="https://solo.liveu.tv/" target="_blank" rel="noopener">Кабинет LiveU ↗</a>
+      </nav>
+      <span class="fmeta">Приватная трансляция команды ·
+        <a href="https://balchug-racing.ru/" target="_blank" rel="noopener">balchug-racing.ru</a></span>
+    </div>
+  </footer>
+
+  <script src="/assets/hls.min.js"></script>
+  <script>
+  (function () {
+    "use strict";
+
+    // Stream key подставляется при деплое из /etc/balchug/stream.key (см. server/deploy.sh)
+    var STREAM  = "__STREAM_KEY__";
+    var HLS_URL = location.origin + "/hls/" + STREAM + ".m3u8";
+
+    var $ = function (id) { return document.getElementById(id); };
+    var video=$("video"), overlay=$("overlay"), ovTitle=$("ovTitle"), ovText=$("ovText"),
+        gauge=$("gauge"), pbarWrap=$("pbarWrap"), pbar=$("pbar"),
+        pill=$("pill"), pillText=$("pillText"), recDot=$("recDot"),
+        liveBtn=$("liveBtn"), muteBtn=$("muteBtn"), fsBtn=$("fsBtn"),
+        bufRange=$("bufRange"), bufVal=$("bufVal"), bufBadge=$("bufBadge"), bufHint=$("bufHint"),
+        autoChk=$("autoChk"), autoNote=$("autoNote"),
+        qrow=$("qrow"), qcur=$("qcur"),
+        tLat=$("tLat"), tBuf=$("tBuf"), tBw=$("tBw"), tQ=$("tQ"), tStall=$("tStall"), tState=$("tState");
+
+    var hls=null, nativeHls=false, playing=false, prebuffering=false;
+    var reconnectTimer=null, restartTimer=null;
+    var stalls=0, stallTimes=[], lastAutoAdjust=0;
+    var manualLevel=-1;   // -1 = авто
+
+    // ---- сохранённые настройки ----
+    var DEFAULT_BUFFER=30;
+    var savedBuf=parseInt(localStorage.getItem("balchug_buffer"),10);
+    bufRange.value=(savedBuf>=5&&savedBuf<=50)?savedBuf:DEFAULT_BUFFER;
+    var autoMode=localStorage.getItem("balchug_auto")==="1";
+    autoChk.checked=autoMode;
+    var savedQ=parseInt(localStorage.getItem("balchug_quality"),10); if(!isNaN(savedQ)) manualLevel=savedQ;
+
+    function targetSec(){ return parseInt(bufRange.value,10)||DEFAULT_BUFFER; }
+    function setPill(s,t){ pill.className="live-pill "+s; pillText.textContent=t; }
+    function showOverlay(title,text,spin){ overlay.classList.remove("hidden");
+      ovTitle.textContent=title; ovText.textContent=text; gauge.style.display=spin?"":"none"; }
+    function hideOverlay(){ overlay.classList.add("hidden"); pbarWrap.style.display="none"; }
+
+    function destroy(){
+      if(hls){ try{hls.destroy();}catch(e){} hls=null; }
+      if(nativeHls){ try{video.removeAttribute("src");video.load();}catch(e){} nativeHls=false; }
+    }
+    function scheduleReconnect(d){ if(reconnectTimer)return;
+      reconnectTimer=setTimeout(function(){reconnectTimer=null;start();}, d||6000); }
+    function restartSoon(){ if(restartTimer)clearTimeout(restartTimer);
+      restartTimer=setTimeout(function(){restartTimer=null;
+        if(reconnectTimer){clearTimeout(reconnectTimer);reconnectTimer=null;} start();},250); }
+
+    function bufferAhead(){
+      try{ for(var i=video.buffered.length-1;i>=0;i--){
+        if(video.currentTime>=video.buffered.start(i)-0.5)
+          return Math.max(0, video.buffered.end(i)-video.currentTime);
+      } }catch(e){} return 0;
+    }
+
+    // ============ запуск hls.js ============
+    function start(){
+      destroy(); playing=false; prebuffering=false;
+      setPill("connecting","Подключение");
+      showOverlay("Подключение","Устанавливаем соединение с сервером трансляции.",true);
+      recDot.style.opacity=".4";
+      liveBtn.disabled=true; liveBtn.textContent="Эфир недоступен";
+
+      if(window.Hls && Hls.isSupported()){
+        var t=targetSec();
+        hls=new Hls({
+          lowLatencyMode:false,
+          liveSyncDuration:t,
+          liveMaxLatencyDuration:t+20,
+          maxBufferLength:Math.max(40,t+20),
+          maxMaxBufferLength:Math.max(80,t+40),
+          backBufferLength:20,
+          maxLiveSyncPlaybackRate:1.5,
+          startLevel:(manualLevel>=0?manualLevel:-1),
+          // ABR: повышение качества при росте канала. Дефолтный up-factor 0.7
+          // слишком консервативен (порог 720p ≈ 4.43 Мбит) и «залипает» на низком
+          // качестве. 0.9 → порог 720p ≈ 3.44 Мбит (повышается, когда канал реально
+          // освободился), 1080p ≈ 7.2 Мбит. Понижение (стабильность) — дефолтное 0.95.
+          abrBandWidthUpFactor:0.9,
+          abrBandWidthFactor:0.95,
+          abrEwmaFastLive:3.0,
+          abrEwmaSlowLive:6.0
+        });
+        hls.loadSource(HLS_URL);
+        hls.attachMedia(video);
+        try { window.__hls = hls; } catch (e) {}   // debug-хук для диагностики ABR
+        hls.on(Hls.Events.MANIFEST_PARSED, function(e,data){
+          buildQuality(data.levels);
+          if(manualLevel>=0 && manualLevel<data.levels.length){ hls.currentLevel=manualLevel; }
+          beginPrebuffer();
+        });
+        hls.on(Hls.Events.LEVEL_SWITCHED, updateQualityActive);
+        hls.on(Hls.Events.ERROR, function(e,data){
+          if(!data.fatal) return;
+          // Сбой медиа — пробуем восстановить без переподключения.
+          if(data.type===Hls.ErrorTypes.MEDIA_ERROR){ try{hls.recoverMediaError();return;}catch(_){} }
+          // Остальное фатальное (чаще всего master 404 = трансляция не запущена):
+          // показываем понятный статус и тихо переподключаемся — сами подхватим эфир.
+          destroy(); prebuffering=false;
+          setPill("connecting","Нет сигнала");
+          showOverlay("Ожидание трансляции",
+            "Похоже, болид ещё не в эфире. Подключимся автоматически, как только начнётся трансляция.", true);
+          scheduleReconnect(5000);
+        });
+      } else if(video.canPlayType("application/vnd.apple.mpegurl")){
+        nativeHls=true; video.src=HLS_URL; tryPlay();
+        qrow.innerHTML='<button class="qbtn active">Авто (Safari)</button>';
+      } else {
+        showOverlay("Браузер не поддерживается","Откройте в Chrome, Firefox, Edge или Safari.",false);
+      }
+    }
+
+    // ============ пребуфер: копим, потом играем ============
+    function beginPrebuffer(){
+      prebuffering=true;
+      var goal=Math.min(targetSec(), 12);
+      showOverlay("Накопление буфера","Копим запас, чтобы видео шло без рывков…",true);
+      pbarWrap.style.display=""; pbar.style.width="0%";
+      var iv=setInterval(function(){
+        if(!prebuffering){ clearInterval(iv); return; }
+        var a=bufferAhead(), p=Math.min(100,Math.round(a/goal*100));
+        pbar.style.width=p+"%";
+        ovText.textContent="Накоплено "+a.toFixed(1)+" из "+goal+" с…";
+        if(a>=goal){ clearInterval(iv); prebuffering=false; tryPlay(); }
+      },200);
+      // страховка: не ждать вечно
+      setTimeout(function(){ if(prebuffering){prebuffering=false;tryPlay();} }, 12000);
+    }
+
+    // ============ качество ============
+    function buildQuality(levels){
+      manualLevel = (manualLevel>=0 && manualLevel<levels.length) ? manualLevel : -1;
+      var html='<button class="qbtn" data-lvl="-1">Авто</button>';
+      // сортируем по высоте по убыванию, сохраняя оригинальный индекс
+      var idx=levels.map(function(l,i){return {i:i,h:l.height||0};}).sort(function(a,b){return b.h-a.h;});
+      idx.forEach(function(o){ html+='<button class="qbtn" data-lvl="'+o.i+'">'+(o.h?o.h+'p':'?')+'</button>'; });
+      qrow.innerHTML=html;
+      Array.prototype.forEach.call(qrow.querySelectorAll(".qbtn"), function(b){
+        b.addEventListener("click", function(){
+          var lvl=parseInt(b.getAttribute("data-lvl"),10);
+          manualLevel=lvl; localStorage.setItem("balchug_quality",lvl);
+          if(hls){ hls.currentLevel=lvl; if(lvl<0) hls.nextLevel=-1; }
+          updateQualityActive();
+        });
+      });
+      updateQualityActive();
+    }
+    function levelHeight(i){ try{return hls.levels[i]?hls.levels[i].height+"p":"—";}catch(e){return "—";} }
+    function updateQualityActive(){
+      if(!hls) return;
+      var sel=(hls.autoLevelEnabled||manualLevel<0)?-1:manualLevel;
+      Array.prototype.forEach.call(qrow.querySelectorAll(".qbtn"), function(b){
+        b.classList.toggle("active", parseInt(b.getAttribute("data-lvl"),10)===sel);
+      });
+      var cur=(hls.currentLevel>=0)?levelHeight(hls.currentLevel):"—";
+      qcur.textContent=(sel<0?("Авто → "+cur):cur);
+    }
+
+    // ============ телеметрия + авто-режим (тик 1с) ============
+    setInterval(function(){
+      if(!hls && !nativeHls) return;
+      var a=bufferAhead();
+      tBuf.textContent=a.toFixed(1)+" с";
+      // задержка
+      var lat=null;
+      if(hls && typeof hls.latency==="number" && hls.latency>0) lat=hls.latency;
+      else { try{ var e=video.seekable.length?video.seekable.end(video.seekable.length-1):0; if(e) lat=Math.max(0,e-video.currentTime); }catch(_){} }
+      tLat.textContent = lat!=null ? lat.toFixed(1)+" с" : "—";
+      // полоса
+      if(hls && hls.bandwidthEstimate){ tBw.textContent=(hls.bandwidthEstimate/1e6).toFixed(1)+" Мбит"; }
+      // качество
+      if(hls){ tQ.textContent=(hls.currentLevel>=0?levelHeight(hls.currentLevel):"—"); updateQualityActive(); }
+      // статус
+      if(playing){ tState.textContent="Эфир"; tState.className="v ok"; }
+      tStall.textContent=stalls;
+
+      if(autoMode) autoAdjust();
+    }, 1000);
+
+    function autoAdjust(){
+      var now=Date.now();
+      // чистим окно фризов (последние 25с)
+      stallTimes=stallTimes.filter(function(t){return now-t<25000;});
+      var t=targetSec();
+      if(stallTimes.length>=1 && now-lastAutoAdjust>6000 && t<50){
+        bufRange.value=Math.min(50,t+5); lastAutoAdjust=now; stallTimes=[];
+        applyBufferLive(); renderBuffer(); flashAuto("Фриз → буфер "+targetSec()+" с");
+      } else if(stallTimes.length===0 && now-lastAutoAdjust>45000 && t>10){
+        bufRange.value=t-2; lastAutoAdjust=now;
+        applyBufferLive(); renderBuffer();
+      }
+    }
+    function flashAuto(msg){ autoNote.textContent=msg; setTimeout(function(){ if(autoMode) autoNote.textContent="подстраивает буфер при фризах"; },4000); }
+
+    function applyBufferLive(){
+      var t=targetSec();
+      if(hls){ hls.config.liveSyncDuration=t; hls.config.liveMaxLatencyDuration=t+20;
+        hls.config.maxBufferLength=Math.max(40,t+20); hls.config.maxMaxBufferLength=Math.max(80,t+40); }
+    }
+
+    // ============ ползунок буфера ============
+    function bufZone(t){ if(t<=13)return{cls:"low",name:"Мин. задержка"};
+      if(t<=33)return{cls:"",name:"Баланс"}; return{cls:"high",name:"Макс. стабильность"}; }
+    function renderBuffer(){
+      var t=targetSec(), z=bufZone(t);
+      bufVal.textContent=t; bufBadge.textContent=z.name; bufBadge.className="buf-badge "+z.cls;
+      bufHint.innerHTML="Плеер отстаёт от&nbsp;эфира на&nbsp;<b>"+t+"&nbsp;сек</b>. Больше буфер&nbsp;— реже фризы, выше задержка.";
+    }
+    bufRange.addEventListener("input", renderBuffer);
+    bufRange.addEventListener("change", function(){
+      localStorage.setItem("balchug_buffer", targetSec());
+      renderBuffer(); restartSoon();
+    });
+
+    // ============ авто-режим ============
+    function applyAutoUI(){
+      bufRange.disabled=autoMode;
+      autoNote.textContent=autoMode?"подстраивает буфер при фризах":"включите, чтобы буфер рос при фризах";
+    }
+    autoChk.addEventListener("change", function(){
+      autoMode=autoChk.checked; localStorage.setItem("balchug_auto",autoMode?"1":"0");
+      lastAutoAdjust=Date.now(); applyAutoUI();
+    });
+
+    // ============ события видео ============
+    video.addEventListener("playing", function(){
+      playing=true; hideOverlay(); setPill("live","В эфире"); recDot.style.opacity="1";
+      liveBtn.disabled=false; liveBtn.textContent="● К прямому эфиру";
+    });
+    video.addEventListener("waiting", function(){
+      if(!playing||prebuffering) return;
+      stalls++; stallTimes.push(Date.now());
+      setPill("connecting","Буферизация"); tState.textContent="Буфер…"; tState.className="v red";
+    });
+    video.addEventListener("ended", function(){ playing=false; scheduleReconnect(2000); });
+
+    // ============ звук + кнопки ============
+    function setMuteLabel(){ muteBtn.textContent = video.muted ? "🔇 Включить звук" : "🔊 Звук вкл"; }
+    function tryPlay(){
+      var p = video.play();
+      if(p && p.catch){ p.catch(function(){
+        // автозапуск со звуком заблокирован браузером → стартуем без звука, кнопкой можно включить
+        if(!video.muted){ video.muted=true; setMuteLabel(); video.play().catch(function(){}); }
+      }); }
+    }
+    liveBtn.addEventListener("click", function(){
+      try{ if(video.seekable&&video.seekable.length) video.currentTime=Math.max(0,video.seekable.end(video.seekable.length-1)-1.5); }catch(e){}
+      tryPlay();
+    });
+    muteBtn.addEventListener("click", function(){
+      video.muted=!video.muted; localStorage.setItem("balchug_muted", video.muted?"1":"0");
+      setMuteLabel(); if(!video.muted) video.play().catch(function(){});
+    });
+    fsBtn.addEventListener("click", function(){
+      var el=document.querySelector(".video-wrap");
+      if(document.fullscreenElement) document.exitFullscreen();
+      else if(el.requestFullscreen) el.requestFullscreen();
+      else if(video.webkitEnterFullscreen) video.webkitEnterFullscreen();
+    });
+
+    // ---- init ----
+    video.muted = localStorage.getItem("balchug_muted")==="1";   // по умолчанию звук ВКЛ
+    setMuteLabel();
+    // ---- счётчик зрителей (heartbeat каждые 10 с; считаем только когда идёт просмотр) ----
+    var VSID = Math.random().toString(36).slice(2);
+    var vcountEl = document.getElementById("vcount");
+    function beatViewers(){
+      fetch("/api/viewers?id=" + VSID + "&watching=" + (playing ? 1 : 0) + "&t=" + Date.now(), { cache: "no-store" })
+        .then(function(r){ return r.json(); })
+        .then(function(d){ if(vcountEl) vcountEl.textContent = d.count; })
+        .catch(function(){});
+    }
+    setInterval(beatViewers, 10000); beatViewers();
+
+    renderBuffer(); applyAutoUI(); start();
+  })();
+  </script>
+</body>
+</html>

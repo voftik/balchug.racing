@@ -1,0 +1,101 @@
+/* ============================================================
+   BALCHUG Racing — общий дизайн-код (шапка, навигация, подвал)
+   Бренд: navy #1B365D / red #F0143D / белый, шрифт Russo One.
+   Используется страницами телеметрии/гонок; плеер дублирует токены инлайн.
+   ============================================================ */
+
+@font-face { font-family:'Russo One'; font-style:normal; font-weight:400; font-display:swap;
+  src:url('/assets/russoone-cyrillic.woff2') format('woff2');
+  unicode-range:U+0301,U+0400-045F,U+0490-0491,U+04B0-04B1,U+2116; }
+@font-face { font-family:'Russo One'; font-style:normal; font-weight:400; font-display:swap;
+  src:url('/assets/russoone-latin-ext.woff2') format('woff2');
+  unicode-range:U+0100-02BA,U+1E00-1EFF,U+2020,U+20A0-20AB,U+2C60-2C7F,U+A720-A7FF; }
+@font-face { font-family:'Russo One'; font-style:normal; font-weight:400; font-display:swap;
+  src:url('/assets/russoone-latin.woff2') format('woff2');
+  unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+2000-206F,U+20AC,U+2122,U+2212; }
+
+:root{
+  --navy:#1B365D; --navy-2:#122846; --navy-3:#0c1c33; --red:#F0143D; --red-2:#ff2d52;
+  --white:#fff; --paper:#FAFBFC; --line:#E4E9F0; --muted:#6E7E98; --muted-2:#B5BFCD; --ok:#28d17c;
+  --display:'Russo One','Arial Narrow',Arial,sans-serif;
+  --body:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;
+}
+*{box-sizing:border-box;} html,body{height:100%;margin:0;}
+body{font-family:var(--body);color:var(--navy);background:var(--paper);min-height:100%;
+  display:flex;flex-direction:column;-webkit-font-smoothing:antialiased;
+  background-image:
+    radial-gradient(900px 500px at 88% -10%,rgba(240,20,61,.06),transparent 60%),
+    radial-gradient(900px 600px at 0% 0%,rgba(27,54,93,.06),transparent 55%),
+    repeating-linear-gradient(115deg,rgba(27,54,93,.022) 0 2px,transparent 2px 26px);}
+.wrap{width:100%;max-width:1280px;margin:0 auto;padding:0 22px;}
+.display{font-family:var(--display);letter-spacing:.04em;text-transform:uppercase;}
+
+/* ---- Header + Nav ---- */
+header{border-bottom:1px solid var(--line);background:rgba(255,255,255,.86);
+  backdrop-filter:saturate(1.2) blur(8px);position:sticky;top:0;z-index:20;}
+.head-inner{display:flex;align-items:center;gap:18px;padding:14px 0;flex-wrap:wrap;}
+.brand{display:flex;align-items:center;gap:14px;min-width:0;text-decoration:none;}
+.brand img{height:26px;width:auto;display:block;}
+.brand .sep{width:1px;height:26px;background:var(--line);}
+.brand .kicker{font-family:var(--display);font-size:12px;letter-spacing:.18em;text-transform:uppercase;
+  color:var(--muted);white-space:nowrap;}
+.brand .kicker b{color:var(--red);}
+
+.nav{display:flex;align-items:center;gap:6px;flex-wrap:wrap;}
+.nav a{font-family:var(--display);text-transform:uppercase;letter-spacing:.07em;font-size:11.5px;
+  color:var(--navy);text-decoration:none;padding:8px 12px;border-radius:6px;border:1px solid transparent;
+  transition:.15s;white-space:nowrap;}
+.nav a:hover{background:#eef1f6;border-color:var(--line);}
+.nav a.active{background:var(--navy);color:#fff;}
+.nav a.live::before{content:"";display:inline-block;width:7px;height:7px;border-radius:50%;
+  background:var(--red);margin-right:7px;vertical-align:middle;
+  box-shadow:0 0 0 0 rgba(240,20,61,.6);animation:bpulse 1.5s infinite;}
+@keyframes bpulse{0%{box-shadow:0 0 0 0 rgba(240,20,61,.55);}70%{box-shadow:0 0 0 6px rgba(240,20,61,0);}100%{box-shadow:0 0 0 0 rgba(240,20,61,0);}}
+.head-cta{margin-left:auto;}
+
+/* ---- Title bar ---- */
+main{flex:1;padding:26px 0 36px;display:flex;flex-direction:column;}
+.titlebar{display:flex;align-items:baseline;gap:16px;margin-bottom:16px;flex-wrap:wrap;}
+.titlebar h1{font-family:var(--display);text-transform:uppercase;letter-spacing:.03em;
+  font-size:clamp(22px,3.6vw,38px);line-height:.98;margin:0;color:var(--navy);position:relative;padding-left:18px;}
+.titlebar h1::before{content:"";position:absolute;left:0;top:6%;bottom:6%;width:6px;background:var(--red);transform:skewX(-12deg);}
+.titlebar .sub{font-family:var(--display);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);}
+.titlebar .src-link{margin-left:auto;font-family:var(--display);text-transform:uppercase;letter-spacing:.08em;
+  font-size:11px;color:var(--navy);text-decoration:none;border:1px solid var(--line);border-radius:6px;padding:8px 12px;transition:.15s;}
+.titlebar .src-link:hover{border-color:var(--red);color:var(--red);}
+
+/* ---- Footer ---- */
+footer{border-top:1px solid var(--line);background:var(--white);}
+.foot-inner{display:flex;align-items:center;gap:16px 22px;padding:20px 0;flex-wrap:wrap;}
+.foot-inner .fbrand{font-family:var(--display);text-transform:uppercase;letter-spacing:.12em;font-size:12.5px;color:var(--navy);}
+.foot-inner .fbrand b{color:var(--red);}
+.fnav{display:flex;gap:14px;flex-wrap:wrap;}
+.fnav a{font-size:12.5px;color:var(--muted);text-decoration:none;}
+.fnav a:hover{color:var(--red);}
+.foot-inner .fmeta{margin-left:auto;color:var(--muted);font-size:12px;}
+.foot-inner .fmeta a{color:var(--navy);text-decoration:none;border-bottom:1px solid var(--line);}
+.foot-inner .fmeta a:hover{color:var(--red);border-color:var(--red);}
+
+/* ---- Встроенный контент (iframe) ---- */
+.embed-wrap{position:relative;height:calc(100vh - 232px);min-height:560px;background:var(--navy);
+  border:1px solid var(--navy-2);border-radius:10px;overflow:hidden;
+  box-shadow:0 30px 70px -28px rgba(27,54,93,.5);}
+.embed-wrap::before{content:"";position:absolute;top:0;left:0;right:0;height:4px;z-index:3;
+  background:linear-gradient(90deg,var(--red) 0 38%,var(--navy-3) 38% 40%,var(--red) 40% 44%,transparent 44%);}
+.embed-wrap iframe{position:absolute;inset:4px 0 0 0;width:100%;height:calc(100% - 4px);border:0;background:#fff;display:block;}
+.embed-loader{position:absolute;inset:0;z-index:2;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:14px;background:radial-gradient(700px 360px at 50% 45%,rgba(27,54,93,.4),rgba(5,8,13,.92));transition:opacity .4s;}
+.embed-loader.hidden{opacity:0;pointer-events:none;}
+.embed-loader .gauge{width:44px;height:44px;border-radius:50%;border:3px solid rgba(255,255,255,.14);border-top-color:var(--red);animation:spin .9s linear infinite;}
+.embed-loader p{margin:0;color:rgba(255,255,255,.7);font-family:var(--display);text-transform:uppercase;letter-spacing:.1em;font-size:12px;}
+@keyframes spin{to{transform:rotate(360deg);}}
+
+.reveal{opacity:0;transform:translateY(10px);animation:rise .6s cubic-bezier(.2,.7,.2,1) forwards;}
+@keyframes rise{to{opacity:1;transform:none;}}
+@media (prefers-reduced-motion:reduce){.reveal{animation:none;opacity:1;transform:none;}}
+
+@media (max-width:680px){
+  .brand .kicker{display:none;}
+  .head-cta{margin-left:0;}
+  .titlebar .src-link{margin-left:0;}
+}

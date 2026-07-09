@@ -1,0 +1,18 @@
+[Unit]
+Description=Balchug Racing — HLS VOD transcode worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/balchug/secrets.env
+WorkingDirectory=/opt/balchug_racing/server/jobs
+ExecStart=/opt/balchug_racing/venv/bin/python transcode_worker.py
+Restart=on-failure
+RestartSec=5
+Nice=15
+User=www-data
+Group=www-data
+
+[Install]
+WantedBy=multi-user.target

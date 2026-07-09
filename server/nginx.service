@@ -1,0 +1,21 @@
+[Unit]
+Description=nginx (source build with nginx-http-flv-module) — Balchug Racing
+Documentation=https://github.com/winshining/nginx-http-flv-module
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+PIDFile=/run/nginx.pid
+ExecStartPre=/usr/sbin/nginx -t -q
+ExecStart=/usr/sbin/nginx
+ExecReload=/usr/sbin/nginx -s reload
+ExecStop=/usr/sbin/nginx -s quit
+Restart=on-failure
+RestartSec=3s
+KillSignal=SIGQUIT
+TimeoutStopSec=10
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

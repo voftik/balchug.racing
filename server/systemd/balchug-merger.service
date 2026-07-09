@@ -1,0 +1,18 @@
+[Unit]
+Description=Balchug Racing — session merger (склейка кусков записи эфира)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/balchug/secrets.env
+WorkingDirectory=/opt/balchug_racing/server/jobs
+ExecStart=/opt/balchug_racing/venv/bin/python session_merger.py
+Restart=on-failure
+RestartSec=10
+# root: чтение /proc/*/fd (детект открытых файлов записи) и удаление FLV www-data
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>BALCHUG Racing — Телеметрия трассы (Moscow Raceway)</title>
+<meta name="theme-color" content="#1B365D" />
+<link rel="icon" type="image/png" href="/assets/favicon.png" />
+<link rel="preload" href="/assets/russoone-cyrillic.woff2" as="font" type="font/woff2" crossorigin />
+<link rel="preload" href="/assets/russoone-latin.woff2" as="font" type="font/woff2" crossorigin />
+<link rel="stylesheet" href="/assets/site.css" />
+</head>
+<body>
+  <header>
+    <div class="wrap head-inner">
+      <a class="brand" href="/">
+        <img src="/assets/logo.svg" alt="BALCHUG Racing" />
+        <span class="sep"></span>
+        <span class="kicker">Onboard&nbsp;<b>//</b>&nbsp;Live</span>
+      </a>
+      <nav class="nav">
+        <a href="/" class="live">Онборд</a>
+        <a href="/telemetry/" class="active">Телеметрия трассы</a>
+        <a href="/smp-races/">Гонки SMP</a>
+        <a href="/smp-live/">Live сезона</a>
+        <a href="/weather/">Радар осадков</a>
+        <a href="/archive/">Архив</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <div class="wrap">
+      <div class="titlebar reveal">
+        <h1>Телеметрия трассы</h1>
+        <span class="sub">Moscow Raceway · live timing</span>
+        <a class="src-link" href="https://livetiming.getraceresults.com/moscowraceway" target="_blank" rel="noopener">Открыть в новом окне ↗</a>
+      </div>
+      <div class="embed-wrap reveal">
+        <div class="embed-loader" id="ld"><div class="gauge"></div><p>Загрузка телеметрии…</p></div>
+        <iframe src="https://livetiming.getraceresults.com/moscowraceway"
+                title="Moscow Raceway live timing"
+                allow="fullscreen" referrerpolicy="no-referrer-when-downgrade"
+                onload="document.getElementById('ld').classList.add('hidden')"></iframe>
+      </div>
+    </div>
+  </main>
+
+  <footer>
+    <div class="wrap foot-inner">
+      <span class="fbrand">BALCHUG <b>RACING</b></span>
+      <nav class="fnav">
+        <a href="/">Онборд</a>
+        <a href="/telemetry/">Телеметрия трассы</a>
+        <a href="/smp-races/">Гонки SMP</a>
+        <a href="/smp-live/">Live сезона</a>
+        <a href="/weather/">Радар осадков</a>
+        <a href="/archive/">Архив</a>
+        <a href="https://solo.liveu.tv/" target="_blank" rel="noopener">Кабинет LiveU ↗</a>
+      </nav>
+      <span class="fmeta">Источник: <a href="https://livetiming.getraceresults.com/moscowraceway" target="_blank" rel="noopener">getraceresults.com</a></span>
+    </div>
+  </footer>
+</body>
+</html>

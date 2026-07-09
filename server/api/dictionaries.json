@@ -1,0 +1,65 @@
+{
+  "_comment": "Справочники для русской разметки каталога. Источник: statistics/global_result_stat.json команды + уточнения пользователя. pilots_by_slug — по имени папки в S3; pilots_by_code — по первому токену имени файла; tracks — по подстроке в имени файла (проверять сверху вниз, длинные раньше).",
+  "pilots_by_slug": {
+    "kirill_kirakozov":   {"code": "KIR", "name": "Кирилл Киракозов"},
+    "mikhail_loboda":     {"code": "LOB", "name": "Михаил Лобода"},
+    "mikhail_loboda_alt": {"code": "LOB", "name": "Михаил Лобода"},
+    "boris_shulmeister":  {"code": "SHU", "name": "Борис Шульмейстер"},
+    "aleksey_karachev":   {"code": "KAR", "name": "Алексей Карачёв"},
+    "roman_rusinov":      {"code": "RUS", "name": "Роман Русинов"},
+    "aleksandr_smolyar":  {"code": "SMO", "name": "Александр Смоляр"},
+    "sergey_valuyskikh":  {"code": "VAL", "name": "Сергей Валуйских"},
+    "andrey_pavlovich":   {"code": "PAV", "name": "Андрей Павлович"},
+    "dmitriy_eliseev":    {"code": "JUS", "name": "Дмитрий Елисеев"},
+    "evgeniy_kharkovskiy":{"code": "KHA", "name": "Евгений Харьковский"},
+    "harold_shepskis":    {"code": "SHE", "name": "Гарольд Шепскис"},
+    "unknown_kar":        {"code": "",    "name": "Не определён"},
+    "unknown_pilot":      {"code": "",    "name": "Не определён"},
+    "unknown_pilot_gro":  {"code": "",    "name": "Не определён"}
+  },
+  "pilots_by_code": {
+    "KIR": "Кирилл Киракозов",
+    "LOB": "Михаил Лобода",
+    "SHU": "Борис Шульмейстер",
+    "KAR": "Алексей Карачёв",
+    "RUS": "Роман Русинов",
+    "SMO": "Александр Смоляр",
+    "VAL": "Сергей Валуйских",
+    "PAV": "Андрей Павлович",
+    "JUS": "Дмитрий Елисеев",
+    "KHA": "Евгений Харьковский",
+    "SHE": "Гарольд Шепскис"
+  },
+  "track_tokens": [
+    ["igorashor",  "Igora Drive Short"],
+    ["igora_shor", "Igora Drive Short"],
+    ["igorashort", "Igora Drive Short"],
+    ["igoralong",  "Igora Drive Long"],
+    ["igora_long", "Igora Drive Long"],
+    ["igora_rec",  "Igora Drive"],
+    ["igorarec",   "Igora Drive"],
+    ["mrw_gp9",    "Moscow Raceway"],
+    ["mrwgp9",     "Moscow Raceway"],
+    ["mrwgp",      "Moscow Raceway"],
+    ["mrw",        "Moscow Raceway"],
+    ["moscow",     "Moscow Raceway"],
+    ["nring",      "Нижегородское кольцо"],
+    ["igora",      "Igora Drive"],
+    ["generic",    "Тестовая трасса"]
+  ],
+  "session_tokens": [
+    ["generic testing", "Тест"],
+    ["testing",         "Тест"],
+    ["qualif",          "Квалификация"],
+    ["qual",            "Квалификация"],
+    ["race",            "Гонка"],
+    ["practice",        "Практика"],
+    ["free",            "Практика"]
+  ],
+  "cars": {
+    "JS53": "Tatuus FR JS53 (Formula Regional)",
+    "JS21": "Tatuus F4 JS21",
+    "21S":  "Tatuus F4 (21S)",
+    "21E":  "Tatuus F4 (21E)"
+  }
+}

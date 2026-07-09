@@ -1,0 +1,4 @@
+# Серверная часть каталога записей (venv: /opt/balchug_racing/venv)
+boto3>=1.34
+fastapi>=0.110
+uvicorn>=0.29

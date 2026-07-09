@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>BALCHUG Racing — Архив записей</title>
+<meta name="theme-color" content="#1B365D" />
+<link rel="icon" type="image/png" href="/assets/favicon.png" />
+<link rel="preload" href="/assets/russoone-cyrillic.woff2" as="font" type="font/woff2" crossorigin />
+<link rel="preload" href="/assets/russoone-latin.woff2" as="font" type="font/woff2" crossorigin />
+<link rel="stylesheet" href="/assets/site.css" />
+<style>
+  /* ---- Фильтры ---- */
+  .filters{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:0 0 16px;}
+  .filters input,.filters select{font-family:var(--body);font-size:13px;color:var(--navy);
+    background:#fff;border:1px solid var(--line);border-radius:8px;padding:9px 11px;outline:none;transition:.15s;}
+  .filters input:focus,.filters select:focus{border-color:var(--navy);}
+  .filters input.search{flex:1;min-width:220px;}
+  .filters select{cursor:pointer;}
+  .count{margin-left:auto;font-family:var(--display);text-transform:uppercase;letter-spacing:.08em;font-size:11px;color:var(--muted);}
+  .chip{font-family:var(--display);text-transform:uppercase;letter-spacing:.06em;font-size:10.5px;
+    border:1px solid var(--line);border-radius:999px;padding:6px 11px;background:#fff;color:var(--navy);cursor:pointer;}
+  .chip:hover{border-color:var(--red);color:var(--red);}
+
+  /* ---- Грид ---- */
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(255px,1fr));gap:16px;}
+  .rec{background:#fff;border:1px solid var(--line);border-radius:12px;overflow:hidden;cursor:pointer;
+    transition:.18s;display:flex;flex-direction:column;box-shadow:0 1px 0 rgba(27,54,93,.04);}
+  .rec:hover{transform:translateY(-3px);box-shadow:0 18px 40px -22px rgba(27,54,93,.5);border-color:#cdd6e3;}
+  .rec .thumb{position:relative;aspect-ratio:16/9;background:linear-gradient(135deg,var(--navy),var(--navy-3));overflow:hidden;}
+  .rec .thumb img{width:100%;height:100%;object-fit:cover;display:block;}
+  .rec .thumb .ph{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    font-family:var(--display);color:rgba(255,255,255,.35);font-size:30px;}
+  .rec .thumb .badges{position:absolute;left:8px;top:8px;display:flex;gap:5px;flex-wrap:wrap;}
+  .rec .thumb .play{position:absolute;right:8px;bottom:8px;width:34px;height:34px;border-radius:50%;
+    background:rgba(240,20,61,.92);display:flex;align-items:center;justify-content:center;color:#fff;font-size:13px;}
+  .bdg{font-family:var(--display);text-transform:uppercase;letter-spacing:.06em;font-size:9px;
+    padding:3px 7px;border-radius:4px;background:rgba(5,8,13,.6);color:#fff;backdrop-filter:blur(2px);}
+  .bdg.live{background:var(--red);} .bdg.dur{background:rgba(5,8,13,.72);}
+  .rec .body{padding:11px 12px 13px;display:flex;flex-direction:column;gap:6px;}
+  .rec .ttl{font-family:var(--display);text-transform:uppercase;letter-spacing:.02em;font-size:12.5px;
+    color:var(--navy);line-height:1.25;}
+  .rec .meta{font-size:11.5px;color:var(--muted);display:flex;flex-wrap:wrap;gap:4px 10px;}
+  .rec .meta b{color:var(--navy);font-weight:600;}
+
+  /* Акцентная кнопка «для Бориса» (без эмодзи) + индикация включённого режима */
+  #adminBtn{background:var(--red);border:1px solid var(--red);color:#fff;font-weight:700;}
+  #adminBtn:hover{background:var(--red-2);border-color:var(--red-2);color:#fff;}
+  body.admin #adminBtn{background:var(--ok);border-color:var(--ok);color:#06121f;}
+  body.admin #adminBtn::after{content:" · вкл";}
+
+  /* Кнопки управления на карточке — видны только в режиме админа */
+  .rec .admin-actions{display:none;gap:7px;margin-top:9px;padding-top:9px;border-top:1px dashed var(--line);}
+  body.admin .rec .admin-actions{display:flex;}
+  .rec .admin-actions button{flex:1;font-family:var(--display);text-transform:uppercase;letter-spacing:.05em;
+    font-size:10px;border:1px solid var(--line);border-radius:6px;padding:7px 6px;cursor:pointer;background:#fff;color:var(--navy);transition:.15s;}
+  .rec .admin-actions .edit:hover{border-color:var(--navy);background:#eef1f6;}
+  .rec .admin-actions .del{color:var(--red);}
+  .rec .admin-actions .del:hover{background:var(--red);border-color:var(--red);color:#fff;}
+  .more-wrap{display:flex;justify-content:center;margin:26px 0 0;}
+  .empty{padding:60px 20px;text-align:center;color:var(--muted);font-family:var(--display);text-transform:uppercase;letter-spacing:.1em;}
+
+  /* ---- Модал плеера ---- */
+  .modal{position:fixed;inset:0;z-index:50;display:none;align-items:flex-start;justify-content:center;
+    background:rgba(5,8,13,.78);backdrop-filter:blur(4px);overflow:auto;padding:24px;}
+  .modal.open{display:flex;}
+  .sheet{width:100%;max-width:1040px;background:var(--paper);border-radius:14px;overflow:hidden;
+    border:1px solid var(--navy-2);box-shadow:0 40px 90px -30px #000;}
+  .sheet .vwrap{position:relative;background:#05080d;aspect-ratio:16/9;}
+  .sheet video{width:100%;height:100%;display:block;background:#05080d;}
+  .sheet .close{position:absolute;right:12px;top:12px;z-index:3;width:38px;height:38px;border-radius:50%;
+    border:0;background:rgba(5,8,13,.6);color:#fff;font-size:18px;cursor:pointer;}
+  .sheet .info{padding:18px 20px 22px;}
+  .sheet h2{font-family:var(--display);text-transform:uppercase;letter-spacing:.02em;font-size:19px;margin:0 0 4px;color:var(--navy);}
+  .sheet .sub{color:var(--muted);font-size:13px;margin-bottom:14px;}
+  .kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:14px;}
+  .kv .c{background:#fff;border:1px solid var(--line);border-radius:9px;padding:9px 11px;}
+  .kv .k{font-family:var(--display);text-transform:uppercase;letter-spacing:.1em;font-size:9px;color:var(--muted);}
+  .kv .v{font-family:var(--display);font-size:14px;color:var(--navy);margin-top:3px;}
+  .summary{font-size:13px;line-height:1.6;color:#42506a;background:#fff;border:1px solid var(--line);
+    border-radius:9px;padding:12px 14px;margin-bottom:14px;}
+  .files{display:flex;flex-direction:column;gap:6px;}
+  .files .fh{font-family:var(--display);text-transform:uppercase;letter-spacing:.1em;font-size:10px;color:var(--muted);margin-bottom:2px;}
+  .files a{font-size:12.5px;color:var(--navy);text-decoration:none;border:1px solid var(--line);border-radius:7px;
+    padding:7px 10px;display:flex;justify-content:space-between;gap:10px;transition:.15s;}
+  .files a:hover{border-color:var(--red);color:var(--red);}
+  .files a .sz{color:var(--muted);font-size:11px;}
+  /* админ-правка */
+  .admin-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:14px;padding-top:12px;border-top:1px dashed var(--line);}
+  .admin-row input{font-size:12.5px;border:1px solid var(--line);border-radius:7px;padding:7px 9px;}
+  .admin-row button{font-family:var(--display);text-transform:uppercase;letter-spacing:.06em;font-size:11px;
+    background:var(--navy);color:#fff;border:0;border-radius:7px;padding:8px 13px;cursor:pointer;}
+  .admin-hint{font-size:11px;color:var(--muted);}
+  @media(max-width:560px){ .filters .search{min-width:100%;} }
+
+  /* ---- Модалка «Я Борис» (reCAPTCHA-стиль) ---- */
+  .boris-modal{position:fixed;inset:0;z-index:60;display:none;align-items:center;justify-content:center;
+    background:rgba(5,8,13,.72);backdrop-filter:blur(4px);padding:20px;}
+  .boris-modal.open{display:flex;animation:bfade .2s ease;}
+  @keyframes bfade{from{opacity:0}to{opacity:1}}
+  .boris-card{background:#fff;border:1px solid var(--line);border-radius:14px;max-width:390px;width:100%;
+    padding:26px 24px;box-shadow:0 40px 90px -30px #000;text-align:center;}
+  .boris-card h3{font-family:var(--display);text-transform:uppercase;letter-spacing:.03em;font-size:18px;color:var(--navy);margin:0 0 20px;}
+  .boris-card h3 .flag{display:inline-block;width:18px;height:13px;border-radius:2px;vertical-align:middle;margin-right:8px;
+    background-image:linear-gradient(45deg,#fff 25%,transparent 25%),linear-gradient(-45deg,#fff 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#fff 75%),linear-gradient(-45deg,transparent 75%,#fff 75%);
+    background-size:7px 7px;background-position:0 0,0 3px,3px -3px,-3px 0;background-color:#000;border:1px solid #2a2f3a;}
+  .boris-widget{display:flex;align-items:center;gap:13px;border:1px solid #d3dae5;border-radius:6px;padding:13px 15px;
+    background:#f9fbfd;cursor:pointer;user-select:none;box-shadow:0 1px 2px rgba(0,0,0,.06);transition:.15s;}
+  .boris-widget:hover{border-color:#b7c0cf;}
+  .boris-box{width:28px;height:28px;border:2px solid #b7c0cf;border-radius:4px;background:#fff;flex:none;
+    display:flex;align-items:center;justify-content:center;transition:.2s;position:relative;}
+  .boris-box svg{width:20px;height:20px;stroke:#28d17c;stroke-width:3.2;fill:none;stroke-linecap:round;stroke-linejoin:round;
+    stroke-dasharray:30;stroke-dashoffset:30;transition:stroke-dashoffset .35s ease .05s;}
+  .boris-box .spin{width:20px;height:20px;border:2.5px solid #d3dae5;border-top-color:var(--red);border-radius:50%;animation:spin .8s linear infinite;display:none;}
+  .boris-widget.loading .boris-box svg{display:none}
+  .boris-widget.loading .boris-box .spin{display:block}
+  .boris-widget.checked .boris-box{border-color:#28d17c;}
+  .boris-widget.checked .boris-box svg{stroke-dashoffset:0;}
+  .boris-widget .lbl{font-size:15px;color:var(--navy);font-weight:700;}
+  .boris-brand{margin-left:auto;text-align:right;font-family:var(--display);text-transform:uppercase;
+    letter-spacing:.04em;font-size:8px;color:#9aa6b6;line-height:1.25;}
+  .boris-brand b{color:var(--navy);}
+  .boris-note{font-size:12px;color:var(--muted);margin-top:16px;line-height:1.5;}
+  .boris-note.ok{color:#1b9e5e;font-weight:600;}
+</style>
+</head>
+<body>
+  <header>
+    <div class="wrap head-inner">
+      <a class="brand" href="/"><img src="/assets/logo.svg" alt="BALCHUG Racing" /><span class="sep"></span><span class="kicker">Onboard&nbsp;<b>//</b>&nbsp;Live</span></a>
+      <nav class="nav">
+        <a href="/" class="live">Онборд</a>
+        <a href="/telemetry/">Телеметрия трассы</a>
+        <a href="/smp-races/">Гонки SMP</a>
+        <a href="/smp-live/">Live сезона</a>
+        <a href="/weather/">Радар осадков</a>
+        <a href="/archive/" class="active">Архив</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <div class="wrap">
+      <div class="titlebar reveal">
+        <h1>Архив записей</h1>
+        <span class="sub">Онборд-видео · телеметрия · сезоны команды</span>
+        <a class="src-link" id="adminBtn" href="#">Кнопка для Бориса</a>
+      </div>
+
+      <div class="filters reveal">
+        <input class="search" id="q" type="search" placeholder="Поиск: пилот, трасса, заголовок…" />
+        <select id="pilot"><option value="">Пилот: все</option></select>
+        <select id="track"><option value="">Трасса: все</option></select>
+        <select id="season"><option value="">Сезон: все</option></select>
+        <select id="stype"><option value="">Тип: все</option></select>
+        <select id="sort">
+          <option value="date_desc">Сначала новые</option>
+          <option value="date_asc">Сначала старые</option>
+          <option value="best_lap">По лучшему кругу</option>
+          <option value="pilot">По пилоту</option>
+        </select>
+        <span class="count" id="count">…</span>
+      </div>
+
+      <div class="grid" id="grid"></div>
+      <div class="more-wrap"><button class="chip" id="more" style="display:none">Показать ещё</button></div>
+    </div>
+  </main>
+
+  <div class="boris-modal" id="borisModal">
+    <div class="boris-card">
+      <h3><span class="flag"></span>Подтвердите, что вы&nbsp;Борис</h3>
+      <div class="boris-widget" id="borisWidget">
+        <div class="boris-box">
+          <svg viewBox="0 0 24 24"><polyline points="4 12 10 18 20 6"></polyline></svg>
+          <span class="spin"></span>
+        </div>
+        <span class="lbl">Я Борис</span>
+        <span class="boris-brand"><b>BALCHUG</b><br>проверка</span>
+      </div>
+      <p class="boris-note" id="borisNote">Отметьте галочку, чтобы получить права редактирования.</p>
+    </div>
+  </div>
+
+  <div class="modal" id="modal">
+    <div class="sheet">
+      <div class="vwrap">
+        <button class="close" id="close">✕</button>
+        <video id="player" playsinline controls></video>
+      </div>
+      <div class="info" id="info"></div>
+    </div>
+  </div>
+
+  <footer>
+    <div class="wrap foot-inner">
+      <span class="fbrand">BALCHUG <b>RACING</b></span>
+      <nav class="fnav">
+        <a href="/">Онборд</a>
+        <a href="/telemetry/">Телеметрия трассы</a>
+        <a href="/smp-races/">Гонки SMP</a>
+        <a href="/smp-live/">Live сезона</a>
+        <a href="/weather/">Радар осадков</a>
+        <a href="/archive/">Архив</a>
+        <a href="https://solo.liveu.tv/" target="_blank" rel="noopener">Кабинет LiveU ↗</a>
+      </nav>
+      <span class="fmeta">Приватная трансляция команды · <a href="https://balchug-racing.ru/" target="_blank" rel="noopener">balchug-racing.ru</a></span>
+    </div>
+  </footer>
+
+  <script src="/assets/hls.min.js"></script>
+  <script src="/assets/archive.js"></script>
+</body>
+</html>

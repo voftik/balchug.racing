@@ -1,0 +1,23 @@
+# --- секреты (НИКОГДА не коммитить) ---
+.stream_key
+CREDENTIALS.md
+secrets.env
+*.key
+*.pem
+
+# --- локальные артефакты агентов/IDE ---
+.claude/
+.omc/
+.DS_Store
+.idea/
+.vscode/
+
+# --- python ---
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# --- временные файлы ---
+*.log
+*.tmp

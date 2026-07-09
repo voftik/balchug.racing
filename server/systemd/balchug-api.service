@@ -1,0 +1,18 @@
+[Unit]
+Description=Balchug Racing — Catalog API (FastAPI/uvicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/balchug/secrets.env
+WorkingDirectory=/opt/balchug_racing/server/api
+ExecStart=/opt/balchug_racing/venv/bin/uvicorn app:app --host 127.0.0.1 --port 8090 --workers 1
+Restart=on-failure
+RestartSec=3
+# доступ к S3-секретам и /var/lib/balchug
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
