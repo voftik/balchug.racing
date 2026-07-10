@@ -7,7 +7,9 @@ normalizer must always use dynamic headers rather than fixed column indexes.
 ## Current source state
 
 - Provider heat name: `Practice - Open-Pit`.
-- Provider flag code: `f=6`, normalized as `GREEN`.
+- Initial snapshot flag code was `f=6`, normalized as `GREEN`; the same capture
+  later observed `f=2` (`RED`), subsequent `GREEN` transitions and `FINISH`.
+  The current code is always an event-derived state, never a configured value.
 - Our current source row: start number `21`, team `BALCHUG Racing`, driver
   `Киракозов Кирилл`, class `CN PRO`, class position `1`. `21` is the
   permanent Balchug Racing race-entry number and is an automatic identity
@@ -70,11 +72,10 @@ the system never presents epoch arithmetic as a guessed UTC timestamp.
 `E<TsTime>` is retained separately as a state timer target so it cannot be
 confused with `LAST`, `BEST` or `L-PIT`.
 
-Pit entry/exit is not inferred from one text cell alone. The state transition is
-reconciled with `t_p.lastPassingIsInPit` and the source `PIT` count, then
-debounced before creating or closing a `pit_stops` record. This keeps a transient
-or reordered table update from manufacturing a stop, while keeping the original
-STATE observation available for replay.
+Pit entry/exit is recorded from observed `STATE` transitions and the source
+`PIT` count, while `t_p` passings are stored independently as corroborating raw
+track evidence. The original STATE observation remains available for replay;
+unknown source literals never manufacture a pit stop.
 
 ## Heat, flag, tracker and statistics handles
 
@@ -141,9 +142,10 @@ different participant from an older heat.
 
 The same stream also supplies `l` leader history, `d` aggregated leader laps
 and `i` caution history (`k`, start `f`, end `t`, clock-stopped `s`, remark
-`r`). The normalizer persists all of these with source provenance. Unknown
-compact keys or changed record shapes stay in raw storage and emit schema drift
-instead of being guessed.
+`r`). Caution history is typed and reconciles flag periods; `l` and `d` remain
+in the merged raw statistics payload pending their dedicated tactical metrics.
+Unknown compact keys or changed record shapes stay in raw storage rather than
+being guessed.
 
 ## Coverage gate
 
@@ -156,5 +158,5 @@ normalization. The timing database schema includes query-ready tables for:
 - tracker passings and aggregate source statistics;
 - laps, pits, automatic tyre stints and metric snapshots.
 
-The next normalizer task fills those tables. Unknown headers and handles remain
-in raw storage and are surfaced as schema drift rather than discarded.
+The normalizer fills these tables from raw frames. Unknown headers and handles
+remain in raw storage and are surfaced as schema drift rather than discarded.

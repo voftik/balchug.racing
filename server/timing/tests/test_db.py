@@ -65,7 +65,7 @@ class TimingDatabaseTests(unittest.TestCase):
     def test_migration_is_repeatable_and_enables_wal(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "timing.db"
-            self.assertEqual(migrate(path), ["0001", "0002"])
+            self.assertEqual(migrate(path), ["0001", "0002", "0003"])
             self.assertEqual(migrate(path), [])
             connection = connect(path)
             try:
@@ -121,6 +121,234 @@ class TimingDatabaseTests(unittest.TestCase):
                     {"flag", "provider_code", "provider_label", "started_at_us", "source_key"}.issubset(
                         flag_columns
                     )
+                )
+            finally:
+                connection.close()
+
+    def test_normalizer_schema_keeps_raw_time_provenance_and_deduplicates_source_events(self):
+        """The #15 writer can replay a connection without duplicating facts."""
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "timing.db"
+            migrate(path)
+            connection = connect(path)
+            try:
+                tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                self.assertTrue(
+                    {
+                        "result_layout_versions",
+                        "result_column_definitions",
+                        "participant_result_cell_observations",
+                        "connection_clock_samples",
+                        "connection_clock_calibrations",
+                        "participant_identity_observations",
+                        "participant_state_observations",
+                        "tracker_passing_observations",
+                        "heat_statistics_current",
+                        "heat_statistics_samples",
+                        "statistics_best_lap_history",
+                        "statistics_class_best_laps",
+                        "statistics_caution_history",
+                    }.issubset(tables)
+                )
+
+                state_columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(participant_state_current)")
+                }
+                self.assertTrue(
+                    {
+                        "state_timer_target_raw",
+                        "state_timer_target_provider_us",
+                        "state_timer_target_at_us",
+                        "state_timer_calibration_id",
+                        "state_timer_source_message_id",
+                        "state_timer_source_key",
+                        "state_timer_observed_at_us",
+                        "provider_pit_count",
+                        "provider_pit_count_raw",
+                    }.issubset(state_columns)
+                )
+                passing_columns = {row[1] for row in connection.execute("PRAGMA table_info(tracker_passings)")}
+                self.assertTrue(
+                    {
+                        "raw_speed_mm_s",
+                        "provider_passed_at_provider_us",
+                        "provider_passed_at_kind",
+                        "clock_calibration_id",
+                        "event_fingerprint",
+                        "observed_at_us",
+                    }.issubset(passing_columns)
+                )
+                flag_columns = {row[1] for row in connection.execute("PRAGMA table_info(track_flag_periods)")}
+                self.assertTrue(
+                    {
+                        "start_provider_ts_raw",
+                        "end_provider_ts_raw",
+                        "observed_started_at_us",
+                        "observed_ended_at_us",
+                        "calibrated_started_at_us",
+                        "calibrated_ended_at_us",
+                        "reconciliation_key",
+                        "reconciliation_source_message_id",
+                    }.issubset(flag_columns)
+                )
+
+                source_id = self.insert_source(connection)
+                heat_id = self.insert_session(connection, "normalizer", source_id)
+                _frame_id, message_id = self.insert_frame(connection, "normalizer", received_at_us=1_000_000)
+                timestamp = now_us()
+                connection.execute(
+                    """
+                    INSERT INTO result_layout_versions(
+                      source_heat_id,version_ordinal,layout_fingerprint,raw_layout_json,
+                      source_message_id,source_key,observed_at_us,created_at_us
+                    ) VALUES (?,?,?,?,?,?,?,?)
+                    """,
+                    (heat_id, 0, "layout-a", '{"h":[]}', message_id, "connection-normalizer:1:0", timestamp, timestamp),
+                )
+                layout_id = connection.execute(
+                    "SELECT id FROM result_layout_versions WHERE source_heat_id = ?", (heat_id,)
+                ).fetchone()[0]
+                connection.execute(
+                    """
+                    INSERT INTO result_column_definitions(
+                      layout_version_id,column_index,source_name_raw,canonical_key,raw_definition_json
+                    ) VALUES (?,?,?,?,?)
+                    """,
+                    (layout_id, 3, "State", "state", '{"n":"State"}'),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO connection_clock_calibrations(
+                      ingest_connection_id,source_heat_id,calibration_key,provider_timestamp_kind,
+                      offset_us,sample_count,valid_from_observed_at_us,source_message_id,source_key,created_at_us
+                    ) VALUES ('connection-normalizer',?,'median-1','ts_time',1,1,?,?,?,?)
+                    """,
+                    (heat_id, timestamp, message_id, "connection-normalizer:1:clock", timestamp),
+                )
+                calibration_id = connection.execute("SELECT id FROM connection_clock_calibrations").fetchone()[0]
+                connection.execute(
+                    """
+                    INSERT INTO participants(
+                      id,source_heat_id,external_key,start_number,team_name,class_name,first_seen_at_us,last_seen_at_us
+                    ) VALUES ('car-21',?,'21','21','BALCHUG Racing','CN PRO',?,?)
+                    """,
+                    (heat_id, timestamp, timestamp),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO participant_state_observations(
+                      source_heat_id,participant_id,layout_version_id,provider_row_index,state_raw,state_kind,
+                      state_timer_target_raw,state_timer_target_provider_us,state_timer_target_at_us,
+                      state_timer_calibration_id,provider_pit_count,source_message_id,source_key,
+                      source_event_key,observed_at_us,created_at_us
+                    ) VALUES (?, 'car-21', ?, 1, 'E837026446926000', 'ON_TRACK',
+                              '837026446926000', 837026446926000, ?, ?, 2, ?, ?, 'state:1:3', ?, ?)
+                    """,
+                    (heat_id, layout_id, timestamp, calibration_id, message_id, "connection-normalizer:1:0", timestamp, timestamp),
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        """
+                        INSERT INTO participant_state_observations(
+                          source_heat_id,provider_row_index,state_kind,source_key,source_event_key,observed_at_us,created_at_us
+                        ) VALUES (?,1,'UNKNOWN','connection-normalizer:1:0','state:1:3',?,?)
+                        """,
+                        (heat_id, timestamp, timestamp),
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO tracker_passing_observations(
+                      source_heat_id,participant_id,transponder_id_raw,raw_speed_mm_s,is_in_pit,
+                      provider_passed_at_raw,provider_passed_at_provider_us,provider_passed_at_kind,
+                      passed_at_us,clock_calibration_id,event_fingerprint,raw_passing_json,
+                      source_message_id,source_key,source_event_key,observed_at_us,created_at_us
+                    ) VALUES (?, 'car-21', '42', 47000, 0, '837026446926000', 837026446926000,
+                              'ts_time', ?, ?, '42:837026446926000:1', '[]', ?,
+                              'connection-normalizer:1:0', 'passing:1', ?, ?)
+                    """,
+                    (heat_id, timestamp, calibration_id, message_id, timestamp, timestamp),
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        """
+                        INSERT INTO tracker_passing_observations(
+                          source_heat_id,event_fingerprint,raw_passing_json,source_key,source_event_key,observed_at_us,created_at_us
+                        ) VALUES (?, '42:837026446926000:1', '[]', 'connection-normalizer:2:0', 'passing:replay', ?, ?)
+                        """,
+                        (heat_id, timestamp, timestamp),
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO track_flag_periods(
+                      source_heat_id,flag,started_at_us,source_key,created_at_us,reconciliation_key,
+                      start_provider_ts_raw,observed_started_at_us,calibrated_started_at_us
+                    ) VALUES (?, 'RED', ?, 'connection-normalizer:1:flag', ?, 'red:837026446926000',
+                              '837026446926000', ?, ?)
+                    """,
+                    (heat_id, timestamp, timestamp, timestamp, timestamp),
+                )
+                with self.assertRaises(sqlite3.IntegrityError):
+                    connection.execute(
+                        """
+                        INSERT INTO track_flag_periods(
+                          source_heat_id,flag,started_at_us,source_key,created_at_us,reconciliation_key
+                        ) VALUES (?, 'RED', ?, 'connection-normalizer:2:flag', ?, 'red:837026446926000')
+                        """,
+                        (heat_id, timestamp, timestamp),
+                    )
+                self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+            finally:
+                connection.close()
+
+    def test_normalizer_migration_upgrades_a_populated_v2_database(self):
+        """0003 must be deployable over the already deployed 0001/0002 data plane."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "timing.db"
+            legacy_migrations = root / "legacy-migrations"
+            legacy_migrations.mkdir()
+            for filename in ("0001_initial.sql", "0002_session_lifecycle.sql"):
+                shutil.copyfile(Path(__file__).parent.parent / "migrations" / filename, legacy_migrations / filename)
+            self.assertEqual(migrate(path, directory=legacy_migrations), ["0001", "0002"])
+            connection = connect(path)
+            try:
+                source_id = self.insert_source(connection)
+                heat_id = self.insert_session(connection, "legacy-normalizer", source_id)
+                timestamp = now_us()
+                connection.execute(
+                    """
+                    INSERT INTO participants(id,source_heat_id,external_key,first_seen_at_us,last_seen_at_us)
+                    VALUES ('legacy-car',?,'21',?,?)
+                    """,
+                    (heat_id, timestamp, timestamp),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO participant_identity_segments(
+                      id,source_heat_id,participant_id,started_at_us,source_key,created_at_us,updated_at_us
+                    ) VALUES ('legacy-segment',?,'legacy-car',?,'legacy:1',?,?)
+                    """,
+                    (heat_id, timestamp, timestamp, timestamp),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO participant_state_current(source_heat_id,participant_id,source_key,updated_at_us)
+                    VALUES (?,'legacy-car','legacy:1',?)
+                    """,
+                    (heat_id, timestamp),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            self.assertEqual(migrate(path), ["0003"])
+            connection = connect(path)
+            try:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM participants").fetchone()[0], 1)
+                self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+                self.assertIn(
+                    "state_timer_target_at_us",
+                    {row[1] for row in connection.execute("PRAGMA table_info(participant_state_current)")},
                 )
             finally:
                 connection.close()

@@ -105,6 +105,10 @@ if systemctl list-unit-files balchug-timing-api.service >/dev/null 2>&1; then
   systemctl enable --now balchug-timing-api
   systemctl restart balchug-timing-api
 fi
+if [ -f /etc/systemd/system/balchug-timing-ingest.service ]; then
+  systemctl enable --now balchug-timing-ingest
+  systemctl restart balchug-timing-ingest
+fi
 if systemctl list-unit-files balchug-merger.service >/dev/null 2>&1; then
   systemctl enable --now balchug-merger >/dev/null 2>&1 || true
   systemctl restart balchug-merger || true

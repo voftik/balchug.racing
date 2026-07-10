@@ -1,0 +1,24 @@
+[Unit]
+Description=Balchug Racing - Live timing ingest worker
+After=network-online.target balchug-timing-api.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/balchug/secrets.env
+Environment=PYTHONPATH=/opt/balchug_racing/server
+Environment=TIMING_DB=/var/lib/balchug/timing.db
+WorkingDirectory=/opt/balchug_racing/server
+ExecStart=/opt/balchug_racing/venv/bin/python -m timing.worker
+Restart=on-failure
+RestartSec=3
+User=www-data
+Group=www-data
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

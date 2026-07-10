@@ -1,0 +1,255 @@
+import json
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+from timing.db import connect, migrate
+from timing.ingest_store import RawIngestStore
+from timing.lifecycle import create_session, start_session
+from timing.normalization import TIME_SERVICE_EPOCH_UNIX_US
+from timing.normalizer_writer import TimingNormalizer
+from timing.protocol import Bootstrap
+
+
+class TimingNormalizerWriterTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.path = Path(self.temporary.name) / "timing.db"
+        migrate(self.path)
+        self.connection = connect(self.path)
+        draft = create_session(
+            self.connection,
+            source_slug="igora",
+            mode="practice",
+            idempotency_key="create-normalizer",
+        ).session
+        self.session = start_session(
+            self.connection,
+            session_id=draft.id,
+            idempotency_key="start-normalizer",
+        ).session
+        self.store = RawIngestStore(self.connection, analysis_session_id=self.session.id)
+        self.store.start_run()
+        self.upstream = self.store.open_connection(Bootstrap("https://example.test/igora", "tid", None))
+        self.normalizer = TimingNormalizer(self.session.id)
+        self.sequence = 0
+
+    def tearDown(self):
+        self.connection.close()
+        self.temporary.cleanup()
+
+    def apply(self, messages, *, received_at_us):
+        self.sequence += 1
+        raw = json.dumps({"M": messages}, ensure_ascii=False, separators=(",", ":"))
+        frame = self.store.persist_raw_frame(
+            self.upstream,
+            sequence=self.sequence,
+            raw_text=raw,
+            received_at_us=received_at_us,
+            monotonic_ns=time.monotonic_ns(),
+        )
+        decoded = self.store.decode_frame(frame)
+        self.normalizer(self.connection, frame, decoded)
+        self.store.mark_processed(frame)
+        return frame
+
+    def test_red_flag_is_provisional_then_reconciled_to_precise_provider_boundaries(self):
+        provider_start = 1_000_000
+        provider_red_start = 1_002_000
+        provider_red_end = 1_004_000
+        offset = 10_800_000_000
+        first_receive = TIME_SERVICE_EPOCH_UNIX_US + provider_start + offset
+        self.apply(
+            [
+                [
+                    "h_i",
+                    {"n": "Practice - Open-Pit", "f": 6, "s": provider_start},
+                ],
+                ["s_i", provider_start],
+                [
+                    "r_i",
+                    {
+                        "l": {
+                            "h": [
+                                {"n": "POS"},
+                                {"n": "NR"},
+                                {"n": "STATE"},
+                                {"n": "TEAM"},
+                                {"n": "DRIVER IN CAR"},
+                                {"n": "CLS"},
+                                {"n": "PIC"},
+                                {"n": "PIT"},
+                                {"n": "LAST"},
+                            ]
+                        },
+                        "r": [
+                            [0, 0, "1"],
+                            [0, 1, "21"],
+                            [0, 2, "E1003000"],
+                            [0, 3, "BALCHUG Racing"],
+                            [0, 4, "Киракозов Кирилл"],
+                            [0, 5, "CN PRO"],
+                            [0, 6, "1"],
+                            [0, 7, "0"],
+                            [0, 8, "107491000"],
+                        ],
+                    },
+                ],
+            ],
+            received_at_us=first_receive,
+        )
+        red_observed = first_receive + 3_000_000
+        self.apply([["h_h", {"f": 2}]], received_at_us=red_observed)
+        provisional = self.connection.execute(
+            "SELECT started_at_us,observed_started_at_us,calibrated_started_at_us FROM track_flag_periods WHERE flag='RED'"
+        ).fetchone()
+        self.assertEqual(tuple(provisional), (red_observed, red_observed, None))
+
+        self.apply(
+            [
+                [
+                    "a_u",
+                    {
+                        "h": "Practice - Open-Pit",
+                        "o": "401",
+                        "x": "66",
+                        "i": {
+                            "2": {
+                                "k": "RedFlag",
+                                "f": str(provider_red_start),
+                                "t": str(provider_red_end),
+                                "s": "0",
+                                "r": "",
+                            }
+                        },
+                        "q": {
+                            "1": {
+                                "r": "9",
+                                "i": "107491000",
+                                "t": "1003000",
+                                "a": "173.58",
+                                "d": "Киракозов Кирилл",
+                                "n": "BALCHUG Racing",
+                                "m": "CN PRO",
+                                "c": "Ligier JS53 evo2",
+                                "s": "21",
+                            }
+                        },
+                    },
+                ]
+            ],
+            received_at_us=first_receive + 4_000_000,
+        )
+        self.apply([["h_h", {"f": 6}]], received_at_us=first_receive + 5_000_000)
+
+        red = self.connection.execute(
+            """
+            SELECT start_provider_ts_raw,end_provider_ts_raw,started_at_us,ended_at_us,
+                   calibrated_started_at_us,calibrated_ended_at_us,reconciliation_key
+            FROM track_flag_periods WHERE flag='RED'
+            """
+        ).fetchone()
+        self.assertEqual(red["start_provider_ts_raw"], str(provider_red_start))
+        self.assertEqual(red["end_provider_ts_raw"], str(provider_red_end))
+        self.assertEqual(red["started_at_us"], TIME_SERVICE_EPOCH_UNIX_US + provider_red_start + offset)
+        self.assertEqual(red["ended_at_us"], TIME_SERVICE_EPOCH_UNIX_US + provider_red_end + offset)
+        self.assertEqual(red["calibrated_started_at_us"], red["started_at_us"])
+        self.assertEqual(red["calibrated_ended_at_us"], red["ended_at_us"])
+        self.assertEqual(red["reconciliation_key"], f"RED:{provider_red_start}")
+        self.assertEqual(
+            self.connection.execute("SELECT flag FROM track_flag_current").fetchone()[0], "GREEN"
+        )
+        self.assertEqual(
+            self.connection.execute("SELECT COUNT(*) FROM track_flag_periods WHERE flag='RED'").fetchone()[0],
+            1,
+        )
+
+        participant = self.connection.execute(
+            """
+            SELECT p.start_number,p.team_name,p.class_name,p.car_name,s.position_overall,s.position_class,
+                   s.state_kind,s.last_lap_ms
+            FROM participants p JOIN participant_state_current s ON s.participant_id=p.id
+            WHERE p.is_ours=1
+            """
+        ).fetchone()
+        self.assertEqual(tuple(participant), ("21", "BALCHUG Racing", "CN PRO", "Ligier JS53 evo2", 1, 1, "ON_TRACK", 107491))
+        self.assertEqual(
+            self.connection.execute("SELECT COUNT(*) FROM participant_result_cell_observations").fetchone()[0],
+            9,
+        )
+        self.assertEqual(
+            tuple(self.connection.execute("SELECT total_laps,total_pitstops FROM heat_statistics_current").fetchone()),
+            (401, 66),
+        )
+
+    def test_state_transitions_complete_pit_and_automatically_open_a_new_tire_stint(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 20_000_000
+        self.apply(
+            [
+                ["s_i", 20_000_000],
+                [
+                    "r_i",
+                    {
+                        "l": {"h": [{"n": "NR"}, {"n": "STATE"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "LAPS"}, {"n": "PIT"}, {"n": "L-PIT"}]},
+                        "r": [[0, 0, "21"], [0, 1, "E20000000"], [0, 2, "BALCHUG Racing"], [0, 3, "CN PRO"], [0, 4, "5"], [0, 5, "0"], [0, 6, "L0"]],
+                    },
+                ],
+            ],
+            received_at_us=received,
+        )
+        self.apply(
+            [["r_c", [[0, 1, "SIn Pit"], [0, 5, "1"], [0, 6, "S20001000"]]]],
+            received_at_us=received + 1_000_000,
+        )
+        self.apply(
+            [["r_c", [[0, 1, "SOutLap"], [0, 4, "6"], [0, 6, "L30000000"]]]],
+            received_at_us=received + 31_000_000,
+        )
+        pit = self.connection.execute("SELECT stop_number,completed,pit_lane_ms,entered_lap,exited_lap FROM pit_stops").fetchone()
+        self.assertEqual(tuple(pit), (1, 1, 30000, 5, 6))
+        stints = self.connection.execute(
+            "SELECT stint_number,started_lap,ended_lap,completed_laps FROM tire_stints ORDER BY stint_number"
+        ).fetchall()
+        self.assertEqual([tuple(stint) for stint in stints], [(1, 5, 6, 1), (2, 6, None, 0)])
+
+    def test_new_heat_timestamp_creates_a_new_source_heat_but_reconnect_does_not(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 30_000_000
+        self.apply([["h_i", {"n": "Heat 1", "s": 30_000_000, "f": 6}], ["s_i", 30_000_000]], received_at_us=received)
+        # A fresh h_i with the same provider start is the normal reconnect snapshot.
+        self.apply([["h_i", {"n": "Heat 1", "s": 30_000_000, "f": 6}]], received_at_us=received + 1_000_000)
+        self.apply([["h_i", {"n": "Heat 2", "s": 40_000_000, "f": 6}]], received_at_us=received + 2_000_000)
+        heats = self.connection.execute(
+            "SELECT generation,external_name FROM source_heats ORDER BY generation"
+        ).fetchall()
+        self.assertEqual([tuple(heat) for heat in heats], [(1, "Heat 1"), (2, "Heat 2")])
+
+    def test_finish_loop_passings_age_tires_when_the_layout_has_no_laps_column(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 50_000_000
+        self.apply(
+            [
+                ["s_i", 50_000_000],
+                ["t_i", {"l": [[0, False, 0], [500, False, 1], [50, True, -1]], "d": []}],
+                [
+                    "r_i",
+                    {
+                        "l": {"h": [{"n": "NR"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "STATE"}, {"n": "PIT"}]},
+                        "r": [[0, 0, "21"], [0, 1, "BALCHUG Racing"], [0, 2, "CN PRO"], [0, 3, "E50000000"], [0, 4, "0"]],
+                    },
+                ],
+            ],
+            received_at_us=received,
+        )
+        self.apply([["t_p", [[42, "21", 0, 500, 0, 47000, False, 50_010_000]]]], received_at_us=received + 10_000)
+        self.apply([["r_c", [[0, 3, "SIn Pit"], [0, 4, "1"]]]], received_at_us=received + 20_000)
+        self.apply([["r_c", [[0, 3, "SOutLap"]]]], received_at_us=received + 30_000)
+        self.apply([["t_p", [[42, "21", 0, 500, 0, 47000, False, 50_120_000]]]], received_at_us=received + 120_000)
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM laps").fetchone()[0], 2)
+        stints = self.connection.execute(
+            "SELECT stint_number,started_lap,ended_lap,completed_laps FROM tire_stints ORDER BY stint_number"
+        ).fetchall()
+        self.assertEqual([tuple(stint) for stint in stints], [(1, None, 1, 1), (2, 1, None, 1)])
+
+
+if __name__ == "__main__":
+    unittest.main()
