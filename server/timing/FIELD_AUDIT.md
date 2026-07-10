@@ -84,6 +84,38 @@ Known current flag codes: `-1/0` not started, `1` ready, `2` red, `3`
 safety-car/yellow, `4` Code 60, `5` finish, `6` green, `7` FCY. The normalizer
 stores both the code and canonical flag period.
 
+## Statistics tab contract
+
+The provider's Statistics screen is fed by the same `a_i` initial snapshot,
+`a_u` patches and `a_r` reset handle captured by the recorder. It is not a
+second page scrape. The following `a_u` compact keys are confirmed against the
+provider's own view model and must be normalized in addition to retaining the
+merged raw payload:
+
+| Key | Meaning |
+|---|---|
+| `h` | heat name |
+| `g`, `f` | green-flag and finish-flag source timestamps |
+| `p`, `a`, `n` | participants started, classified and not classified |
+| `pt`, `pp`, `ptz` | participants on track, in pit zone and tank zone |
+| `o`, `x` | total laps and total pitstops for all participants |
+| `e`, `y`, `r`, `fy` | leader laps under green, safety car, Code 60 and FCY |
+| `c`, `s`, `fc` | number of safety cars, Code 60s and FCYs |
+| `u`, `t`, `fu` | total duration under safety car, Code 60 and FCY |
+
+`a_u.b` is best-lap history and `a_u.q` is best lap per class. Their records
+carry `r` lap number, `i` lap time, `t` source time of day, `a` average speed,
+`d` driver, `n` team, `c` vehicle and `s` race number; `q` additionally carries
+`m` class and `p` provider class ordering. They enrich CAR identity only when
+the current source observation matches the same entry; they never overwrite a
+different participant from an older heat.
+
+The same stream also supplies `l` leader history, `d` aggregated leader laps
+and `i` caution history (`k`, start `f`, end `t`, clock-stopped `s`, remark
+`r`). The normalizer persists all of these with source provenance. Unknown
+compact keys or changed record shapes stay in raw storage and emit schema drift
+instead of being guessed.
+
 ## Coverage gate
 
 The recorder already persists every raw frame and all decoded handles before
