@@ -367,6 +367,30 @@ def archive_snapshot(
         _raise_read_error(error)
 
 
+@app.get("/sessions/{session_id}/archive/comparison", response_model=TimingArchiveResponse)
+def archive_comparison(
+    session_id: str,
+    generation: int | None = None,
+    mode: Literal["all", "participant"] = "all",
+    participant_id: str | None = None,
+    max_points: int = MAX_CHART_POINTS,
+) -> JSONResponse:
+    """Return one bounded own-versus-class benchmark for an archived heat."""
+
+    try:
+        return _archive_payload(
+            _read_model().archive_comparison(
+                session_id,
+                generation=generation,
+                mode=mode,
+                participant_id=participant_id,
+                max_points=max_points,
+            )
+        )
+    except TimingReadError as error:
+        _raise_read_error(error)
+
+
 @app.get("/sessions/{session_id}")
 def session_detail(session_id: str) -> dict[str, object]:
     connection = connect()

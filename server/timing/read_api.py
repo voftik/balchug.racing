@@ -12,6 +12,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import math
 import sqlite3
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -41,6 +42,11 @@ MAX_ARCHIVE_SESSIONS = 100
 # timeline while keeping the public manifest bounded.
 MAX_ARCHIVE_MARKERS = 2_000
 ARCHIVE_FINALIZATION_WINDOW_US = 60 * US_PER_SECOND
+# The player receives raw lap facts for at most one or two cars.  This keeps
+# a pathological short-lap 24-hour session bounded without degrading the
+# server-side class benchmark, which is calculated from the complete facts.
+MAX_ARCHIVE_COMPARISON_LAPS_PER_PARTICIPANT = 2_000
+ARCHIVE_COMPARISON_LAP_BUCKET_US = 60 * US_PER_SECOND
 
 SCOPE_KINDS = frozenset(("participant", "class", "session"))
 FreshnessStatus = Literal["LIVE", "STALE", "OFFLINE"]
@@ -226,6 +232,24 @@ class TimingReadModel:
             session_id,
             database=self.database,
             generation=generation,
+            max_points=max_points,
+        )
+
+    def archive_comparison(
+        self,
+        session_id: str,
+        *,
+        generation: int | None = None,
+        mode: Literal["all", "participant"] = "all",
+        participant_id: str | None = None,
+        max_points: int = MAX_CHART_POINTS,
+    ) -> dict[str, Any]:
+        return read_archive_comparison(
+            session_id,
+            database=self.database,
+            generation=generation,
+            mode=mode,
+            participant_id=participant_id,
             max_points=max_points,
         )
 
@@ -1349,6 +1373,535 @@ def _archive_point_rows(
         (heat_id, first_at_us, last_at_us, *selected_seconds),
     ).fetchall()
     return list(rows), count
+
+
+def _comparison_number(value: Any) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return value
+
+
+def _comparison_text(*values: Any) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _archive_class_participants(payload: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Extract only the compact class state needed for an archive benchmark."""
+
+    raw_participants = payload.get("class_participants")
+    if not isinstance(raw_participants, list):
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for raw_item in raw_participants:
+        if not isinstance(raw_item, Mapping):
+            continue
+        measured = raw_item.get("measured")
+        measured = measured if isinstance(measured, Mapping) else {}
+        computed = raw_item.get("computed")
+        computed = computed if isinstance(computed, Mapping) else {}
+        measured_state = measured.get("state")
+        measured_state = measured_state if isinstance(measured_state, Mapping) else {}
+        participant_id = _comparison_text(computed.get("participant_id"), measured.get("participant_id"))
+        if participant_id is None:
+            continue
+        result[participant_id] = {
+            "participant_id": participant_id,
+            "start_number": _comparison_text(computed.get("start_number"), measured.get("start_number")),
+            "team_name": _comparison_text(computed.get("team_name"), measured.get("team_name")),
+            "car_name": _comparison_text(computed.get("car_name"), measured.get("car_name")),
+            "class_name": _comparison_text(computed.get("class_name"), measured.get("class_name")),
+            "driver_name": _comparison_text(
+                computed.get("current_driver_name"), measured_state.get("driver_name")
+            ),
+            "is_ours": bool(computed.get("is_ours") or measured.get("is_ours")),
+            "current_state": _comparison_text(
+                computed.get("current_state"), measured_state.get("state_kind"), measured_state.get("state")
+            ),
+            "pace_5_ms": _comparison_number(computed.get("pace_5_ms")),
+        }
+    return result
+
+
+def _archive_declared_ours_id(payload: Mapping[str, Any]) -> str | None:
+    computed = payload.get("computed")
+    computed = computed if isinstance(computed, Mapping) else {}
+    session = computed.get("session")
+    session = session if isinstance(session, Mapping) else {}
+    measured = payload.get("measured")
+    measured = measured if isinstance(measured, Mapping) else {}
+    ours = measured.get("ours")
+    ours = ours if isinstance(ours, Mapping) else {}
+    return _comparison_text(session.get("ours_participant_id"), ours.get("participant_id"))
+
+
+def _comparison_percentile(sorted_values: Sequence[int | float], percentile: float) -> float | None:
+    if not sorted_values:
+        return None
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    index = (len(sorted_values) - 1) * percentile
+    lower = math.floor(index)
+    upper = math.ceil(index)
+    if lower == upper:
+        return float(sorted_values[lower])
+    fraction = index - lower
+    return float(sorted_values[lower] + (sorted_values[upper] - sorted_values[lower]) * fraction)
+
+
+def _comparison_pace(entry: Mapping[str, Any] | None) -> int | float | None:
+    if not isinstance(entry, Mapping) or entry.get("current_state") != "ON_TRACK":
+        return None
+    return _comparison_number(entry.get("pace_5_ms"))
+
+
+def _archive_participant_sort_key(participant: Mapping[str, Any]) -> tuple[int, int, str, str]:
+    number = str(participant.get("start_number") or "")
+    try:
+        numeric_number = int(number)
+    except ValueError:
+        numeric_number = 10**9
+    return (0 if participant.get("is_ours") else 1, numeric_number, number, str(participant.get("participant_id") or ""))
+
+
+def _merge_archive_participant(
+    roster_by_id: dict[str, dict[str, Any]],
+    participant: Mapping[str, Any],
+) -> None:
+    """Merge durable roster metadata without overwriting a populated value."""
+
+    participant_id = _comparison_text(participant.get("participant_id"))
+    if participant_id is None:
+        return
+    existing = roster_by_id.setdefault(
+        participant_id,
+        {
+            "participant_id": participant_id,
+            "start_number": None,
+            "team_name": None,
+            "car_name": None,
+            "class_name": None,
+            "driver_name": None,
+            "is_ours": False,
+        },
+    )
+    for key in ("start_number", "team_name", "car_name", "class_name", "driver_name"):
+        if participant.get(key) is not None:
+            existing[key] = participant[key]
+    existing["is_ours"] = bool(existing["is_ours"] or participant.get("is_ours"))
+
+
+def _archive_class_roster_from_facts(
+    connection: sqlite3.Connection,
+    *,
+    heat_id: int,
+    class_key: str | None,
+) -> list[dict[str, Any]]:
+    """Return every recorded member of the archived class, including retirees."""
+
+    if class_key is None:
+        return []
+    rows = connection.execute(
+        """
+        SELECT p.id,p.start_number,p.team_name,p.car_name,p.class_name,p.class_name_key,p.is_ours,
+               c.current_driver_name AS driver_name
+        FROM participants AS p
+        LEFT JOIN participant_state_current AS c
+          ON c.source_heat_id = p.source_heat_id AND c.participant_id = p.id
+        WHERE p.source_heat_id = ?
+        """,
+        (heat_id,),
+    ).fetchall()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        participant_class_key = row["class_name_key"] or _class_key(row["class_name"])
+        if participant_class_key != class_key:
+            continue
+        result.append(
+            {
+                "participant_id": row["id"],
+                "start_number": row["start_number"],
+                "team_name": row["team_name"],
+                "car_name": row["car_name"],
+                "class_name": row["class_name"],
+                "driver_name": row["driver_name"],
+                "is_ours": bool(row["is_ours"]),
+            }
+        )
+    return result
+
+
+def _archive_comparison_pit_stops(
+    connection: sqlite3.Connection,
+    *,
+    heat_id: int,
+    participant_ids: Sequence[str],
+    ours_id: str,
+    first_at_us: int,
+    last_at_us: int,
+) -> list[dict[str, Any]]:
+    if not participant_ids:
+        return []
+    placeholders = ",".join("?" for _ in participant_ids)
+    rows = connection.execute(
+        f"""
+        SELECT f.participant_id,p.start_number,p.team_name,f.stop_number,f.entered_at_us,f.exited_at_us,
+               f.entered_lap,f.exited_lap,f.pit_lane_ms,f.completed
+        FROM pit_stops f
+        JOIN participants p ON p.id = f.participant_id
+        WHERE f.source_heat_id = ? AND f.participant_id IN ({placeholders})
+          AND f.entered_at_us <= ? AND (f.exited_at_us IS NULL OR f.exited_at_us >= ?)
+        ORDER BY f.entered_at_us,f.participant_id,f.stop_number
+        LIMIT ?
+        """,
+        (heat_id, *participant_ids, last_at_us, first_at_us, MAX_ARCHIVE_MARKERS),
+    ).fetchall()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        entered_at_us = int(row["entered_at_us"])
+        exited_at_us = int(row["exited_at_us"]) if row["exited_at_us"] is not None else None
+        result.append(
+            {
+                "participant_id": row["participant_id"],
+                "start_number": row["start_number"],
+                "team_name": row["team_name"],
+                "is_ours": row["participant_id"] == ours_id,
+                "stop_number": int(row["stop_number"]),
+                "entered_at_us": entered_at_us,
+                "exited_at_us": exited_at_us,
+                "timeline_started_at_us": max(first_at_us, entered_at_us),
+                "timeline_ended_at_us": min(last_at_us, exited_at_us) if exited_at_us is not None else None,
+                "carried_into_range": entered_at_us < first_at_us,
+                "entered_lap": row["entered_lap"],
+                "exited_lap": row["exited_lap"],
+                "pit_lane_ms": row["pit_lane_ms"],
+                "completed": bool(row["completed"]),
+            }
+        )
+    return result
+
+
+def _archive_comparison_lap_rows(
+    connection: sqlite3.Connection,
+    *,
+    heat_id: int,
+    participant_ids: Sequence[str],
+    first_at_us: int,
+    last_at_us: int,
+) -> dict[str, list[dict[str, Any]]]:
+    if not participant_ids:
+        return {}
+    placeholders = ",".join("?" for _ in participant_ids)
+    rows = connection.execute(
+        f"""
+        SELECT f.participant_id,p.start_number,p.team_name,f.lap_number,f.completed_at_us,f.duration_ms,
+               f.flag,f.is_in_lap,f.is_out_lap,f.crosses_pit,f.is_clean
+        FROM laps f
+        JOIN participants p ON p.id = f.participant_id
+        WHERE f.source_heat_id = ? AND f.participant_id IN ({placeholders})
+          AND f.completed_at_us IS NOT NULL AND f.completed_at_us >= ? AND f.completed_at_us <= ?
+        ORDER BY f.participant_id,f.completed_at_us,f.lap_number
+        """,
+        (heat_id, *participant_ids, first_at_us, last_at_us),
+    ).fetchall()
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(row["participant_id"], []).append(
+            {
+                "participant_id": row["participant_id"],
+                "start_number": row["start_number"],
+                "team_name": row["team_name"],
+                "lap_number": int(row["lap_number"]),
+                "completed_at_us": int(row["completed_at_us"]),
+                "duration_ms": row["duration_ms"],
+                "flag": row["flag"],
+                "is_in_lap": bool(row["is_in_lap"]),
+                "is_out_lap": bool(row["is_out_lap"]),
+                "crosses_pit": bool(row["crosses_pit"]),
+                "is_clean": bool(row["is_clean"]),
+            }
+        )
+    return grouped
+
+
+def _bounded_archive_lap_rows(laps: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Bound player lap points while retaining every non-clean boundary as a break."""
+
+    if not laps:
+        return []
+    indexes = (
+        list(range(len(laps)))
+        if len(laps) <= MAX_ARCHIVE_COMPARISON_LAPS_PER_PARTICIPANT
+        else _evenly_spaced(list(range(len(laps))), MAX_ARCHIVE_COMPARISON_LAPS_PER_PARTICIPANT)
+    )
+    result: list[dict[str, Any]] = []
+    previous_index: int | None = None
+    for index in indexes:
+        item = dict(laps[index])
+        previous_was_not_clean = previous_index is not None and not bool(laps[previous_index].get("is_clean"))
+        omitted_non_clean = (
+            previous_index is not None
+            and any(not bool(laps[between].get("is_clean")) for between in range(previous_index + 1, index))
+        )
+        item["break_before"] = bool(
+            item.get("is_clean") and (previous_index is None or previous_was_not_clean or omitted_non_clean)
+        )
+        result.append(item)
+        previous_index = index
+    return result
+
+
+def _archive_lap_benchmark(
+    laps_by_participant: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    excluded_participant_id: str,
+    first_at_us: int,
+) -> list[dict[str, Any]]:
+    # Each machine contributes at most its latest confirmed clean lap to a
+    # one-minute window.  A short-lap car must not outweigh its competitors.
+    buckets: dict[int, dict[str, int | float]] = {}
+    for participant_id, laps in laps_by_participant.items():
+        if participant_id == excluded_participant_id:
+            continue
+        for lap in laps:
+            duration_ms = _comparison_number(lap.get("duration_ms"))
+            if not lap.get("is_clean") or duration_ms is None:
+                continue
+            bucket = (int(lap["completed_at_us"]) - first_at_us) // ARCHIVE_COMPARISON_LAP_BUCKET_US
+            buckets.setdefault(bucket, {})[participant_id] = duration_ms
+    result: list[dict[str, Any]] = []
+    for bucket, durations_by_participant in sorted(buckets.items()):
+        ordered = sorted(durations_by_participant.values())
+        result.append(
+            {
+                "window_started_at_us": first_at_us + bucket * ARCHIVE_COMPARISON_LAP_BUCKET_US,
+                "window_ended_at_us": first_at_us + (bucket + 1) * ARCHIVE_COMPARISON_LAP_BUCKET_US,
+                "median_duration_ms": _comparison_percentile(ordered, 0.5),
+                "p25_duration_ms": _comparison_percentile(ordered, 0.25),
+                "p75_duration_ms": _comparison_percentile(ordered, 0.75),
+                "participant_count": len(durations_by_participant),
+            }
+        )
+    return result
+
+
+def read_archive_comparison(
+    session_id: str,
+    *,
+    database: str | Path | None = None,
+    generation: int | None = None,
+    mode: Literal["all", "participant"] = "all",
+    participant_id: str | None = None,
+    max_points: int = MAX_CHART_POINTS,
+) -> dict[str, Any]:
+    """Return one bounded own-versus-class benchmark series for an archived heat."""
+
+    session_id = _require_session_id(session_id)
+    if mode not in {"all", "participant"}:
+        raise ReadValidationError("comparison mode must be 'all' or 'participant'")
+    if mode == "all" and participant_id is not None:
+        raise ReadValidationError("participant_id is only valid for participant comparison mode")
+    if mode == "participant" and (not isinstance(participant_id, str) or not participant_id.strip()):
+        raise ReadValidationError("participant comparison mode requires participant_id")
+    max_points = _require_max_points(max_points)
+    with _readonly_snapshot(database) as connection:
+        session = _require_archived_session(connection, session_id)
+        heat, _ = _select_archive_heat(connection, session_id=session_id, generation=generation)
+        first_at_us = int(heat["first_at_us"])
+        last_at_us = int(heat["last_at_us"])
+        point_rows, source_point_count = _archive_point_rows(
+            connection,
+            heat_id=int(heat["id"]),
+            first_at_us=first_at_us,
+            last_at_us=last_at_us,
+            max_points=max_points,
+        )
+        decoded_points: list[tuple[sqlite3.Row, dict[str, dict[str, Any]]]] = []
+        roster_by_id: dict[str, dict[str, Any]] = {}
+        observed_ours_ids: list[str] = []
+        for row in point_rows:
+            payload = _decode_playback_payload(row)
+            declared_ours_id = _archive_declared_ours_id(payload)
+            if declared_ours_id is not None:
+                observed_ours_ids.append(declared_ours_id)
+            entries = _archive_class_participants(payload)
+            for entry in entries.values():
+                _merge_archive_participant(roster_by_id, entry)
+            decoded_points.append((row, entries))
+
+        ours_id = _comparison_text(session["our_participant_id"], *(observed_ours_ids or ()))
+        if ours_id is None:
+            ours_id = next((entry_id for entry_id, entry in roster_by_id.items() if entry.get("is_ours")), None)
+        ours_was_observed = ours_id is not None and ours_id in roster_by_id
+        ours_metadata = connection.execute(
+            """
+            SELECT class_name,class_name_key
+            FROM participants
+            WHERE source_heat_id = ? AND id = ?
+            """,
+            (int(heat["id"]), ours_id),
+        ).fetchone() if ours_id is not None else None
+        class_name = _comparison_text(
+            ours_metadata["class_name"] if ours_metadata is not None else None,
+            roster_by_id.get(ours_id, {}).get("class_name") if ours_id is not None else None,
+            session["our_class"],
+        )
+        class_key = (
+            (ours_metadata["class_name_key"] or _class_key(ours_metadata["class_name"]))
+            if ours_metadata is not None
+            else _class_key(class_name)
+        )
+        for participant in _archive_class_roster_from_facts(
+            connection,
+            heat_id=int(heat["id"]),
+            class_key=class_key,
+        ):
+            _merge_archive_participant(roster_by_id, participant)
+
+        unavailable = not ours_was_observed
+        if unavailable:
+            return {
+                "schema_version": ARCHIVE_SCHEMA_VERSION,
+                "session": _session_payload(session),
+                "heat": _archive_heat_summary(heat),
+                "range": {
+                    "first_at_us": first_at_us,
+                    "last_at_us": last_at_us,
+                    "source_point_count": source_point_count,
+                    "downsampled": source_point_count > len(point_rows),
+                },
+                "comparison": {
+                    "available": False,
+                    "reason": "our_class_participants_unavailable",
+                    "mode": mode,
+                    "ours_participant_id": ours_id,
+                    "participant_id": participant_id if mode == "participant" else None,
+                },
+                "participants": [],
+                "points": [],
+                "pit_stops": [],
+                "lap_series": {"ours": [], "benchmark": [], "benchmark_kind": None},
+                "semantics": {
+                    "series": "step",
+                    "missing_values": "null values are not interpolated",
+                },
+            }
+
+        roster_by_id[ours_id]["is_ours"] = True
+        if mode == "participant":
+            assert participant_id is not None
+            if participant_id == ours_id:
+                raise ReadValidationError("participant comparison must select a competitor, not our participant")
+            if participant_id not in roster_by_id:
+                raise ScopeNotFoundError(f"Participant does not exist in our archived class: {participant_id}")
+
+        class_name = _comparison_text(roster_by_id[ours_id].get("class_name"), class_name, session["our_class"])
+        points: list[dict[str, Any]] = []
+        for row, entries in decoded_points:
+            ours_pace = _comparison_pace(entries.get(ours_id))
+            point: dict[str, Any] = {
+                "observed_at_us": int(row["observed_at_us"]),
+                "ours_pace_5_ms": ours_pace,
+            }
+            if mode == "participant":
+                benchmark_pace = _comparison_pace(entries.get(participant_id))
+                point.update(
+                    {
+                        "benchmark_pace_5_ms": benchmark_pace,
+                        "benchmark_participant_count": 1 if benchmark_pace is not None else 0,
+                    }
+                )
+            else:
+                competitor_paces = sorted(
+                    pace
+                    for entry_id, entry in entries.items()
+                    if entry_id != ours_id and (pace := _comparison_pace(entry)) is not None
+                )
+                point.update(
+                    {
+                        "benchmark_pace_5_ms": _comparison_percentile(competitor_paces, 0.5),
+                        "benchmark_p25_pace_5_ms": _comparison_percentile(competitor_paces, 0.25),
+                        "benchmark_p75_pace_5_ms": _comparison_percentile(competitor_paces, 0.75),
+                        "benchmark_participant_count": len(competitor_paces),
+                    }
+                )
+            points.append(point)
+
+        participants = sorted(roster_by_id.values(), key=_archive_participant_sort_key)
+        participant_ids = [str(participant["participant_id"]) for participant in participants]
+        pit_stops = _archive_comparison_pit_stops(
+            connection,
+            heat_id=int(heat["id"]),
+            participant_ids=participant_ids,
+            ours_id=ours_id,
+            first_at_us=first_at_us,
+            last_at_us=last_at_us,
+        )
+        raw_lap_rows = _archive_comparison_lap_rows(
+            connection,
+            heat_id=int(heat["id"]),
+            participant_ids=participant_ids if mode == "all" else [ours_id, str(participant_id)],
+            first_at_us=first_at_us,
+            last_at_us=last_at_us,
+        )
+        lap_series = {
+            "ours": _bounded_archive_lap_rows(raw_lap_rows.get(ours_id, [])),
+            "benchmark": (
+                _bounded_archive_lap_rows(raw_lap_rows.get(str(participant_id), []))
+                if mode == "participant"
+                else _archive_lap_benchmark(
+                    raw_lap_rows,
+                    excluded_participant_id=ours_id,
+                    first_at_us=first_at_us,
+                )
+            ),
+            "benchmark_kind": "participant" if mode == "participant" else "minute_median",
+        }
+        return {
+            "schema_version": ARCHIVE_SCHEMA_VERSION,
+            "session": _session_payload(session),
+            "heat": _archive_heat_summary(heat),
+            "range": {
+                "first_at_us": first_at_us,
+                "last_at_us": last_at_us,
+                "source_point_count": source_point_count,
+                "downsampled": source_point_count > len(point_rows),
+            },
+            "comparison": {
+                "available": True,
+                "mode": mode,
+                "ours_participant_id": ours_id,
+                "participant_id": participant_id if mode == "participant" else None,
+                "class_name": class_name,
+                "benchmark": (
+                    "participant_pace_5_ms"
+                    if mode == "participant"
+                    else "median_on_track_competitor_pace_5_ms"
+                ),
+            },
+            "participants": participants,
+            "points": points,
+            "pit_stops": pit_stops,
+            "lap_series": lap_series,
+            "semantics": {
+                "series": "step",
+                "ours_pace_5_ms": "confirmed rolling pace for five clean laps while our car is on track",
+                "benchmark_pace_5_ms": (
+                    "confirmed rolling pace for the selected on-track competitor"
+                    if mode == "participant"
+                    else "median confirmed rolling pace for on-track competitors in our archived class, excluding our car"
+                ),
+                "lap_series": (
+                    "clean laps for our car and the selected participant; display points are bounded and preserve non-clean breaks"
+                    if mode == "participant"
+                    else "one-minute median of the latest clean lap per competitor, excluding our car"
+                ),
+                "pit_stops": "confirmed pit in/out facts clipped only for timeline display; pit_lane_ms remains the measured full duration",
+                "missing_values": "null values are not interpolated or converted to zero",
+            },
+        }
 
 
 def _evenly_spaced(values: Sequence[int], count: int) -> list[int]:

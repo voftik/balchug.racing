@@ -211,6 +211,9 @@ class TimingApiTests(unittest.IsolatedAsyncioTestCase):
         snapshot = await self.client.get(f"/sessions/{session_id}/archive/snapshot?at_us={timestamp}")
         self.assertEqual(snapshot.status_code, 200)
         self.assertEqual(snapshot.json()["playback"]["effective_at_us"], timestamp)
+        comparison = await self.client.get(f"/sessions/{session_id}/archive/comparison?mode=all")
+        self.assertEqual(comparison.status_code, 200)
+        self.assertFalse(comparison.json()["comparison"]["available"])
 
     async def test_public_read_routes_expose_only_bounded_normalized_timing_data(self):
         created = await self.create("igora", {"mode": "practice"}, "read-surface-session")

@@ -44,8 +44,8 @@
   .rec .meta b{color:var(--navy);font-weight:600;}
   .timing-card-relation{display:flex;align-items:center;flex-wrap:wrap;gap:7px;margin-top:2px;padding-top:9px;border-top:1px dashed var(--line);}
   .timing-card-label{flex:0 0 100%;font-family:var(--display);font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);}
-  .timing-card-link,.timing-relation-link{display:inline-flex;align-items:center;justify-content:center;min-height:40px;
-    border:1px solid var(--red);border-radius:6px;background:var(--red);padding:9px 12px;color:#fff;font:11px/1.25 var(--display);
+  .timing-card-link,.timing-relation-link{display:inline-flex;align-items:center;justify-content:center;min-height:52px;
+    border:1px solid var(--red);border-radius:6px;background:var(--red);padding:13px 16px;color:#fff;font:12px/1.25 var(--display);
     text-align:center;text-transform:uppercase;letter-spacing:.04em;cursor:pointer;box-shadow:0 8px 16px -11px rgba(240,20,61,.9);transition:.15s;}
   .timing-card-link{flex:1 1 100%;width:100%;}
   .timing-card-link:hover,.timing-card-link:focus-visible,.timing-relation-link:hover,.timing-relation-link:focus-visible{background:var(--navy);border-color:var(--navy);color:#fff;outline:2px solid var(--red);outline-offset:2px;}
@@ -164,14 +164,36 @@
   .ta-flag span{font-family:var(--display);font-size:9px;text-transform:uppercase;letter-spacing:0;color:var(--muted);text-align:right;}
   .ta-flag.flag-green{border-left:5px solid #2eac72;}.ta-flag.flag-red{border-left:5px solid var(--red);}.ta-flag.flag-yellow,.ta-flag.flag-fcy,.ta-flag.flag-full-course-yellow,.ta-flag.flag-code-60{border-left:5px solid #d89a00;}.ta-flag.flag-safety-car{border-left:5px solid #7d55b8;}.ta-flag.flag-finish{border-left:5px solid #303946;}
   .ta-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border-bottom:1px solid var(--line);}
-  .ta-kpi{min-width:0;padding:12px 14px;border-right:1px solid var(--line);}
+  .ta-kpi{position:relative;min-width:0;padding:12px 14px;border-right:1px solid var(--line);}
   .ta-kpi:nth-child(4n){border-right:0;}.ta-kpi:nth-child(n+5){border-top:1px solid var(--line);}
   .ta-kpi b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--display);font-size:14px;line-height:1.15;color:var(--navy);font-variant-numeric:tabular-nums;}
   .ta-kpi span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:4px;font-family:var(--display);font-size:8.5px;text-transform:uppercase;letter-spacing:0;color:var(--muted);}
+  .ta-kpi.is-changed,.ta-benchmark-metric.is-changed,.ta-flag.is-changed{animation:ta-value-flash .92s cubic-bezier(.2,.8,.2,1);}
+  @keyframes ta-value-flash{0%{background:rgba(240,20,61,.34);box-shadow:inset 0 0 0 1px rgba(240,20,61,.82)}35%{background:rgba(240,20,61,.13);box-shadow:inset 0 0 0 1px rgba(240,20,61,.32)}100%{background:transparent;box-shadow:inset 0 0 0 1px transparent}}
+  .ta-benchmark{display:grid;grid-template-columns:minmax(150px,1.3fr) repeat(4,minmax(0,1fr));border-bottom:1px solid var(--line);background:#f8fafc;}
+  .ta-benchmark[hidden]{display:none;}.ta-benchmark-title,.ta-benchmark-metric{min-width:0;padding:10px 14px;border-right:1px solid var(--line);}
+  .ta-benchmark-title{font-family:var(--display);font-size:10px;line-height:1.35;text-transform:uppercase;color:var(--navy);}
+  .ta-benchmark-title small{display:block;margin-top:3px;font:9px/1.35 var(--body);text-transform:none;color:var(--muted);}
+  .ta-benchmark-metric:last-child{border-right:0;}.ta-benchmark-metric b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--display);font-size:12px;color:var(--navy);font-variant-numeric:tabular-nums;}
+  .ta-benchmark-metric span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:3px;font-family:var(--display);font-size:8.5px;text-transform:uppercase;color:var(--muted);}
+  .ta-benchmark-metric.delta-fast b{color:#16824f;}.ta-benchmark-metric.delta-slow b{color:var(--red);}
   .ta-chart-wrap{padding:14px 16px 10px;border-bottom:1px solid var(--line);}
-  .ta-chart-labels{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 0 8px;color:var(--muted);font-family:var(--display);font-size:9px;text-transform:uppercase;letter-spacing:0;}
-  .ta-chart-labels span:last-child{color:var(--navy);font-variant-numeric:tabular-nums;}
+  .ta-chart-head{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:8px 14px;margin:0 0 8px;}
+  .ta-chart-title{display:block;font-family:var(--display);font-size:10px;text-transform:uppercase;color:var(--navy);}
+  .ta-chart-help{display:block;margin-top:3px;color:var(--muted);font-size:10.5px;line-height:1.35;}
+  .ta-chart-range{align-self:center;color:var(--navy);font-family:var(--display);font-size:9px;font-variant-numeric:tabular-nums;text-transform:uppercase;white-space:nowrap;}
+  .ta-compare{display:flex;align-items:center;gap:6px;min-width:230px;}.ta-compare label{font-family:var(--display);font-size:9px;text-transform:uppercase;color:var(--muted);white-space:nowrap;}
+  .ta-compare select{min-width:0;width:100%;height:34px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--navy);font:11px var(--body);padding:0 8px;outline:none;}.ta-compare select:focus{border-color:var(--navy);outline:2px solid rgba(27,54,93,.18);outline-offset:1px;}
+  .ta-chart-legend{display:flex;flex-wrap:wrap;gap:7px 14px;margin:0 0 10px;padding:0;list-style:none;}
+  .ta-chart-legend li{display:flex;align-items:flex-start;gap:6px;min-width:0;max-width:260px;color:var(--muted);font-size:9.5px;line-height:1.35;}
+  .ta-chart-legend b{display:block;font-family:var(--display);font-size:9px;text-transform:uppercase;color:var(--navy);}.ta-chart-legend small{display:block;font-size:9.5px;}
+  .ta-legend-key{display:block;flex:none;width:12px;height:3px;margin-top:5px;background:var(--navy);}.ta-legend-key.ours{background:var(--red);}.ta-legend-key.competitor{background:#007b91;}.ta-legend-key.aggregate{background:#526276;}.ta-legend-key.track{height:10px;margin-top:1px;background:linear-gradient(90deg,#2eac72 0 35%,#d89a00 35% 65%,var(--red) 65% 100%);}.ta-legend-key.pit{width:2px;height:12px;margin:0 5px;background:#122846;}
   .ta-chart{display:block;width:100%;height:172px;cursor:crosshair;touch-action:manipulation;}
+  .ta-visual{padding:14px 16px 10px;border-bottom:1px solid var(--line);}.ta-visual[hidden]{display:none;}
+  .ta-visual-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin:0 0 8px;}.ta-visual-title{display:block;font-family:var(--display);font-size:10px;text-transform:uppercase;color:var(--navy);}.ta-visual-help{display:block;margin-top:3px;color:var(--muted);font-size:10.5px;line-height:1.35;}
+  .ta-pit-scroll{max-height:330px;overflow:auto;border-top:1px solid var(--line);border-bottom:1px solid var(--line);}.ta-pit-chart{display:block;width:100%;height:96px;touch-action:manipulation;}
+  .ta-lap-chart{display:block;width:100%;height:186px;touch-action:manipulation;}
+  .ta-lap-legend{display:flex;flex-wrap:wrap;gap:7px 14px;margin:0 0 10px;padding:0;list-style:none;}.ta-lap-legend li{display:flex;align-items:flex-start;gap:6px;color:var(--muted);font-size:9.5px;line-height:1.35;}.ta-lap-legend b{display:block;font-family:var(--display);font-size:9px;text-transform:uppercase;color:var(--navy);}.ta-lap-legend small{display:block;font-size:9.5px;}
   .ta-controls{display:grid;grid-template-columns:auto auto auto auto minmax(80px,1fr) minmax(110px,auto) minmax(104px,auto);align-items:center;gap:8px;padding:12px 16px;}
   .ta-icon{display:inline-flex;align-items:center;justify-content:center;width:44px;height:44px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--navy);font:16px var(--body);cursor:pointer;line-height:1;}
   .ta-icon:hover{border-color:var(--navy);background:#f4f7fb;}.ta-icon.primary{background:var(--navy);border-color:var(--navy);color:#fff;}
@@ -185,8 +207,9 @@
   .ta-events{overflow:auto;max-height:316px;}.ta-event{display:grid;grid-template-columns:48px 1fr;gap:8px;width:100%;padding:10px 14px;border:0;border-bottom:1px solid var(--line);background:#fff;color:inherit;text-align:left;font:11px var(--body);line-height:1.3;cursor:pointer;}.ta-event:hover,.ta-event:focus-visible{background:#f4f7fb;outline:0;}.ta-event time{font-family:var(--display);font-size:9px;color:var(--muted);font-variant-numeric:tabular-nums;}.ta-event b{display:block;font-family:var(--display);font-size:10px;text-transform:uppercase;letter-spacing:0;color:var(--navy);}.ta-event span{display:block;margin-top:2px;color:var(--muted);}.ta-event.active{border-left:3px solid var(--red);padding-left:11px;}
   .ta-side-empty{padding:14px;color:var(--muted);font-size:11px;line-height:1.4;}
   @media(max-width:880px){.ta-body{grid-template-columns:1fr;}.ta-main{border-right:0;}.ta-side{border-top:1px solid var(--line);}.ta-events{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));max-height:none;}.ta-event{border-bottom:0;border-right:1px solid var(--line);}.ta-side-empty{grid-column:1/-1;}.ta-session{margin-left:0;width:100%;}.ta-session select{flex:1;}}
-  @media(max-width:620px){.timing-modal{padding:0;}.timing-sheet{min-height:100%;border:0;border-radius:0;}.timing-close{right:10px;top:10px;}.ta-head{padding:14px 58px 14px 14px;}.ta-coverage{padding:10px 14px;flex-direction:column;gap:3px;}.ta-kpis{grid-template-columns:repeat(2,minmax(0,1fr));}.ta-kpi:nth-child(4n){border-right:1px solid var(--line);}.ta-kpi:nth-child(2n){border-right:0;}.ta-kpi:nth-child(n+3){border-top:1px solid var(--line);}.ta-chart-wrap{padding:12px 14px 8px;}.ta-controls{grid-template-columns:auto auto auto auto minmax(48px,1fr);grid-template-areas:"play back forward reset range" "rate rate time time time";padding:11px 14px;}.ta-session select,.ta-rate select,.ta-time input{height:44px;}.ta-play{grid-area:play;}.ta-back{grid-area:back;}.ta-forward{grid-area:forward;}.ta-reset{grid-area:reset;}.ta-range{grid-area:range;}.ta-rate{grid-area:rate;min-width:0;}.ta-time{grid-area:time;justify-content:flex-end;min-width:0;}.ta-events{grid-template-columns:1fr;}.ta-event{border-right:0;border-bottom:1px solid var(--line);}}
+  @media(max-width:620px){.timing-modal{padding:0;}.timing-sheet{min-height:100%;border:0;border-radius:0;}.timing-close{right:10px;top:10px;}.ta-head{padding:14px 58px 14px 14px;}.ta-coverage{padding:10px 14px;flex-direction:column;gap:3px;}.ta-kpis{grid-template-columns:repeat(2,minmax(0,1fr));}.ta-kpi:nth-child(4n){border-right:1px solid var(--line);}.ta-kpi:nth-child(2n){border-right:0;}.ta-kpi:nth-child(n+3){border-top:1px solid var(--line);}.ta-benchmark{grid-template-columns:repeat(2,minmax(0,1fr));}.ta-benchmark-title{grid-column:1/-1;border-right:0;border-bottom:1px solid var(--line);}.ta-benchmark-metric:nth-child(odd){border-right:0;}.ta-benchmark-metric:nth-child(n+4){border-top:1px solid var(--line);}.ta-chart-wrap,.ta-visual{padding:12px 14px 8px;}.ta-chart-head{grid-template-columns:1fr;gap:8px;}.ta-compare{width:100%;min-width:0;}.ta-chart-range{justify-self:start;}.ta-chart-legend,.ta-lap-legend{gap:7px 10px;}.ta-chart-legend li{max-width:100%;}.ta-visual-head{display:block;}.ta-pit-scroll{max-height:300px;}.ta-controls{grid-template-columns:auto auto auto auto minmax(48px,1fr);grid-template-areas:"play back forward reset range" "rate rate time time time";padding:11px 14px;}.ta-session select,.ta-rate select,.ta-time input{height:44px;}.ta-play{grid-area:play;}.ta-back{grid-area:back;}.ta-forward{grid-area:forward;}.ta-reset{grid-area:reset;}.ta-range{grid-area:range;}.ta-rate{grid-area:rate;min-width:0;}.ta-time{grid-area:time;justify-content:flex-end;min-width:0;}.ta-events{grid-template-columns:1fr;}.ta-event{border-right:0;border-bottom:1px solid var(--line);}}
   @media(max-width:360px){.ta-controls{grid-template-columns:repeat(4,minmax(0,1fr));grid-template-areas:"play back forward reset" "range range range range" "rate rate time time";gap:6px;padding:10px;}.ta-icon{width:100%;min-width:0;height:40px;}.ta-range{min-width:0;}.ta-rate label,.ta-time label{display:none;}.ta-time input{width:82px;}}
+  @media(prefers-reduced-motion:reduce){.ta-kpi.is-changed,.ta-benchmark-metric.is-changed,.ta-flag.is-changed{animation:none;background:rgba(240,20,61,.12);}}
 </style>
 </head>
 <body>
@@ -269,10 +292,33 @@
           <div class="ta-main">
             <div class="ta-flag" id="timingFlag"><strong>—</strong><span id="timingObserved">—</span></div>
             <div class="ta-kpis" id="timingKpis"></div>
+            <div class="ta-benchmark" id="timingBenchmark" hidden></div>
             <div class="ta-chart-wrap">
-              <div class="ta-chart-labels"><span>Pace5 · Gap впереди</span><span id="timingChartRange">—</span></div>
-              <canvas class="ta-chart" id="timingChart" aria-label="Временной график темпа и интервала" role="img"></canvas>
+              <div class="ta-chart-head">
+                <div><span class="ta-chart-title">Темп и сравнение</span><span class="ta-chart-help">Темп считается по пяти чистым кругам: меньшее время означает более высокий темп. Разница темпа показывает BALCHUG Racing минус бенчмарк.</span></div>
+                <div class="ta-compare"><label for="timingComparison">Сравнить с</label><select id="timingComparison" aria-label="Выбор соперника для сравнения" disabled><option>Загрузка…</option></select></div>
+                <span class="ta-chart-range" id="timingChartRange">—</span>
+              </div>
+              <ul class="ta-chart-legend" aria-label="Легенда диаграммы">
+                <li><i class="ta-legend-key ours"></i><span><b>BALCHUG Racing</b><small>Темп за 5 чистых кругов</small></span></li>
+                <li id="timingComparisonLegend" hidden><i class="ta-legend-key aggregate" id="timingComparisonLegendKey"></i><span><b id="timingComparisonLegendTitle">Бенчмарк</b><small id="timingComparisonLegendText">—</small></span></li>
+                <li><i class="ta-legend-key track"></i><span><b>Фон графика</b><small>Статус трассы: зелёный, жёлтый, красный, финиш</small></span></li>
+                <li><i class="ta-legend-key pit"></i><span><b>Вертикальная отметка</b><small>Пит-стоп BALCHUG Racing</small></span></li>
+              </ul>
+              <canvas class="ta-chart" id="timingChart" aria-label="Временной график темпа BALCHUG Racing, выбранного соперника и разницы темпа с бенчмарком" role="img"></canvas>
             </div>
+            <section class="ta-visual" id="timingPitPanel" hidden aria-labelledby="timingPitTitle">
+              <div class="ta-visual-head"><div><span class="ta-visual-title" id="timingPitTitle">Хронология пит-стопов</span><span class="ta-visual-help">Полоса показывает pit in, pit out и измеренную длительность в пит-лейне. Незавершённая остановка остаётся открытой до конца сохранённого окна.</span></div></div>
+              <div class="ta-pit-scroll"><canvas class="ta-pit-chart" id="timingPitChart" aria-label="Хронология пит-стопов BALCHUG Racing и соперников" role="img"></canvas></div>
+            </section>
+            <section class="ta-visual" id="timingLapPanel" hidden aria-labelledby="timingLapTitle">
+              <div class="ta-visual-head"><div><span class="ta-visual-title" id="timingLapTitle">Время круга</span><span class="ta-visual-help">Только подтверждённые чистые круги. In lap, out lap, пит-стопы и пропуски данных не соединяются линией.</span></div></div>
+              <ul class="ta-lap-legend" aria-label="Легенда графика времени круга">
+                <li><i class="ta-legend-key ours"></i><span><b>BALCHUG Racing</b><small>Чистые круги #21</small></span></li>
+                <li id="timingLapLegend" hidden><i class="ta-legend-key aggregate" id="timingLapLegendKey"></i><span><b id="timingLapLegendTitle">Бенчмарк</b><small id="timingLapLegendText">—</small></span></li>
+              </ul>
+              <canvas class="ta-lap-chart" id="timingLapChart" aria-label="Хронологический график чистых времен круга BALCHUG Racing и бенчмарка" role="img"></canvas>
+            </section>
             <div class="ta-controls" aria-label="Управление воспроизведением телеметрии">
               <button class="ta-icon primary ta-play" id="timingPlay" type="button" aria-label="Воспроизвести" title="Воспроизвести">&#9654;</button>
               <button class="ta-icon ta-back" id="timingStepBack" type="button" aria-label="Предыдущий срез" title="Предыдущий срез">&#9664;</button>
@@ -299,6 +345,6 @@
 
   <script src="/assets/hls.min.js"></script>
   <script src="/assets/archive.js?v=20260711-timing-card-cta"></script>
-  <script src="/assets/timing-archive.js?v=20260711-archive-timing-modal"></script>
+  <script src="/assets/timing-archive.js?v=20260711-archive-benchmark"></script>
 </body>
 </html>

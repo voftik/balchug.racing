@@ -19,8 +19,22 @@
     flag: $("timingFlag"),
     observed: $("timingObserved"),
     kpis: $("timingKpis"),
+    benchmark: $("timingBenchmark"),
     chart: $("timingChart"),
     chartRange: $("timingChartRange"),
+    comparison: $("timingComparison"),
+    comparisonLegend: $("timingComparisonLegend"),
+    comparisonLegendKey: $("timingComparisonLegendKey"),
+    comparisonLegendTitle: $("timingComparisonLegendTitle"),
+    comparisonLegendText: $("timingComparisonLegendText"),
+    pitPanel: $("timingPitPanel"),
+    pitChart: $("timingPitChart"),
+    lapPanel: $("timingLapPanel"),
+    lapChart: $("timingLapChart"),
+    lapLegend: $("timingLapLegend"),
+    lapLegendKey: $("timingLapLegendKey"),
+    lapLegendTitle: $("timingLapLegendTitle"),
+    lapLegendText: $("timingLapLegendText"),
     events: $("timingEvents"),
     play: $("timingPlay"),
     stepBack: $("timingStepBack"),
@@ -61,8 +75,28 @@
     eventWindowKey: "",
     chartBase: null,
     chartBaseKey: "",
+    pitBase: null,
+    pitBaseKey: "",
+    pitVisual: null,
+    pitVisualKey: "",
+    pitGeometry: null,
+    pitLastPlayheadX: null,
+    lapBase: null,
+    lapBaseKey: "",
+    lapGeometry: null,
+    lapLastPlayheadX: null,
+    visualsLastDrawMs: 0,
     chartRangeText: "",
     observedText: "",
+    kpiValues: null,
+    flagValue: null,
+    benchmarkValues: null,
+    comparison: null,
+    comparisonSelection: "all",
+    comparisonCache: Object.create(null),
+    comparisonController: null,
+    comparisonRequestId: 0,
+    comparisonRevision: 0,
     entriesLoaded: false,
     entriesLoading: false,
     pendingSelection: null,
@@ -87,6 +121,27 @@
   function formatGap(milliseconds) {
     if (typeof milliseconds !== "number" || !isFinite(milliseconds)) return "—";
     return (milliseconds < 0 ? "-" : "+") + (Math.abs(milliseconds) / 1000).toFixed(3) + "с";
+  }
+
+  function formatNounCount(value, one, few, many) {
+    if (typeof value !== "number" || !isFinite(value) || value < 0) return "—";
+    var count = Math.round(value);
+    var lastTwo = count % 100;
+    var last = count % 10;
+    var suffix = lastTwo >= 11 && lastTwo <= 14 ? many :
+      (last === 1 ? one : (last >= 2 && last <= 4 ? few : many));
+    return count + " " + suffix;
+  }
+
+  function formatLapCount(value) {
+    return formatNounCount(value, "круг", "круга", "кругов");
+  }
+
+  function formatPaceDelta(milliseconds) {
+    if (typeof milliseconds !== "number" || !isFinite(milliseconds)) return "—";
+    if (Math.abs(milliseconds) < 1) return "На одном темпе";
+    var value = (Math.abs(milliseconds) / 1000).toFixed(3) + " с";
+    return milliseconds < 0 ? "-" + value + " быстрее" : "+" + value + " медленнее";
   }
 
   function formatElapsed(seconds) {
@@ -355,6 +410,163 @@
     return state.entries.find(function (entry) { return selectEntryId(entry) === selected; }) || null;
   }
 
+  function comparisonKey(selection) { return selection || "ours"; }
+
+  function comparisonParticipants() {
+    var source = state.comparison || state.comparisonCache.all;
+    return source && Array.isArray(source.participants) ? source.participants : [];
+  }
+
+  function comparisonParticipant(participantId) {
+    return comparisonParticipants().find(function (participant) {
+      return participant && participant.participant_id === participantId;
+    }) || null;
+  }
+
+  function comparisonOursId() {
+    var source = state.comparison || state.comparisonCache.all;
+    return source && source.comparison && source.comparison.ours_participant_id || null;
+  }
+
+  function comparisonOptionLabel(participant) {
+    var number = participant && participant.start_number ? "#" + participant.start_number + " · " : "";
+    var team = participant && participant.team_name || "Соперник";
+    var car = participant && participant.car_name ? " · " + participant.car_name : "";
+    var driver = participant && participant.driver_name ? " · " + participant.driver_name : "";
+    return number + team + car + driver;
+  }
+
+  function renderComparisonLegend() {
+    var response = state.comparison;
+    if (state.comparisonSelection === "ours" || !response || !response.comparison || !response.comparison.available) {
+      elements.comparisonLegend.hidden = true;
+      return;
+    }
+    var comparison = response.comparison;
+    var className = comparison.class_name || "класса";
+    elements.comparisonLegend.hidden = false;
+    if (comparison.mode === "participant") {
+      var participant = comparisonParticipant(comparison.participant_id);
+      elements.comparisonLegendKey.className = "ta-legend-key competitor";
+      elements.comparisonLegendTitle.textContent = participant ? comparisonOptionLabel(participant) : "Соперник";
+      elements.comparisonLegendText.textContent = "Темп выбранной машины того же класса";
+    } else {
+      elements.comparisonLegendKey.className = "ta-legend-key aggregate";
+      elements.comparisonLegendTitle.textContent = "Медиана соперников " + className;
+      elements.comparisonLegendText.textContent = "Только подтверждённый темп едущих соперников; #21 исключён";
+    }
+  }
+
+  function renderComparisonSelector() {
+    var participants = comparisonParticipants();
+    var source = state.comparison || state.comparisonCache.all;
+    var comparison = source && source.comparison;
+    elements.comparison.replaceChildren();
+    if (!comparison || !comparison.available || !participants.length) {
+      var unavailable = document.createElement("option");
+      unavailable.textContent = "Сравнение недоступно";
+      elements.comparison.appendChild(unavailable);
+      elements.comparison.disabled = true;
+      renderComparisonLegend();
+      return;
+    }
+    var oursId = comparison.ours_participant_id;
+    var ourParticipant = participants.find(function (participant) { return participant.participant_id === oursId; });
+    var ours = document.createElement("option");
+    ours.value = "ours";
+    ours.textContent = ourParticipant ? "Только " + comparisonOptionLabel(ourParticipant) : "Только BALCHUG Racing";
+    elements.comparison.appendChild(ours);
+    var aggregate = document.createElement("option");
+    aggregate.value = "all";
+    aggregate.textContent = "Все соперники " + (comparison.class_name || "класса") + " · медиана";
+    elements.comparison.appendChild(aggregate);
+    var group = document.createElement("optgroup");
+    group.label = "Отдельный соперник";
+    participants.filter(function (participant) { return participant.participant_id !== oursId; }).forEach(function (participant) {
+      var option = document.createElement("option");
+      option.value = "participant:" + participant.participant_id;
+      option.textContent = comparisonOptionLabel(participant);
+      group.appendChild(option);
+    });
+    if (group.children.length) elements.comparison.appendChild(group);
+    var valid = Array.prototype.some.call(elements.comparison.options, function (option) {
+      return option.value === state.comparisonSelection;
+    });
+    if (!valid) state.comparisonSelection = "all";
+    elements.comparison.value = state.comparisonSelection;
+    elements.comparison.disabled = false;
+    renderComparisonLegend();
+  }
+
+  function renderComparisonLoading() {
+    elements.comparison.replaceChildren();
+    var option = document.createElement("option");
+    option.textContent = "Загрузка…";
+    elements.comparison.appendChild(option);
+    elements.comparison.disabled = true;
+    elements.comparisonLegend.hidden = true;
+    elements.benchmark.hidden = true;
+    elements.pitPanel.hidden = true;
+    elements.lapPanel.hidden = true;
+  }
+
+  function applyComparison(response, selection) {
+    state.comparison = response && response.comparison && response.comparison.available ? response : null;
+    state.comparisonRevision += 1;
+    renderComparisonSelector();
+    renderComparisonLegend();
+    if (state.payload) renderBenchmark(state.payload);
+    drawChart();
+  }
+
+  function loadComparison(selection, epoch) {
+    selection = comparisonKey(selection);
+    state.comparisonSelection = selection;
+    if (selection === "ours") {
+      state.comparison = null;
+      state.comparisonRevision += 1;
+      renderComparisonSelector();
+      renderComparisonLegend();
+      if (state.payload) renderBenchmark(state.payload);
+      drawChart();
+      return;
+    }
+    if (state.comparisonCache[selection]) {
+      applyComparison(state.comparisonCache[selection], selection);
+      return;
+    }
+    if (!state.entry || !state.manifest) return;
+    if (state.comparisonController) state.comparisonController.abort();
+    state.comparison = null;
+    state.comparisonRevision += 1;
+    renderComparisonLegend();
+    if (state.payload) renderBenchmark(state.payload);
+    drawChart();
+    var requestId = ++state.comparisonRequestId;
+    var requestEpoch = epoch === undefined ? state.selectionEpoch : epoch;
+    var participantId = selection.indexOf("participant:") === 0 ? selection.slice("participant:".length) : null;
+    var url = API + "/sessions/" + encodeURIComponent(state.entry.session.id) + "/archive/comparison?generation=" +
+      encodeURIComponent(state.entry.heat.generation) + "&mode=" + (participantId ? "participant" : "all");
+    if (participantId) url += "&participant_id=" + encodeURIComponent(participantId);
+    state.comparisonController = new AbortController();
+    fetchJson(url, { signal: state.comparisonController.signal }).then(function (response) {
+      if (requestEpoch !== state.selectionEpoch || requestId !== state.comparisonRequestId || selection !== state.comparisonSelection) return;
+      state.comparisonCache[selection] = response;
+      applyComparison(response, selection);
+    }).catch(function (error) {
+      if (error && error.name === "AbortError") return;
+      if (requestEpoch !== state.selectionEpoch || requestId !== state.comparisonRequestId || selection !== state.comparisonSelection) return;
+      state.comparison = null;
+      state.comparisonRevision += 1;
+      renderComparisonSelector();
+      renderComparisonLegend();
+      if (state.payload) renderBenchmark(state.payload);
+      drawChart();
+    }).then(function () {
+      if (requestId === state.comparisonRequestId) state.comparisonController = null;
+    });
+  }
+
   function loadSelectedEntry() {
     stopPlayback();
     var entry = currentEntry();
@@ -363,6 +575,7 @@
     var epoch = state.selectionEpoch;
     if (state.manifestController) state.manifestController.abort();
     if (state.snapshotController) state.snapshotController.abort();
+    if (state.comparisonController) state.comparisonController.abort();
     window.clearTimeout(state.snapshotTimer);
     state.snapshotRequestId += 1;
     state.activeSnapshotRequestId = 0;
@@ -383,12 +596,33 @@
     state.eventWindowKey = "";
     state.chartBase = null;
     state.chartBaseKey = "";
+    state.pitBase = null;
+    state.pitBaseKey = "";
+    state.pitVisual = null;
+    state.pitVisualKey = "";
+    state.pitGeometry = null;
+    state.pitLastPlayheadX = null;
+    state.lapBase = null;
+    state.lapBaseKey = "";
+    state.lapGeometry = null;
+    state.lapLastPlayheadX = null;
+    state.visualsLastDrawMs = 0;
     state.chartRangeText = "";
     state.observedText = "";
+    state.kpiValues = null;
+    state.flagValue = null;
+    state.benchmarkValues = null;
+    state.comparison = null;
+    state.comparisonSelection = "all";
+    state.comparisonCache = Object.create(null);
+    state.comparisonController = null;
+    state.comparisonRequestId += 1;
+    state.comparisonRevision += 1;
     state.coverage = null;
     root.classList.remove("is-terminal-snapshot");
     elements.coverage.hidden = true;
     elements.coverage.className = "ta-coverage";
+    renderComparisonLoading();
     controlsDisabled(true);
     setEmpty("Загрузка телеметрической сессии…");
     try { localStorage.setItem(storeKey(), selectEntryId(entry)); } catch (error) {}
@@ -407,6 +641,7 @@
       controlsDisabled(state.coverage && state.coverage.kind === "terminal_snapshot");
       buildEvents();
       setAt(state.atUs, !(state.coverage && state.coverage.kind === "terminal_snapshot"));
+      if (!(state.coverage && state.coverage.kind === "terminal_snapshot")) loadComparison("all", epoch);
     }).catch(function (error) {
       if ((error && error.name === "AbortError") || epoch !== state.selectionEpoch) return;
       setEmpty("Архивная телеметрия недоступна: " + error.message);
@@ -549,11 +784,15 @@
     state.payload = null;
     state.effectiveAtUs = null;
     state.renderedEffectiveAtUs = null;
+    state.kpiValues = null;
+    state.flagValue = null;
+    state.benchmarkValues = null;
     elements.flag.className = "ta-flag";
     elements.flag.querySelector("strong").textContent = "Загрузка среза";
     state.observedText = "курсор " + formatElapsed((state.atUs - state.manifest.range.first_at_us) / 1000000);
     elements.observed.textContent = state.observedText;
     elements.kpis.replaceChildren();
+    elements.benchmark.hidden = true;
   }
 
   function updateSnapshotTiming(effectiveAtUs) {
@@ -567,6 +806,125 @@
     }
   }
 
+  function restartFlash(element) {
+    element.classList.remove("is-changed");
+    void element.offsetWidth;
+    element.classList.add("is-changed");
+  }
+
+  function firstDefined() {
+    for (var index = 0; index < arguments.length; index += 1) {
+      if (arguments[index] !== null && arguments[index] !== undefined) return arguments[index];
+    }
+    return null;
+  }
+
+  function snapshotClassParticipants(payload) {
+    var snapshot = asObject(payload);
+    var participants = Array.isArray(snapshot.class_participants) ? snapshot.class_participants : [];
+    return participants.map(function (raw) {
+      var item = asObject(raw);
+      var measured = asObject(item.measured);
+      var computed = asObject(item.computed);
+      var measuredState = asObject(measured.state);
+      return {
+        participantId: firstDefined(computed.participant_id, measured.participant_id),
+        pace5: numericValue(computed.pace_5_ms),
+        state: firstDefined(computed.current_state, measuredState.state_kind, measuredState.state),
+        positionClass: firstDefined(computed.position_class, measuredState.position_class),
+        tyreAge: numericValue(computed.tyre_age_laps),
+        pits: numericValue(computed.pits_completed),
+        driver: firstDefined(computed.current_driver_name, measuredState.driver_name)
+      };
+    }).filter(function (participant) { return typeof participant.participantId === "string" && participant.participantId; });
+  }
+
+  function onTrackPace(participant) {
+    return participant && participant.state === "ON_TRACK" ? numericValue(participant.pace5) : null;
+  }
+
+  function median(values) {
+    if (!values.length) return null;
+    var ordered = values.slice().sort(function (left, right) { return left - right; });
+    var middle = Math.floor(ordered.length / 2);
+    return ordered.length % 2 ? ordered[middle] : (ordered[middle - 1] + ordered[middle]) / 2;
+  }
+
+  function benchmarkMetric(label, value, key, changed, className) {
+    var cell = document.createElement("div");
+    cell.className = "ta-benchmark-metric" + (changed ? " is-changed" : "") + (className ? " " + className : "");
+    var result = document.createElement("b");
+    result.textContent = valueOrDash(value);
+    result.title = result.textContent;
+    var caption = document.createElement("span");
+    caption.textContent = label;
+    cell.dataset.metric = key;
+    cell.appendChild(result);
+    cell.appendChild(caption);
+    return cell;
+  }
+
+  function renderBenchmark(payload) {
+    var response = state.comparison;
+    if (state.comparisonSelection === "ours" || !response || !response.comparison || !response.comparison.available) {
+      elements.benchmark.hidden = true;
+      state.benchmarkValues = null;
+      return;
+    }
+    var comparison = response.comparison;
+    var snapshot = asObject(payload);
+    var session = asObject(asObject(snapshot.computed).session);
+    var oursId = comparison.ours_participant_id;
+    var participants = snapshotClassParticipants(snapshot);
+    var ownPace = session.current_state === "ON_TRACK" ? numericValue(session.pace_5_ms) : null;
+    var benchmarkPace = null;
+    var contextValue = "—";
+    var contextLabel = "В бенчмарке";
+    var titleText;
+    var noteText;
+    if (comparison.mode === "participant") {
+      var selected = participants.find(function (participant) { return participant.participantId === comparison.participant_id; });
+      var selectedMeta = comparisonParticipant(comparison.participant_id);
+      benchmarkPace = onTrackPace(selected);
+      titleText = selectedMeta ? comparisonOptionLabel(selectedMeta) : "Выбранный соперник";
+      noteText = "Подтверждённый темп выбранной машины";
+      contextLabel = "Позиция в классе";
+      contextValue = selected && selected.positionClass !== null && selected.positionClass !== undefined ? "P" + selected.positionClass : "—";
+    } else {
+      var competitorPaces = participants.filter(function (participant) {
+        return participant.participantId !== oursId;
+      }).map(onTrackPace).filter(function (pace) { return pace !== null; });
+      benchmarkPace = median(competitorPaces);
+      titleText = "Медиана соперников " + (comparison.class_name || "класса");
+      noteText = "Только едущие соперники с подтверждённым темпом";
+      contextValue = formatNounCount(competitorPaces.length, "машина", "машины", "машин");
+    }
+    var delta = ownPace !== null && benchmarkPace !== null ? ownPace - benchmarkPace : null;
+    var values = {
+      ours: formatLap(ownPace),
+      benchmark: formatLap(benchmarkPace),
+      delta: formatPaceDelta(delta),
+      context: contextValue
+    };
+    var previous = state.benchmarkValues;
+    elements.benchmark.replaceChildren();
+    var title = document.createElement("div");
+    title.className = "ta-benchmark-title";
+    title.textContent = titleText;
+    var note = document.createElement("small");
+    note.textContent = noteText;
+    title.appendChild(note);
+    elements.benchmark.appendChild(title);
+    var deltaClass = delta === null ? "" : (delta < 0 ? "delta-fast" : (delta > 0 ? "delta-slow" : ""));
+    elements.benchmark.appendChild(benchmarkMetric("Темп BALCHUG", values.ours, "ours", !!previous && previous.ours !== values.ours));
+    elements.benchmark.appendChild(benchmarkMetric("Темп бенчмарка", values.benchmark, "benchmark", !!previous && previous.benchmark !== values.benchmark));
+    elements.benchmark.appendChild(benchmarkMetric(contextLabel, values.context, "context", !!previous && previous.context !== values.context));
+    var deltaMetric = benchmarkMetric("Разница темпа", values.delta, "delta", !!previous && previous.delta !== values.delta, deltaClass);
+    elements.benchmark.insertBefore(deltaMetric, elements.benchmark.children[3]);
+    state.benchmarkValues = values;
+    elements.benchmark.hidden = false;
+  }
+
   function renderSnapshot(payload, effectiveAtUs) {
     var snapshot = asObject(payload);
     var measured = asObject(snapshot.measured);
@@ -576,37 +934,47 @@
     var session = asObject(computed.session);
     var flag = asObject(measured.track_flag);
     var flagValue = flag.flag || session.track_flag;
+    var normalizedFlag = valueOrDash(flagValue);
+    var flagChanged = state.flagValue !== null && state.flagValue !== normalizedFlag;
     elements.flag.className = "ta-flag " + flagClass(flagValue);
     elements.flag.querySelector("strong").textContent = flagLabel(flagValue);
+    if (flagChanged) restartFlash(elements.flag);
+    state.flagValue = normalizedFlag;
     updateSnapshotTiming(effectiveAtUs);
 
     var values = [
-      ["POS", session.position_overall !== null && session.position_overall !== undefined ? "P" + session.position_overall : oursState.position_overall !== null && oursState.position_overall !== undefined ? "P" + oursState.position_overall : "—"],
-      ["PIC", session.position_class !== null && session.position_class !== undefined ? "P" + session.position_class : oursState.position_class !== null && oursState.position_class !== undefined ? "P" + oursState.position_class : "—"],
-      ["Круги", session.completed_laps !== null && session.completed_laps !== undefined ? session.completed_laps : oursState.laps],
-      ["STATE", session.current_state || oursState.state_kind || oursState.state],
-      ["Last", formatLap(session.last_lap_ms || oursState.last_lap_ms)],
-      ["Pace5", formatLap(session.pace_5_ms)],
-      ["Впереди", formatGap(session.gap_to_ahead_ms)],
-      ["Сзади", formatGap(session.gap_to_behind_ms)],
-      ["Шины", session.tyre_age_laps !== null && session.tyre_age_laps !== undefined ? session.tyre_age_laps + "L" : "—"],
-      ["Питы", session.pits_completed !== null && session.pits_completed !== undefined ? session.pits_completed : "—"],
-      ["Best", formatLap(session.best_lap_ms || oursState.best_lap_ms)],
-      ["Экипаж", ours.start_number ? "#" + ours.start_number : session.ours_identity && session.ours_identity.start_number ? "#" + session.ours_identity.start_number : "—"]
+      { id: "pos", label: "POS", value: session.position_overall !== null && session.position_overall !== undefined ? "P" + session.position_overall : oursState.position_overall !== null && oursState.position_overall !== undefined ? "P" + oursState.position_overall : "—" },
+      { id: "class_leader_gap", label: "До лидера класса", value: formatGap(session.gap_to_class_leader_ms) },
+      { id: "laps", label: "Круги", value: firstDefined(session.completed_laps, oursState.laps) },
+      { id: "state", label: "Состояние", value: firstDefined(session.current_state, oursState.state_kind, oursState.state) },
+      { id: "last", label: "Последний круг", value: formatLap(firstDefined(session.last_lap_ms, oursState.last_lap_ms)) },
+      { id: "pace5", label: "Темп (5 кр.)", value: formatLap(session.pace_5_ms) },
+      { id: "ahead", label: "Впереди", value: formatGap(session.gap_to_ahead_ms) },
+      { id: "behind", label: "Сзади", value: formatGap(session.gap_to_behind_ms) },
+      { id: "tyres", label: "Возраст шин", value: formatLapCount(firstDefined(session.tyre_age_laps, oursState.tyre_age_laps)) },
+      { id: "pits", label: "Пит-стопы", value: firstDefined(session.pits_completed, oursState.provider_pit_count) },
+      { id: "best", label: "Лучший круг", value: formatLap(firstDefined(session.best_lap_ms, oursState.best_lap_ms)) },
+      { id: "driver", label: "Пилот", value: firstDefined(oursState.driver_name, ours.current_driver_name, session.ours_identity && session.ours_identity.driver_name) }
     ];
+    var nextValues = Object.create(null);
     elements.kpis.replaceChildren();
     values.forEach(function (item) {
+      var displayValue = valueOrDash(item.value);
+      nextValues[item.id] = displayValue;
       var cell = document.createElement("div");
-      cell.className = "ta-kpi";
+      var changed = state.kpiValues !== null && state.kpiValues[item.id] !== displayValue;
+      cell.className = "ta-kpi" + (changed ? " is-changed" : "");
       var value = document.createElement("b");
-      value.textContent = valueOrDash(item[1]);
+      value.textContent = displayValue;
       value.title = value.textContent;
       var label = document.createElement("span");
-      label.textContent = item[0];
+      label.textContent = item.label;
       cell.appendChild(value);
       cell.appendChild(label);
       elements.kpis.appendChild(cell);
     });
+    state.kpiValues = nextValues;
+    renderBenchmark(payload);
   }
 
   function pointValue(point, key) {
@@ -615,6 +983,403 @@
     var session = asObject(computed.session);
     var value = session[key];
     return typeof value === "number" && isFinite(value) ? value : null;
+  }
+
+  function comparisonChartSamples() {
+    var response = state.comparison;
+    if (response && response.comparison && response.comparison.available && Array.isArray(response.points)) {
+      return response.points.map(function (point) {
+        return {
+          atUs: point.observed_at_us,
+          ours: numericValue(point.ours_pace_5_ms),
+          benchmark: numericValue(point.benchmark_pace_5_ms),
+          p25: numericValue(point.benchmark_p25_pace_5_ms),
+          p75: numericValue(point.benchmark_p75_pace_5_ms),
+          count: numericValue(point.benchmark_participant_count)
+        };
+      });
+    }
+    return (state.manifest.keyframes || []).map(function (point) {
+      return { atUs: point.observed_at_us, ours: pointValue(point, "pace_5_ms"), benchmark: null, p25: null, p75: null, count: null };
+    });
+  }
+
+  function comparisonVisualData() {
+    if (state.comparison && state.comparison.comparison && state.comparison.comparison.available) return state.comparison;
+    if (state.comparisonSelection === "ours" && state.comparisonCache.all && state.comparisonCache.all.comparison && state.comparisonCache.all.comparison.available) {
+      return state.comparisonCache.all;
+    }
+    return null;
+  }
+
+  function prepareCanvas(canvas, height, clear) {
+    var rect = canvas.getBoundingClientRect();
+    var width = Math.max(1, Math.round(rect.width));
+    var ratio = window.devicePixelRatio || 1;
+    if (canvas.style.height !== height + "px") canvas.style.height = height + "px";
+    if (canvas.width !== width * ratio || canvas.height !== height * ratio) {
+      canvas.width = width * ratio;
+      canvas.height = height * ratio;
+    }
+    var context = canvas.getContext("2d");
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    if (clear !== false) context.clearRect(0, 0, width, height);
+    return { context: context, width: width, height: height };
+  }
+
+  function staticCanvas(width, height, ratio) {
+    var canvas = document.createElement("canvas");
+    canvas.width = width * ratio;
+    canvas.height = height * ratio;
+    var context = canvas.getContext("2d");
+    context.setTransform(ratio, 0, 0, ratio, 0, 0);
+    context.clearRect(0, 0, width, height);
+    return { canvas: canvas, context: context };
+  }
+
+  function drawTimelinePlayhead(context, x, height) {
+    context.strokeStyle = "#122846";
+    context.lineWidth = 1.4;
+    context.setLineDash([4, 3]);
+    context.beginPath(); context.moveTo(x, 0); context.lineTo(x, height); context.stroke();
+    context.setLineDash([]);
+  }
+
+  function drawTimelineFlags(context, xAt, width, height, range, left, right) {
+    (state.manifest.markers.flags || []).forEach(function (flag) {
+      var start = Math.max(range.first_at_us, flag.started_at_us || range.first_at_us);
+      var end = Math.min(range.last_at_us, flag.ended_at_us || range.last_at_us);
+      if (end < start) return;
+      context.fillStyle = flagColor(flag.flag);
+      context.fillRect(xAt(start), 0, Math.max(1, xAt(end) - xAt(start)), height);
+    });
+    context.strokeStyle = "#E4E9F0";
+    context.lineWidth = 1;
+    [0, 0.5, 1].forEach(function (ratio) {
+      var x = left + (width - left - right) * ratio + 0.5;
+      context.beginPath(); context.moveTo(x, 0); context.lineTo(x, height); context.stroke();
+    });
+  }
+
+  function pitVisualConfiguration(data) {
+    var key = [
+      state.manifest && state.manifest.heat && state.manifest.heat.source_heat_id,
+      state.comparisonSelection,
+      state.comparisonRevision
+    ].join(":");
+    if (state.pitVisual && state.pitVisualKey === key) return state.pitVisual;
+    var comparison = asObject(data.comparison);
+    var oursId = comparison.ours_participant_id;
+    var selectedId = state.comparisonSelection.indexOf("participant:") === 0 ?
+      state.comparisonSelection.slice("participant:".length) : null;
+    var participantIds = state.comparisonSelection === "ours" ? [oursId] :
+      (selectedId ? [oursId, selectedId] : (data.participants || []).map(function (participant) { return participant.participant_id; }));
+    var requiredIds = Object.create(null);
+    participantIds.forEach(function (participantId) { requiredIds[participantId] = true; });
+    var pitsByParticipant = Object.create(null);
+    var pits = (data.pit_stops || []).filter(function (pit) {
+      return !!requiredIds[pit.participant_id];
+    });
+    pits.forEach(function (pit) {
+      if (!pitsByParticipant[pit.participant_id]) pitsByParticipant[pit.participant_id] = [];
+      pitsByParticipant[pit.participant_id].push(pit);
+    });
+    var participants = (data.participants || []).filter(function (participant) {
+      if (!requiredIds[participant.participant_id]) return false;
+      // A selected rival remains visible even before its first pit-stop.
+      return !!pitsByParticipant[participant.participant_id] || participant.participant_id === oursId || participant.participant_id === selectedId;
+    });
+    if (!participants.length) {
+      var ours = (data.participants || []).find(function (participant) { return participant.participant_id === oursId; });
+      if (ours) participants = [ours];
+    }
+    state.pitVisualKey = key;
+    state.pitVisual = {
+      key: key,
+      oursId: oursId,
+      selectedId: selectedId,
+      participants: participants,
+      pits: pits,
+      pitsByParticipant: pitsByParticipant
+    };
+    return state.pitVisual;
+  }
+
+  function drawPitTimelineBase(context, visual, width, height) {
+    var rowHeight = 30;
+    var headerHeight = 22;
+    var range = state.manifest.range;
+    var left = width < 440 ? 92 : 136;
+    var right = 10;
+    var usableWidth = Math.max(1, width - left - right);
+    var total = Math.max(1, range.last_at_us - range.first_at_us);
+    var xAt = function (atUs) { return left + (atUs - range.first_at_us) / total * usableWidth; };
+    drawTimelineFlags(context, xAt, width, height, range, left, right);
+    context.fillStyle = "#6E7E98";
+    context.font = "9px Arial";
+    context.fillText("00:00", left, 12);
+    context.fillText(formatElapsed((range.last_at_us - range.first_at_us) / 2_000_000), left + usableWidth / 2 - 18, 12);
+    context.fillText(formatElapsed((range.last_at_us - range.first_at_us) / 1_000_000), width - right - 42, 12);
+    if (!visual.pits.length) {
+      context.fillStyle = "#6E7E98";
+      context.font = "11px Arial";
+      context.fillText("В сохранённой части нет подтверждённых пит-стопов выбранных машин", left, headerHeight + 19);
+    }
+    visual.participants.forEach(function (participant, index) {
+      var top = headerHeight + index * rowHeight;
+      var isOurs = participant.participant_id === visual.oursId;
+      var selected = participant.participant_id === visual.selectedId;
+      context.strokeStyle = "#E4E9F0";
+      context.lineWidth = 1;
+      context.beginPath(); context.moveTo(0, top + rowHeight - 0.5); context.lineTo(width, top + rowHeight - 0.5); context.stroke();
+      context.fillStyle = "#1B365D";
+      context.font = "10px Arial";
+      var label = (participant.start_number ? "#" + participant.start_number + " " : "") + (participant.team_name || "Машина");
+      context.save(); context.beginPath(); context.rect(0, top, Math.max(1, left - 6), rowHeight); context.clip(); context.fillText(label, 4, top + 19); context.restore();
+      (visual.pitsByParticipant[participant.participant_id] || []).forEach(function (pit) {
+        var start = numericValue(pit.timeline_started_at_us);
+        if (start === null) return;
+        var end = numericValue(pit.timeline_ended_at_us);
+        if (end === null) end = range.last_at_us;
+        var x = xAt(start);
+        var endX = xAt(Math.max(start, Math.min(range.last_at_us, end)));
+        var barWidth = Math.max(3, endX - x);
+        context.fillStyle = isOurs ? "#F0143D" : (selected ? "#007B91" : "#526276");
+        context.globalAlpha = pit.completed ? 0.88 : 0.48;
+        context.fillRect(x, top + 7, barWidth, 15);
+        context.globalAlpha = 1;
+        if (!pit.completed) {
+          context.strokeStyle = "#122846";
+          context.setLineDash([3, 2]);
+          context.strokeRect(x + 0.5, top + 7.5, Math.max(2, barWidth - 1), 14);
+          context.setLineDash([]);
+        }
+        if (barWidth > 44 && pit.pit_lane_ms !== null && pit.pit_lane_ms !== undefined) {
+          context.fillStyle = "#fff";
+          context.font = "9px Arial";
+          context.fillText(formatLap(pit.pit_lane_ms), x + 4, top + 18);
+        }
+      });
+    });
+    return { left: left, right: right, range: range };
+  }
+
+  function drawPitTimeline() {
+    var data = comparisonVisualData();
+    if (!data || !state.manifest || !Array.isArray(data.pit_stops)) {
+      elements.pitPanel.hidden = true;
+      state.pitBase = null;
+      state.pitBaseKey = "";
+      return;
+    }
+    var visual = pitVisualConfiguration(data);
+    elements.pitPanel.hidden = false;
+    var height = 22 + Math.max(1, visual.participants.length) * 30 + 6;
+    var surface = prepareCanvas(elements.pitChart, height, false);
+    var ratio = window.devicePixelRatio || 1;
+    var baseKey = [visual.key, surface.width, surface.height, ratio].join(":");
+    if (!state.pitBase || state.pitBaseKey !== baseKey) {
+      var base = staticCanvas(surface.width, surface.height, ratio);
+      var geometry = drawPitTimelineBase(base.context, visual, surface.width, surface.height);
+      state.pitBase = base.canvas;
+      state.pitBaseKey = baseKey;
+      state.pitGeometry = geometry;
+      state.pitLastPlayheadX = null;
+    }
+    var geometry = state.pitGeometry;
+    var total = Math.max(1, geometry.range.last_at_us - geometry.range.first_at_us);
+    var playhead = geometry.left + (state.atUs - geometry.range.first_at_us) / total * Math.max(1, surface.width - geometry.left - geometry.right);
+    var playheadPixel = Math.round(playhead);
+    if (state.pitLastPlayheadX === playheadPixel) return;
+    surface.context.clearRect(0, 0, surface.width, surface.height);
+    surface.context.drawImage(state.pitBase, 0, 0, surface.width, surface.height);
+    drawTimelinePlayhead(surface.context, playhead, surface.height);
+    state.pitLastPlayheadX = playheadPixel;
+  }
+
+  function cleanLapPoints(laps) {
+    var points = [];
+    var breakBefore = true;
+    (Array.isArray(laps) ? laps : []).forEach(function (lap) {
+      var duration = numericValue(lap.duration_ms);
+      var clean = !!lap.is_clean && duration !== null;
+      if (clean) points.push({
+        atUs: lap.completed_at_us,
+        value: duration,
+        breakBefore: breakBefore || lap.break_before === true
+      });
+      breakBefore = !clean;
+    });
+    return points;
+  }
+
+  function aggregateLapPoints(points) {
+    var previousEnd = null;
+    return (Array.isArray(points) ? points : []).map(function (point) {
+      var start = numericValue(point.window_started_at_us);
+      var end = numericValue(point.window_ended_at_us);
+      var result = {
+        atUs: start !== null && end !== null ? Math.round((start + end) / 2) : start,
+        value: numericValue(point.median_duration_ms),
+        p25: numericValue(point.p25_duration_ms),
+        p75: numericValue(point.p75_duration_ms),
+        count: numericValue(point.participant_count),
+        breakBefore: previousEnd !== null && start !== previousEnd
+      };
+      previousEnd = end;
+      return result;
+    }).filter(function (point) { return point.atUs !== null && point.value !== null; });
+  }
+
+  function renderLapLegend(data) {
+    if (state.comparisonSelection === "ours" || !data || !data.comparison || !data.comparison.available) {
+      elements.lapLegend.hidden = true;
+      return;
+    }
+    var comparison = data.comparison;
+    elements.lapLegend.hidden = false;
+    if (comparison.mode === "participant") {
+      var participant = comparisonParticipant(comparison.participant_id);
+      elements.lapLegendKey.className = "ta-legend-key competitor";
+      elements.lapLegendTitle.textContent = participant ? comparisonOptionLabel(participant) : "Соперник";
+      elements.lapLegendText.textContent = "Подтверждённые чистые круги выбранной машины";
+    } else {
+      elements.lapLegendKey.className = "ta-legend-key aggregate";
+      elements.lapLegendTitle.textContent = "Медиана соперников";
+      elements.lapLegendText.textContent = "Медиана чистых кругов в 60-секундном окне; полоса — межквартильный диапазон";
+    }
+  }
+
+  function drawLapChartBase(context, data, width, height) {
+    renderLapLegend(data);
+    var range = state.manifest.range;
+    var left = 42;
+    var right = 10;
+    var usableWidth = Math.max(1, width - left - right);
+    var total = Math.max(1, range.last_at_us - range.first_at_us);
+    var xAt = function (atUs) { return left + (atUs - range.first_at_us) / total * usableWidth; };
+    drawTimelineFlags(context, xAt, width, height, range, left, right);
+    var own = cleanLapPoints(data.lap_series.ours);
+    var aggregate = data.lap_series.benchmark_kind === "minute_median";
+    var benchmark = aggregate ? aggregateLapPoints(data.lap_series.benchmark) : cleanLapPoints(data.lap_series.benchmark);
+    var values = own.concat(benchmark).map(function (point) { return point.value; });
+    benchmark.forEach(function (point) { if (point.p25 !== null) values.push(point.p25); if (point.p75 !== null) values.push(point.p75); });
+    if (!values.length) {
+      context.fillStyle = "#6E7E98";
+      context.font = "11px Arial";
+      context.fillText("Нет подтверждённых чистых кругов в выбранном сравнении", left, height / 2);
+      return { left: left, right: right, range: range };
+    }
+    var min = Math.min.apply(Math, values);
+    var max = Math.max.apply(Math, values);
+    if (min === max) { min -= 1; max += 1; }
+    var yAt = function (value) { return 16 + (height - 32) - (value - min) / (max - min) * (height - 32); };
+    context.fillStyle = "#6E7E98";
+    context.font = "10px Arial";
+    context.fillText("Круг", 2, 26);
+    context.fillText(formatLap(min), width - right - 48, 26);
+    context.fillText(formatLap(max), width - right - 48, height - 16);
+    context.strokeStyle = "#E4E9F0";
+    context.lineWidth = 1;
+    [0.25, 0.5, 0.75].forEach(function (ratio) {
+      var y = Math.round(16 + (height - 32) * ratio) + 0.5;
+      context.beginPath(); context.moveTo(left, y); context.lineTo(width - right, y); context.stroke();
+    });
+    function drawBand(points) {
+      var segment = [];
+      function flush() {
+        if (segment.length < 2) { segment = []; return; }
+        context.fillStyle = "rgba(82,98,118,.14)";
+        context.beginPath();
+        segment.forEach(function (point, index) {
+          var x = xAt(point.atUs);
+          if (!index) context.moveTo(x, yAt(point.p25));
+          else { context.lineTo(x, yAt(segment[index - 1].p25)); context.lineTo(x, yAt(point.p25)); }
+        });
+        for (var index = segment.length - 1; index >= 0; index -= 1) {
+          var point = segment[index];
+          if (index === segment.length - 1) context.lineTo(xAt(point.atUs), yAt(point.p75));
+          else { context.lineTo(xAt(point.atUs), yAt(segment[index + 1].p75)); context.lineTo(xAt(point.atUs), yAt(point.p75)); }
+        }
+        context.closePath(); context.fill(); segment = [];
+      }
+      points.forEach(function (point) {
+        if (point.count !== null && point.count >= 2 && point.p25 !== null && point.p75 !== null) segment.push(point);
+        else flush();
+      });
+      flush();
+    }
+    function drawLapSeries(points, color, dash) {
+      context.strokeStyle = color;
+      context.lineWidth = 1.5;
+      context.setLineDash(dash || []);
+      context.beginPath();
+      var previous = null;
+      points.forEach(function (point) {
+        var x = xAt(point.atUs);
+        var y = yAt(point.value);
+        if (previous === null || point.breakBefore) context.moveTo(x, y);
+        else context.lineTo(x, y);
+        previous = point;
+      });
+      context.stroke();
+      context.setLineDash([]);
+      context.fillStyle = color;
+      points.forEach(function (point) {
+        context.beginPath(); context.arc(xAt(point.atUs), yAt(point.value), 2.3, 0, Math.PI * 2); context.fill();
+      });
+    }
+    if (aggregate) drawBand(benchmark);
+    drawLapSeries(own, "#F0143D");
+    if (state.comparisonSelection !== "ours") drawLapSeries(benchmark, aggregate ? "#526276" : "#007B91", aggregate ? [4, 3] : []);
+    return { left: left, right: right, range: range };
+  }
+
+  function drawLapChart() {
+    var data = comparisonVisualData();
+    if (!data || !state.manifest || !data.lap_series) {
+      elements.lapPanel.hidden = true;
+      state.lapBase = null;
+      state.lapBaseKey = "";
+      return;
+    }
+    elements.lapPanel.hidden = false;
+    var surface = prepareCanvas(elements.lapChart, 186, false);
+    var ratio = window.devicePixelRatio || 1;
+    var baseKey = [
+      state.manifest.heat && state.manifest.heat.source_heat_id,
+      state.comparisonSelection,
+      state.comparisonRevision,
+      surface.width,
+      surface.height,
+      ratio
+    ].join(":");
+    if (!state.lapBase || state.lapBaseKey !== baseKey) {
+      var base = staticCanvas(surface.width, surface.height, ratio);
+      state.lapGeometry = drawLapChartBase(base.context, data, surface.width, surface.height);
+      state.lapBase = base.canvas;
+      state.lapBaseKey = baseKey;
+      state.lapLastPlayheadX = null;
+    }
+    var geometry = state.lapGeometry;
+    var total = Math.max(1, geometry.range.last_at_us - geometry.range.first_at_us);
+    var playhead = geometry.left + (state.atUs - geometry.range.first_at_us) / total * Math.max(1, surface.width - geometry.left - geometry.right);
+    var playheadPixel = Math.round(playhead);
+    if (state.lapLastPlayheadX === playheadPixel) return;
+    surface.context.clearRect(0, 0, surface.width, surface.height);
+    surface.context.drawImage(state.lapBase, 0, 0, surface.width, surface.height);
+    drawTimelinePlayhead(surface.context, playhead, surface.height);
+    state.lapLastPlayheadX = playheadPixel;
+  }
+
+  function drawComparisonVisuals() {
+    // Keep the primary chart at native animation speed.  These two canvases
+    // only need a readable playhead, so 20 fps avoids expensive redraws at 64x.
+    var now = performance.now();
+    if (state.playing && now - state.visualsLastDrawMs < 50) return;
+    state.visualsLastDrawMs = now;
+    drawPitTimeline();
+    drawLapChart();
   }
 
   function drawStaticChart(context, width, height) {
@@ -639,24 +1404,34 @@
       context.fillRect(xAt(start), 0, Math.max(1, xAt(end) - xAt(start)), height);
     });
 
-    function drawSeries(key, top, bandHeight, color, label, formatter) {
-      var frames = state.manifest.keyframes || [];
-      var values = frames.map(function (point) { return pointValue(point, key); }).filter(function (value) { return value !== null; });
+    function rangeFor(values, includeZero) {
+      var known = values.filter(function (value) { return value !== null; });
+      if (includeZero) known.push(0);
+      if (!known.length) return null;
+      var min = Math.min.apply(Math, known);
+      var max = Math.max.apply(Math, known);
+      if (min === max) { min -= 1; max += 1; }
+      return { min: min, max: max };
+    }
+
+    function drawLabels(label, top, bandHeight, bounds, formatter) {
       context.fillStyle = "#6E7E98";
       context.font = "10px Arial";
       context.fillText(label, 2, top + 10);
-      if (!values.length) return;
-      var min = Math.min.apply(Math, values);
-      var max = Math.max.apply(Math, values);
-      if (min === max) { min -= 1; max += 1; }
-      var yAt = function (value) { return top + bandHeight - (value - min) / (max - min) * bandHeight; };
+      if (!bounds) return;
+      context.fillText(formatter(bounds.min), width - padding.right - 48, top + 10);
+      context.fillText(formatter(bounds.max), width - padding.right - 48, top + bandHeight);
+    }
+
+    function drawStep(samples, key, yAt, color, dash) {
       context.strokeStyle = color;
       context.lineWidth = 1.6;
+      context.setLineDash(dash || []);
       context.beginPath();
       var previous = null;
-      frames.forEach(function (point) {
-        var value = pointValue(point, key);
-        var x = xAt(point.observed_at_us);
+      samples.forEach(function (point) {
+        var value = numericValue(point[key]);
+        var x = xAt(point.atUs);
         if (value === null) { previous = null; return; }
         var y = yAt(value);
         if (previous === null) context.moveTo(x, y);
@@ -664,13 +1439,91 @@
         previous = { y: y };
       });
       context.stroke();
-      context.fillStyle = "#6E7E98";
-      context.fillText(formatter(min), width - padding.right - 46, top + 10);
-      context.fillText(formatter(max), width - padding.right - 46, top + bandHeight);
+      context.setLineDash([]);
     }
 
-    drawSeries("pace_5_ms", 16, 57, "#F0143D", "Pace5", formatLap);
-    drawSeries("gap_to_ahead_ms", 96, 57, "#1B365D", "Gap", formatGap);
+    function drawBand(samples, yAt) {
+      var segment = [];
+      function flush() {
+        if (segment.length < 2) { segment = []; return; }
+        context.fillStyle = "rgba(82,98,118,.14)";
+        context.beginPath();
+        segment.forEach(function (point, index) {
+          var x = xAt(point.atUs);
+          var y = yAt(point.p25);
+          if (!index) context.moveTo(x, y);
+          else { context.lineTo(x, yAt(segment[index - 1].p25)); context.lineTo(x, y); }
+        });
+        for (var index = segment.length - 1; index >= 0; index -= 1) {
+          var point = segment[index];
+          var x = xAt(point.atUs);
+          var y = yAt(point.p75);
+          if (index === segment.length - 1) context.lineTo(x, y);
+          else { context.lineTo(x, yAt(segment[index + 1].p75)); context.lineTo(x, y); }
+        }
+        context.closePath();
+        context.fill();
+        segment = [];
+      }
+      samples.forEach(function (point) {
+        if (point.count !== null && point.count >= 2 && point.p25 !== null && point.p75 !== null) segment.push(point);
+        else flush();
+      });
+      flush();
+    }
+
+    function drawDelta(samples, yAt) {
+      var previous = null;
+      samples.forEach(function (point) {
+        var value = point.ours !== null && point.benchmark !== null ? point.ours - point.benchmark : null;
+        if (value === null) { previous = null; return; }
+        var x = xAt(point.atUs);
+        var y = yAt(value);
+        if (previous !== null) {
+          context.strokeStyle = value > 0 ? "#F0143D" : (value < 0 ? "#16824F" : "#526276");
+          context.lineWidth = 1.7;
+          context.setLineDash([]);
+          context.beginPath();
+          context.moveTo(previous.x, previous.y);
+          context.lineTo(x, previous.y);
+          context.lineTo(x, y);
+          context.stroke();
+        }
+        previous = { x: x, y: y };
+      });
+    }
+
+    var samples = comparisonChartSamples();
+    var paceValues = [];
+    samples.forEach(function (point) { [point.ours, point.benchmark, point.p25, point.p75].forEach(function (value) { if (value !== null) paceValues.push(value); }); });
+    var paceBounds = rangeFor(paceValues, false);
+    var paceTop = 16;
+    var paceHeight = 57;
+    drawLabels("Темп", paceTop, paceHeight, paceBounds, formatLap);
+    if (paceBounds) {
+      var paceY = function (value) { return paceTop + paceHeight - (value - paceBounds.min) / (paceBounds.max - paceBounds.min) * paceHeight; };
+      var aggregate = state.comparison && state.comparison.comparison && state.comparison.comparison.mode === "all";
+      if (aggregate) drawBand(samples, paceY);
+      drawStep(samples, "ours", paceY, "#F0143D");
+      if (state.comparisonSelection !== "ours") drawStep(samples, "benchmark", paceY, aggregate ? "#526276" : "#007B91", aggregate ? [4, 3] : []);
+    }
+
+    var deltaValues = samples.map(function (point) {
+      return point.ours !== null && point.benchmark !== null ? point.ours - point.benchmark : null;
+    });
+    var deltaBounds = rangeFor(deltaValues, true);
+    var deltaTop = 96;
+    var deltaHeight = 57;
+    drawLabels("Разница", deltaTop, deltaHeight, deltaBounds, formatGap);
+    if (deltaBounds) {
+      var deltaY = function (value) { return deltaTop + deltaHeight - (value - deltaBounds.min) / (deltaBounds.max - deltaBounds.min) * deltaHeight; };
+      context.strokeStyle = "#AAB4C3";
+      context.lineWidth = 1;
+      context.setLineDash([3, 3]);
+      context.beginPath(); context.moveTo(padding.left, deltaY(0)); context.lineTo(width - padding.right, deltaY(0)); context.stroke();
+      context.setLineDash([]);
+      drawDelta(samples, deltaY);
+    }
 
     (state.manifest.markers.pits || []).forEach(function (pit) {
       if (pit.entered_at_us < range.first_at_us || pit.entered_at_us > range.last_at_us) return;
@@ -700,6 +1553,8 @@
       state.manifest.keyframes.length,
       (state.manifest.markers.flags || []).length,
       (state.manifest.markers.pits || []).length,
+      state.comparisonSelection,
+      state.comparisonRevision,
       width,
       height,
       ratio
@@ -724,14 +1579,17 @@
     var total = Math.max(1, range.last_at_us - range.first_at_us);
     var xAt = function (atUs) { return padding.left + (atUs - range.first_at_us) / total * usableWidth; };
     var playheadX = xAt(state.atUs);
-    context.strokeStyle = "#F0143D";
-    context.lineWidth = 2;
+    context.strokeStyle = "#122846";
+    context.lineWidth = 1.5;
+    context.setLineDash([4, 3]);
     context.beginPath(); context.moveTo(playheadX, 0); context.lineTo(playheadX, height); context.stroke();
+    context.setLineDash([]);
     var chartRangeText = formatElapsed((state.atUs - range.first_at_us) / 1000000) + " / " + formatElapsed((range.last_at_us - range.first_at_us) / 1000000);
     if (chartRangeText !== state.chartRangeText) {
       state.chartRangeText = chartRangeText;
       elements.chartRange.textContent = chartRangeText;
     }
+    drawComparisonVisuals();
   }
 
   function buildEvents() {
@@ -841,6 +1699,8 @@
     elements.play.innerHTML = "&#9654;";
     elements.play.setAttribute("aria-label", "Воспроизвести");
     elements.play.title = "Воспроизвести";
+    state.visualsLastDrawMs = 0;
+    if (wasPlaying && state.modalOpen && state.manifest) drawChart();
     if (wasPlaying && state.pendingSnapshotAtUs !== null && !state.snapshotInFlight && state.manifest) {
       window.clearTimeout(state.snapshotTimer);
       state.snapshotTimer = window.setTimeout(requestExactSnapshot, 0);
@@ -935,6 +1795,10 @@
   }
 
   elements.select.addEventListener("change", loadSelectedEntry);
+  elements.comparison.addEventListener("change", function () {
+    if (!state.manifest) return;
+    loadComparison(elements.comparison.value);
+  });
   elements.play.addEventListener("click", togglePlayback);
   elements.stepBack.addEventListener("click", function () { step(-1); });
   elements.stepForward.addEventListener("click", function () { step(1); });

@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from timing.db import connect, migrate
 from timing.read_api import (
@@ -12,6 +13,7 @@ from timing.read_api import (
     ReadValidationError,
     ScopeNotFoundError,
     TimingReadModel,
+    _bounded_archive_lap_rows,
 )
 
 
@@ -325,6 +327,127 @@ class TimingReadModelTests(unittest.TestCase):
         self.assertEqual(snapshot["snapshot"]["class_participants"][0]["measured"]["participant_id"], "competitor")
         with self.assertRaises(ReadValidationError):
             self.model.archive_snapshot("session-1", at_us=1_999_999)
+
+    def test_archive_comparison_returns_one_bounded_competitor_benchmark(self):
+        def participant(participant_id, number, team, pace, state, *, ours=False):
+            return {
+                "measured": {
+                    "participant_id": participant_id,
+                    "start_number": number,
+                    "team_name": team,
+                    "car_name": "Ligier",
+                    "class_name": "CN PRO",
+                    "is_ours": ours,
+                    "state": {"state_kind": state, "driver_name": team + " Driver"},
+                },
+                "computed": {
+                    "participant_id": participant_id,
+                    "start_number": number,
+                    "team_name": team,
+                    "car_name": "Ligier",
+                    "class_name": "CN PRO",
+                    "is_ours": ours,
+                    "current_state": state,
+                    "pace_5_ms": pace,
+                },
+            }
+
+        self.connection.execute("UPDATE analysis_sessions SET lifecycle = 'stopped' WHERE id = 'session-1'")
+        self.connection.executemany(
+            """
+            INSERT INTO participants(
+              id,source_heat_id,external_key,start_number,team_name,car_name,class_name,class_name_key,
+              is_ours,active,first_seen_at_us,last_seen_at_us
+            ) VALUES (?,?,?,?,?,?,?,?,0,1,?,?)
+            """,
+            (
+                ("nr-9", self.heat_id, "nr:9", "9", "Pro Motorsport", "Norma", "CN PRO", "cn pro", 1_000_000, 7_000_000),
+                ("nr-29", self.heat_id, "nr:29", "29", "TEAMGARIS 29", "Ligier", "CN PRO", "cn pro", 1_000_000, 7_000_000),
+                ("nr-77", self.heat_id, "nr:77", "77", "Retired CN PRO", "Ligier", "CN PRO", "cn pro", 1_000_000, 3_000_000),
+            ),
+        )
+        self.connection.executemany(
+            """
+            INSERT INTO laps(
+              id,source_heat_id,participant_id,lap_number,completed_at_us,duration_ms,sectors_json,
+              flag,is_in_lap,is_out_lap,crosses_pit,is_clean,source_key,created_at_us
+            ) VALUES (?,?,?,?,?,?,?,'GREEN',0,0,0,1,?,?)
+            """,
+            (
+                ("lap-9-1", self.heat_id, "nr-9", 1, 2_000_000, 109_000, "[]", "lap:9:1", 2_000_000),
+                ("lap-9-2", self.heat_id, "nr-9", 2, 3_000_000, 109_200, "[]", "lap:9:2", 3_000_000),
+                ("lap-29-1", self.heat_id, "nr-29", 1, 5_000_000, 110_600, "[]", "lap:29:1", 5_000_000),
+            ),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO pit_stops(
+              id,source_heat_id,participant_id,stop_number,entered_at_us,exited_at_us,entered_lap,
+              exited_lap,pit_lane_ms,completed,entered_source_key,exited_source_key,created_at_us,updated_at_us
+            ) VALUES ('pit-9',?,'nr-9',1,3000000,3040000,1,1,40000,1,'pit:9:in','pit:9:out',3000000,3040000)
+            """,
+            (self.heat_id,),
+        )
+        for observed_at_us, ours_pace, first_pace, second_pace, second_state in (
+            (2_000_000, 108_000, 109_000, 110_000, "IN_PIT"),
+            (5_000_000, 107_600, 108_600, 110_600, "ON_TRACK"),
+            (7_000_000, 107_400, 108_200, 109_200, "ON_TRACK"),
+        ):
+            self._add_playback_snapshot(
+                observed_at_us,
+                {
+                    "schema_version": "timing-archive.v1",
+                    "observed_at_us": observed_at_us,
+                    "computed": {"session": {"ours_participant_id": "ours"}},
+                    "class_participants": [
+                        participant("ours", "21", "BALCHUG Racing", ours_pace, "ON_TRACK", ours=True),
+                        participant("nr-9", "9", "Pro Motorsport", first_pace, "ON_TRACK"),
+                        participant("nr-29", "29", "TEAMGARIS 29", second_pace, second_state),
+                    ],
+                },
+            )
+        self.connection.commit()
+
+        aggregate = self.model.archive_comparison("session-1", mode="all")
+        self.assertTrue(aggregate["comparison"]["available"])
+        self.assertEqual(aggregate["comparison"]["ours_participant_id"], "ours")
+        self.assertEqual([item["participant_id"] for item in aggregate["participants"]], ["ours", "nr-9", "nr-29", "nr-77"])
+        self.assertEqual(aggregate["points"][0]["benchmark_pace_5_ms"], 109_000.0)
+        self.assertEqual(aggregate["points"][0]["benchmark_participant_count"], 1)
+        self.assertEqual(aggregate["points"][1]["benchmark_pace_5_ms"], 109_600.0)
+        self.assertEqual(aggregate["points"][1]["benchmark_p25_pace_5_ms"], 109_100.0)
+        self.assertEqual(aggregate["points"][1]["benchmark_p75_pace_5_ms"], 110_100.0)
+        self.assertEqual(aggregate["pit_stops"][0]["participant_id"], "nr-9")
+        self.assertEqual(aggregate["lap_series"]["benchmark_kind"], "minute_median")
+        self.assertEqual(aggregate["lap_series"]["benchmark"][0]["median_duration_ms"], 109_900.0)
+        self.assertEqual(aggregate["lap_series"]["benchmark"][0]["participant_count"], 2)
+
+        selected = self.model.archive_comparison("session-1", mode="participant", participant_id="nr-29")
+        self.assertEqual(selected["comparison"]["participant_id"], "nr-29")
+        self.assertEqual(selected["points"][0]["benchmark_pace_5_ms"], None)
+        self.assertEqual(selected["points"][2]["benchmark_pace_5_ms"], 109_200)
+        self.assertEqual([lap["participant_id"] for lap in selected["lap_series"]["benchmark"]], ["nr-29"])
+        retired = self.model.archive_comparison("session-1", mode="participant", participant_id="nr-77")
+        self.assertEqual(retired["comparison"]["participant_id"], "nr-77")
+        self.assertEqual(retired["points"][0]["benchmark_pace_5_ms"], None)
+        with self.assertRaises(ReadValidationError):
+            self.model.archive_comparison("session-1", mode="participant", participant_id="ours")
+        with self.assertRaises(ScopeNotFoundError):
+            self.model.archive_comparison("session-1", mode="participant", participant_id="not-in-class")
+
+    def test_bounded_archive_laps_keep_breaks_when_non_clean_rows_are_decimated(self):
+        laps = [
+            {"lap_number": 1, "is_clean": True},
+            {"lap_number": 2, "is_clean": False},
+            {"lap_number": 3, "is_clean": True},
+            {"lap_number": 4, "is_clean": True},
+            {"lap_number": 5, "is_clean": False},
+            {"lap_number": 6, "is_clean": True},
+        ]
+        with patch("timing.read_api.MAX_ARCHIVE_COMPARISON_LAPS_PER_PARTICIPANT", 3):
+            bounded = _bounded_archive_lap_rows(laps)
+        self.assertEqual([lap["lap_number"] for lap in bounded], [1, 3, 6])
+        self.assertTrue(all(lap["break_before"] for lap in bounded))
 
     def test_archive_requires_a_stopped_session_with_a_projection(self):
         with self.assertRaises(ReadValidationError):
