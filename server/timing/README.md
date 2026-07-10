@@ -152,6 +152,18 @@ away, a generation changes, or a slow client falls behind its bounded queue,
 the stream sends `reset` with a complete new snapshot. Heartbeats and
 freshness-only `quality` events have no cursor and cannot hide a stale source.
 
+If a stopped session was recorded before a normalizer or metric release, rebuild
+only its derived state from its unchanged raw frames. Always inspect the
+preflight first; the command rejects active sessions and leaves raw frames and
+decoded messages intact:
+
+```bash
+PYTHONPATH=server python3 -m timing.rebuild --db /var/lib/balchug/timing.db \
+  --session <analysis-session-id> --dry-run
+PYTHONPATH=server python3 -m timing.rebuild --db /var/lib/balchug/timing.db \
+  --session <analysis-session-id>
+```
+
 ## Ingest worker operation
 
 `balchug-timing-ingest.service` runs `python -m timing.worker` as `www-data`.
