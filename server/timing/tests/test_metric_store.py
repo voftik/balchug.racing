@@ -10,6 +10,7 @@ from timing.metric_store import (
     MetricSampleCandidate,
     MetricStoreError,
     load_heat_metric_input,
+    load_metric_history,
     materialize_metric_samples,
 )
 
@@ -355,6 +356,110 @@ class MetricStoreTests(unittest.TestCase):
         self.assertEqual(rows[-1]["observed_at_us"], 5_500_000)
         self.assertEqual(rows[-1]["source_key"], "frame:5b")
         self.assertEqual(json.loads(rows[-1]["values_json"])["pace_5_ms"], 106_800)
+
+    def test_materializes_current_scope_each_newer_tick_while_history_stays_sparse(self):
+        first = materialize_metric_samples(
+            self.connection,
+            source_heat_id=self.source_heat_id,
+            observed_at_us=1_100_000,
+            metric_version=1,
+            source_key="frame:1",
+            samples=[MetricSampleCandidate("participant", "ours", {"pace_5_ms": 107_200})],
+        )
+        self.assertEqual(first.current_inserted, (first.current_written[0],))
+
+        # This value changed, but it is inside the same five-second history
+        # bucket. The live panel must still receive the newer state.
+        second = materialize_metric_samples(
+            self.connection,
+            source_heat_id=self.source_heat_id,
+            observed_at_us=2_100_000,
+            metric_version=1,
+            source_key="frame:2",
+            samples=[MetricSampleCandidate("participant", "ours", {"pace_5_ms": 107_000})],
+        )
+        self.assertEqual(second.written, ())
+        self.assertEqual(second.current_updated, (second.current_written[0],))
+
+        current = self.connection.execute(
+            """
+            SELECT observed_at_us,metric_version,values_json,source_key
+            FROM metric_current
+            WHERE source_heat_id = ? AND scope_kind = 'participant' AND scope_key = 'ours'
+            """,
+            (self.source_heat_id,),
+        ).fetchone()
+        self.assertEqual(current["observed_at_us"], 2_100_000)
+        self.assertEqual(current["metric_version"], 1)
+        self.assertEqual(current["source_key"], "frame:2")
+        self.assertEqual(json.loads(current["values_json"]), {"pace_5_ms": 107_000})
+
+        history = self.connection.execute(
+            """
+            SELECT observed_at_us,values_json
+            FROM metric_samples
+            WHERE source_heat_id = ? AND scope_kind = 'participant' AND scope_key = 'ours'
+            """,
+            (self.source_heat_id,),
+        ).fetchone()
+        self.assertEqual(history["observed_at_us"], 1_100_000)
+        self.assertEqual(json.loads(history["values_json"]), {"pace_5_ms": 107_200})
+
+        older = materialize_metric_samples(
+            self.connection,
+            source_heat_id=self.source_heat_id,
+            observed_at_us=2_000_000,
+            metric_version=1,
+            source_key="late-frame:1",
+            samples=[MetricSampleCandidate("participant", "ours", {"pace_5_ms": 106_900})],
+        )
+        self.assertEqual(older.current_written, ())
+        self.assertEqual(older.current_skipped[0].scope_key, "ours")
+        self.assertEqual(
+            self.connection.execute(
+                """
+                SELECT observed_at_us,values_json FROM metric_current
+                WHERE source_heat_id = ? AND scope_kind = 'participant' AND scope_key = 'ours'
+                """,
+                (self.source_heat_id,),
+            ).fetchone()["observed_at_us"],
+            2_100_000,
+        )
+
+    def test_loads_validated_ordered_sparse_history(self):
+        candidate = MetricSampleCandidate("session", "session-1", {"pace_5_ms": 107_200})
+        materialize_metric_samples(
+            self.connection,
+            source_heat_id=self.source_heat_id,
+            observed_at_us=1_100_000,
+            metric_version=1,
+            source_key="frame:1",
+            samples=[candidate],
+        )
+        materialize_metric_samples(
+            self.connection,
+            source_heat_id=self.source_heat_id,
+            observed_at_us=6_100_000,
+            metric_version=1,
+            source_key="frame:6",
+            samples=[MetricSampleCandidate("session", "session-1", {"pace_5_ms": 107_000})],
+        )
+        history = load_metric_history(
+            self.connection,
+            source_heat_id=self.source_heat_id,
+            scope_kind="session",
+            scope_key="session-1",
+            since_at_us=2_000_000,
+            metric_version=1,
+        )
+        self.assertEqual([(point.observed_at_us, point.values) for point in history], [(6_100_000, {"pace_5_ms": 107_000})])
+        with self.assertRaisesRegex(MetricStoreError, "Unsupported metric scope"):
+            load_metric_history(
+                self.connection,
+                source_heat_id=self.source_heat_id,
+                scope_kind="unknown",
+                scope_key="session-1",
+            )
 
     def test_rejects_ambiguous_or_invalid_materialization_requests(self):
         candidate = MetricSampleCandidate("participant", "ours", {"pace_5_ms": 107_200})

@@ -44,8 +44,37 @@ class RecordingImporterTests(unittest.TestCase):
                 self.assertEqual(connection.execute("SELECT flag FROM track_flag_current").fetchone()[0], "RED")
                 participant = connection.execute("SELECT start_number,team_name,class_name,is_ours FROM participants").fetchone()
                 self.assertEqual(tuple(participant), ("21", "BALCHUG Racing", "CN PRO", 1))
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM metric_current").fetchone()[0], 3)
+                session_metric = connection.execute(
+                    "SELECT values_json FROM metric_current WHERE scope_kind='session'"
+                ).fetchone()
+                self.assertEqual(json.loads(session_metric["values_json"])["ours_class_key"], "cn pro")
             finally:
                 connection.close()
+
+            replay_database = root / "timing-replay.db"
+            import_recording(replay_database, events)
+
+            def metric_digest(path):
+                reader = connect(path, readonly=True)
+                try:
+                    rows = []
+                    for table in ("metric_current", "metric_samples"):
+                        for row in reader.execute(
+                            f"""
+                            SELECT scope_kind,scope_key,observed_at_us,metric_version,values_json
+                            FROM {table} ORDER BY scope_kind,scope_key,observed_at_us
+                            """
+                        ):
+                            scope_key = "<session>" if row["scope_kind"] == "session" else row["scope_key"]
+                            rows.append(
+                                (table, row["scope_kind"], scope_key, row["observed_at_us"], row["metric_version"], row["values_json"])
+                            )
+                    return rows
+                finally:
+                    reader.close()
+
+            self.assertEqual(metric_digest(database), metric_digest(replay_database))
 
 
 if __name__ == "__main__":

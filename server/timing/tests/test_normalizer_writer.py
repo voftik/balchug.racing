@@ -99,6 +99,10 @@ class TimingNormalizerWriterTests(unittest.TestCase):
             ],
             received_at_us=first_receive,
         )
+        self.assertEqual(
+            self.connection.execute("SELECT provider_started_at_us FROM source_heats").fetchone()[0],
+            first_receive,
+        )
         red_observed = first_receive + 3_000_000
         self.apply([["h_h", {"f": 2}]], received_at_us=red_observed)
         provisional = self.connection.execute(
@@ -251,6 +255,121 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         self.assertEqual(red["observed_ended_at_us"], finish_received)
         self.assertEqual(red["end_provider_ts_raw"], str(provider_red_end))
         self.assertEqual(self.connection.execute("SELECT flag FROM track_flag_current").fetchone()[0], "FINISH")
+        timeline = self.connection.execute(
+            "SELECT flag,started_at_us,ended_at_us FROM track_flag_periods ORDER BY started_at_us,id"
+        ).fetchall()
+        self.assertEqual([row["flag"] for row in timeline], ["GREEN", "RED", "FINISH"])
+        self.assertEqual(timeline[0]["ended_at_us"], timeline[1]["started_at_us"])
+        self.assertEqual(timeline[1]["ended_at_us"], expected_end)
+        self.assertEqual(timeline[2]["started_at_us"], expected_end)
+
+    def test_statistics_finish_reconciles_an_open_red_to_the_exact_finish_boundary(self):
+        provider_start = 30_000_000
+        provider_red_start = 32_000_000
+        provider_finish = 35_000_000
+        offset = 10_800_000_000
+        received = TIME_SERVICE_EPOCH_UNIX_US + provider_start + offset
+        self.apply(
+            [["h_i", {"n": "Practice", "f": 6, "s": provider_start}], ["s_i", provider_start]],
+            received_at_us=received,
+        )
+        self.apply([["h_h", {"f": 2}]], received_at_us=received + 3_000_000)
+        open_red = {
+            "f": "0",
+            "i": {
+                "1": {
+                    "k": "RedFlag",
+                    "f": str(provider_red_start),
+                    "t": "9223372036854775807",
+                    "s": "0",
+                    "r": "",
+                }
+            },
+        }
+        self.apply([["a_u", open_red]], received_at_us=received + 4_000_000)
+        self.assertIsNone(
+            self.connection.execute("SELECT finish_flag_at_us FROM heat_statistics_current").fetchone()[0]
+        )
+        self.apply([["h_h", {"f": 5}]], received_at_us=received + 6_000_000)
+        self.apply(
+            [["a_u", {"f": str(provider_finish), "i": open_red["i"]}]],
+            received_at_us=received + 7_000_000,
+        )
+
+        expected_red_start = TIME_SERVICE_EPOCH_UNIX_US + provider_red_start + offset
+        expected_finish = TIME_SERVICE_EPOCH_UNIX_US + provider_finish + offset
+        timeline = self.connection.execute(
+            """
+            SELECT flag,started_at_us,ended_at_us,observed_started_at_us,observed_ended_at_us,
+                   calibrated_started_at_us,calibrated_ended_at_us,start_provider_ts_raw,end_provider_ts_raw
+            FROM track_flag_periods ORDER BY started_at_us,id
+            """
+        ).fetchall()
+        self.assertEqual([row["flag"] for row in timeline], ["GREEN", "RED", "FINISH"])
+        self.assertEqual(timeline[0]["ended_at_us"], expected_red_start)
+        self.assertEqual(timeline[1]["started_at_us"], expected_red_start)
+        self.assertEqual(timeline[1]["ended_at_us"], expected_finish)
+        self.assertEqual(timeline[2]["started_at_us"], expected_finish)
+        self.assertEqual(timeline[1]["end_provider_ts_raw"], str(provider_finish))
+        self.assertEqual(timeline[2]["start_provider_ts_raw"], str(provider_finish))
+        self.assertEqual(timeline[2]["observed_started_at_us"], received + 6_000_000)
+        self.assertEqual(timeline[2]["calibrated_started_at_us"], expected_finish)
+        self.assertEqual(
+            self.connection.execute("SELECT finish_flag_at_us FROM heat_statistics_current").fetchone()[0],
+            expected_finish,
+        )
+
+    def test_history_only_unknown_caution_splits_the_surrounding_green_status(self):
+        provider_start = 40_000_000
+        provider_blue_start = 42_000_000
+        provider_blue_end = 43_000_000
+        offset = 10_800_000_000
+        received = TIME_SERVICE_EPOCH_UNIX_US + provider_start + offset
+        self.apply(
+            [["h_i", {"n": "Practice", "f": 6, "s": provider_start}], ["s_i", provider_start]],
+            received_at_us=received,
+        )
+        # This is deliberately not accompanied by h_h: it models history
+        # arriving after a reconnect while the direct current state is Green.
+        self.apply(
+            [
+                [
+                    "a_u",
+                    {
+                        "i": {
+                            "1": {
+                                "k": "BlueFlag",
+                                "f": str(provider_blue_start),
+                                "t": str(provider_blue_end),
+                                "s": "0",
+                                "r": "",
+                            }
+                        }
+                    },
+                ]
+            ],
+            received_at_us=received + 5_000_000,
+        )
+
+        expected_start = TIME_SERVICE_EPOCH_UNIX_US + provider_blue_start + offset
+        expected_end = TIME_SERVICE_EPOCH_UNIX_US + provider_blue_end + offset
+        timeline = self.connection.execute(
+            """
+            SELECT flag,provider_label,started_at_us,ended_at_us,calibrated_started_at_us,
+                   calibrated_ended_at_us,start_provider_ts_raw,end_provider_ts_raw
+            FROM track_flag_periods ORDER BY started_at_us,id
+            """
+        ).fetchall()
+        self.assertEqual([row["flag"] for row in timeline], ["GREEN", "UNKNOWN", "GREEN"])
+        self.assertEqual(timeline[1]["provider_label"], "BlueFlag")
+        self.assertEqual(timeline[0]["ended_at_us"], expected_start)
+        self.assertEqual(timeline[1]["started_at_us"], expected_start)
+        self.assertEqual(timeline[1]["ended_at_us"], expected_end)
+        self.assertEqual(timeline[2]["started_at_us"], expected_end)
+        current = self.connection.execute(
+            "SELECT flag,started_at_us,calibrated_started_at_us FROM track_flag_current"
+        ).fetchone()
+        self.assertEqual(tuple(current), ("GREEN", expected_end, expected_end))
 
     def test_unknown_live_flag_values_remain_distinct_track_statuses(self):
         received = TIME_SERVICE_EPOCH_UNIX_US + 15_000_000
@@ -414,6 +533,47 @@ class TimingNormalizerWriterTests(unittest.TestCase):
             "SELECT lap_number,completed_at_us,duration_ms FROM laps ORDER BY lap_number"
         ).fetchall()
         self.assertEqual([tuple(lap) for lap in laps], [(6, None, None), (7, received + 1_000_000, 108000)])
+
+    def test_completed_grid_lap_keeps_dynamic_sector_cells(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 65_000_000
+        self.apply(
+            [
+                [
+                    "r_i",
+                    {
+                        "l": {
+                            "h": [
+                                {"n": "NR"},
+                                {"n": "TEAM"},
+                                {"n": "CLS"},
+                                {"n": "STATE"},
+                                {"n": "LAPS"},
+                                {"n": "SECT 1"},
+                                {"n": "SECT 2"},
+                            ]
+                        },
+                        "r": [
+                            [0, 0, "21"],
+                            [0, 1, "BALCHUG Racing"],
+                            [0, 2, "CN PRO"],
+                            [0, 3, "E65000000"],
+                            [0, 4, "5"],
+                            [0, 5, "35000000"],
+                            [0, 6, "36000000"],
+                        ],
+                    },
+                ]
+            ],
+            received_at_us=received,
+        )
+        self.apply(
+            [["r_c", [[0, 4, "6"], [0, 5, "34000000"], [0, 6, "35500000"]]]],
+            received_at_us=received + 1_000_000,
+        )
+        sectors = json.loads(
+            self.connection.execute("SELECT sectors_json FROM laps WHERE lap_number = 6").fetchone()[0]
+        )
+        self.assertEqual(sectors, {"sector_1": "34000000", "sector_2": "35500000"})
 
     def test_missing_nr_reuses_team_identity_and_conflicting_nr_21_does_not_replace_ours(self):
         received = TIME_SERVICE_EPOCH_UNIX_US + 70_000_000

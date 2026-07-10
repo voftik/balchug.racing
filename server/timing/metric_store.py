@@ -263,6 +263,7 @@ class MetricSampleCandidate:
     scope_key: str
     values: Mapping[str, Any]
     event_boundary: bool = False
+    history_values: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -272,14 +273,60 @@ class MetricScope:
 
 
 @dataclass(frozen=True)
+class MetricHistoryPoint:
+    """One validated sparse chart point supplied to a pure metric formula."""
+
+    observed_at_us: int
+    metric_version: int
+    values: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class MetricRunnerState:
+    """Last durable derived boundary for restart-safe event detection."""
+
+    source_heat_id: int
+    observed_at_us: int
+    source_frame_id: int
+    source_message_id: int | None
+    source_key: str
+    metric_version: int
+    boundary_state_json: str
+
+
+@dataclass(frozen=True)
+class MetricRunnerStateCandidate:
+    """State/tick provenance committed with one metric materialization."""
+
+    source_frame_id: int
+    state_hash: str
+    boundary_state_json: str
+
+
+@dataclass(frozen=True)
 class MetricMaterializationResult:
+    """Outcome of writing sparse history and the current dashboard state.
+
+    ``inserted``/``updated``/``skipped`` describe ``metric_samples`` and
+    retain the original public meaning.  The ``current_*`` fields describe
+    the one-row-per-scope materialization used by the live dashboard.
+    """
+
     inserted: tuple[MetricScope, ...]
     updated: tuple[MetricScope, ...]
     skipped: tuple[MetricScope, ...]
+    current_inserted: tuple[MetricScope, ...] = ()
+    current_updated: tuple[MetricScope, ...] = ()
+    current_skipped: tuple[MetricScope, ...] = ()
+    runner_state_written: bool = False
 
     @property
     def written(self) -> tuple[MetricScope, ...]:
         return self.inserted + self.updated
+
+    @property
+    def current_written(self) -> tuple[MetricScope, ...]:
+        return self.current_inserted + self.current_updated
 
 
 @contextmanager
@@ -717,12 +764,125 @@ def _canonical_values_json(values: Mapping[str, Any]) -> str:
     return json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+def load_metric_history(
+    connection: sqlite3.Connection,
+    *,
+    source_heat_id: int,
+    scope_kind: str,
+    scope_key: str,
+    since_at_us: int | None = None,
+    metric_version: int | None = None,
+) -> tuple[MetricHistoryPoint, ...]:
+    """Load ordered chart evidence without leaking SQLite into formulas."""
+    if type(source_heat_id) is not int or source_heat_id <= 0:
+        raise MetricStoreError("source_heat_id must be a positive integer")
+    if scope_kind not in _SCOPE_KINDS:
+        raise MetricStoreError(f"Unsupported metric scope: {scope_kind!r}")
+    if not isinstance(scope_key, str) or not scope_key.strip():
+        raise MetricStoreError("Metric scope_key must be a non-empty string")
+    if since_at_us is not None and (type(since_at_us) is not int or since_at_us < 0):
+        raise MetricStoreError("since_at_us must be a non-negative integer or None")
+    if metric_version is not None and (type(metric_version) is not int or metric_version < 1):
+        raise MetricStoreError("metric_version must be a positive integer or None")
+    where = ["source_heat_id = ?", "scope_kind = ?", "scope_key = ?"]
+    parameters: list[Any] = [source_heat_id, scope_kind, scope_key]
+    if since_at_us is not None:
+        where.append("observed_at_us >= ?")
+        parameters.append(since_at_us)
+    if metric_version is not None:
+        where.append("metric_version = ?")
+        parameters.append(metric_version)
+    with _read_snapshot(connection):
+        rows = connection.execute(
+            f"""
+            SELECT observed_at_us,metric_version,values_json
+            FROM metric_samples
+            WHERE {' AND '.join(where)}
+            ORDER BY observed_at_us,observed_second
+            """,
+            tuple(parameters),
+        ).fetchall()
+    points: list[MetricHistoryPoint] = []
+    for row in rows:
+        try:
+            values = json.loads(row["values_json"])
+        except (TypeError, json.JSONDecodeError) as error:
+            raise MetricStoreError("Stored metric history has invalid JSON") from error
+        if not isinstance(values, Mapping):
+            raise MetricStoreError("Stored metric history values must be an object")
+        points.append(
+            MetricHistoryPoint(
+                observed_at_us=int(row["observed_at_us"]),
+                metric_version=int(row["metric_version"]),
+                values=values,
+            )
+        )
+    return tuple(points)
+
+
+def load_metric_runner_state(
+    connection: sqlite3.Connection,
+    *,
+    source_heat_id: int,
+    metric_version: int | None = None,
+) -> MetricRunnerState | None:
+    """Load the latest derived boundary without reconstructing it from facts."""
+
+    if type(source_heat_id) is not int or source_heat_id <= 0:
+        raise MetricStoreError("source_heat_id must be a positive integer")
+    if metric_version is not None and (type(metric_version) is not int or metric_version < 1):
+        raise MetricStoreError("metric_version must be a positive integer or None")
+    where = ["source_heat_id = ?"]
+    parameters: list[Any] = [source_heat_id]
+    if metric_version is not None:
+        where.append("metric_version = ?")
+        parameters.append(metric_version)
+    with _read_snapshot(connection):
+        row = connection.execute(
+            f"""
+            SELECT source_heat_id,observed_at_us,source_frame_id,source_message_id,source_key,
+                   metric_version,boundary_state_json
+            FROM metric_runner_state
+            WHERE {' AND '.join(where)}
+            """,
+            tuple(parameters),
+        ).fetchone()
+    if row is None:
+        return None
+    if not isinstance(row["boundary_state_json"], str) or not row["boundary_state_json"]:
+        raise MetricStoreError("Stored metric runner boundary state is invalid")
+    return MetricRunnerState(
+        source_heat_id=int(row["source_heat_id"]),
+        observed_at_us=int(row["observed_at_us"]),
+        source_frame_id=int(row["source_frame_id"]),
+        source_message_id=_int(row["source_message_id"]),
+        source_key=row["source_key"],
+        metric_version=int(row["metric_version"]),
+        boundary_state_json=row["boundary_state_json"],
+    )
+
+
 def _validated_scope(candidate: MetricSampleCandidate) -> MetricScope:
     if candidate.scope_kind not in _SCOPE_KINDS:
         raise MetricStoreError(f"Unsupported metric scope: {candidate.scope_kind!r}")
     if not isinstance(candidate.scope_key, str) or not candidate.scope_key.strip():
         raise MetricStoreError("Metric scope_key must be a non-empty string")
     return MetricScope(candidate.scope_kind, candidate.scope_key)
+
+
+def _observation_rank(
+    observed_at_us: int,
+    source_message_id: int | None,
+    source_key: str,
+) -> tuple[int, int, str]:
+    """Order competing current-state writes deterministically.
+
+    Receive time is primary.  Source message IDs then preserve order for
+    multiple decoded messages from the same received frame; the source key is
+    the stable fallback for imports that have no persisted message ID.
+    """
+
+    return (observed_at_us, source_message_id if source_message_id is not None else -1, source_key)
 
 
 def materialize_metric_samples(
@@ -736,12 +896,16 @@ def materialize_metric_samples(
     source_message_id: int | None = None,
     event_boundary: bool = False,
     interval_us: int = METRIC_SAMPLE_INTERVAL_US,
+    runner_state: MetricRunnerStateCandidate | None = None,
 ) -> MetricMaterializationResult:
-    """Persist only changed scopes on a 5 s bucket or source event boundary.
+    """Materialize current state and sparse chart history from one metric tick.
 
-    The source table permits one point per second.  When a newer event changes
-    a scope within that second, the row becomes the newest deterministic state
-    for that second; retrying the same event is a no-op.
+    ``metric_current`` advances for every newer observation, including an
+    unchanged value inside a chart interval.  ``metric_samples`` stays sparse:
+    it permits one point per second and only retains a changed scope on a five
+    second bucket, formula-version change, or source event boundary.  A newer
+    event in the same second replaces that chart point deterministically;
+    retrying the same event is a no-op in both materializations.
     """
 
     if type(source_heat_id) is not int or source_heat_id <= 0:
@@ -756,8 +920,17 @@ def materialize_metric_samples(
         raise MetricStoreError("source_message_id must be a positive integer or None")
     if type(interval_us) is not int or interval_us <= 0:
         raise MetricStoreError("interval_us must be a positive integer")
+    if runner_state is not None:
+        if not isinstance(runner_state, MetricRunnerStateCandidate):
+            raise MetricStoreError("runner_state must be MetricRunnerStateCandidate or None")
+        if type(runner_state.source_frame_id) is not int or runner_state.source_frame_id <= 0:
+            raise MetricStoreError("runner_state source_frame_id must be a positive integer")
+        if not isinstance(runner_state.state_hash, str) or not runner_state.state_hash:
+            raise MetricStoreError("runner_state state_hash must be a non-empty string")
+        if not isinstance(runner_state.boundary_state_json, str) or not runner_state.boundary_state_json:
+            raise MetricStoreError("runner_state boundary_state_json must be a non-empty string")
 
-    prepared: list[tuple[MetricScope, str, bool]] = []
+    prepared: list[tuple[MetricScope, str, str, bool]] = []
     seen_scopes: set[MetricScope] = set()
     for candidate in samples:
         if not isinstance(candidate, MetricSampleCandidate):
@@ -766,7 +939,11 @@ def materialize_metric_samples(
         if scope in seen_scopes:
             raise MetricStoreError(f"Duplicate metric scope in one write: {scope.scope_kind}/{scope.scope_key}")
         seen_scopes.add(scope)
-        prepared.append((scope, _canonical_values_json(candidate.values), bool(candidate.event_boundary)))
+        current_values_json = _canonical_values_json(candidate.values)
+        history_values_json = _canonical_values_json(
+            candidate.values if candidate.history_values is None else candidate.history_values
+        )
+        prepared.append((scope, current_values_json, history_values_json, bool(candidate.event_boundary)))
 
     if not prepared:
         return MetricMaterializationResult((), (), ())
@@ -776,12 +953,80 @@ def materialize_metric_samples(
     inserted: list[MetricScope] = []
     updated: list[MetricScope] = []
     skipped: list[MetricScope] = []
+    current_inserted: list[MetricScope] = []
+    current_updated: list[MetricScope] = []
+    current_skipped: list[MetricScope] = []
+    runner_state_written = False
     with _write_transaction(connection):
         heat_exists = connection.execute("SELECT 1 FROM source_heats WHERE id = ?", (source_heat_id,)).fetchone()
         if heat_exists is None:
             raise MetricStoreError(f"Source heat does not exist: {source_heat_id}")
         created_at_us = now_us()
-        for scope, values_json, candidate_event in prepared:
+        for scope, values_json, history_values_json, candidate_event in prepared:
+            current = connection.execute(
+                """
+                SELECT observed_at_us,metric_version,values_json,source_message_id,source_key
+                FROM metric_current
+                WHERE source_heat_id = ? AND scope_kind = ? AND scope_key = ?
+                """,
+                (source_heat_id, scope.scope_kind, scope.scope_key),
+            ).fetchone()
+            if current is None:
+                connection.execute(
+                    """
+                    INSERT INTO metric_current(
+                      source_heat_id,scope_kind,scope_key,observed_at_us,metric_version,
+                      values_json,source_message_id,source_key,created_at_us,updated_at_us
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        source_heat_id,
+                        scope.scope_kind,
+                        scope.scope_key,
+                        observed_at_us,
+                        metric_version,
+                        values_json,
+                        source_message_id,
+                        source_key,
+                        created_at_us,
+                        created_at_us,
+                    ),
+                )
+                current_inserted.append(scope)
+            else:
+                current_rank = _observation_rank(
+                    int(current["observed_at_us"]),
+                    _int(current["source_message_id"]),
+                    current["source_key"],
+                )
+                incoming_rank = _observation_rank(observed_at_us, source_message_id, source_key)
+                version_upgrade = (
+                    incoming_rank == current_rank and metric_version > int(current["metric_version"])
+                )
+                if incoming_rank > current_rank or version_upgrade:
+                    connection.execute(
+                        """
+                        UPDATE metric_current
+                        SET observed_at_us = ?, metric_version = ?, values_json = ?,
+                            source_message_id = ?, source_key = ?, updated_at_us = ?
+                        WHERE source_heat_id = ? AND scope_kind = ? AND scope_key = ?
+                        """,
+                        (
+                            observed_at_us,
+                            metric_version,
+                            values_json,
+                            source_message_id,
+                            source_key,
+                            created_at_us,
+                            source_heat_id,
+                            scope.scope_kind,
+                            scope.scope_key,
+                        ),
+                    )
+                    current_updated.append(scope)
+                else:
+                    current_skipped.append(scope)
+
             exact = connection.execute(
                 """
                 SELECT observed_at_us,metric_version,values_json,source_key
@@ -801,12 +1046,16 @@ def materialize_metric_samples(
                 (source_heat_id, scope.scope_kind, scope.scope_key, observed_second),
             ).fetchone()
             unchanged = (
-                (exact is not None and int(exact["metric_version"]) == metric_version and exact["values_json"] == values_json)
+                (
+                    exact is not None
+                    and int(exact["metric_version"]) == metric_version
+                    and exact["values_json"] == history_values_json
+                )
                 or (
                     exact is None
                     and previous is not None
                     and int(previous["metric_version"]) == metric_version
-                    and previous["values_json"] == values_json
+                    and previous["values_json"] == history_values_json
                 )
             )
             if unchanged:
@@ -837,7 +1086,7 @@ def materialize_metric_samples(
                         observed_second,
                         observed_at_us,
                         metric_version,
-                        values_json,
+                        history_values_json,
                         source_message_id,
                         source_key,
                         created_at_us,
@@ -861,7 +1110,7 @@ def materialize_metric_samples(
                 (
                     observed_at_us,
                     metric_version,
-                    values_json,
+                    history_values_json,
                     source_message_id,
                     source_key,
                     source_heat_id,
@@ -871,4 +1120,130 @@ def materialize_metric_samples(
                 ),
             )
             updated.append(scope)
-    return MetricMaterializationResult(tuple(inserted), tuple(updated), tuple(skipped))
+        if runner_state is not None:
+            tick_current = connection.execute(
+                """
+                SELECT observed_at_us,source_frame_id,source_key
+                FROM state_ticks
+                WHERE source_heat_id = ? AND observed_second = ?
+                """,
+                (source_heat_id, observed_second),
+            ).fetchone()
+            tick_rank = (
+                (
+                    int(tick_current["observed_at_us"]),
+                    int(tick_current["source_frame_id"]) if tick_current["source_frame_id"] is not None else -1,
+                    tick_current["source_key"],
+                )
+                if tick_current is not None
+                else None
+            )
+            incoming_tick_rank = (observed_at_us, runner_state.source_frame_id, source_key)
+            if tick_rank is None:
+                connection.execute(
+                    """
+                    INSERT INTO state_ticks(
+                      source_heat_id,observed_second,observed_at_us,source_frame_id,source_key,state_hash,
+                      freshness_ms,created_at_us
+                    ) VALUES (?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        source_heat_id,
+                        observed_second,
+                        observed_at_us,
+                        runner_state.source_frame_id,
+                        source_key,
+                        runner_state.state_hash,
+                        0,
+                        created_at_us,
+                    ),
+                )
+            elif incoming_tick_rank > tick_rank:
+                connection.execute(
+                    """
+                    UPDATE state_ticks
+                    SET observed_at_us = ?, source_frame_id = ?, source_key = ?, state_hash = ?, freshness_ms = ?
+                    WHERE source_heat_id = ? AND observed_second = ?
+                    """,
+                    (
+                        observed_at_us,
+                        runner_state.source_frame_id,
+                        source_key,
+                        runner_state.state_hash,
+                        0,
+                        source_heat_id,
+                        observed_second,
+                    ),
+                )
+
+            state_current = connection.execute(
+                """
+                SELECT observed_at_us,source_frame_id,source_key,metric_version
+                FROM metric_runner_state
+                WHERE source_heat_id = ?
+                """,
+                (source_heat_id,),
+            ).fetchone()
+            state_rank = (
+                (
+                    int(state_current["observed_at_us"]),
+                    int(state_current["source_frame_id"]),
+                    state_current["source_key"],
+                )
+                if state_current is not None
+                else None
+            )
+            version_upgrade = (
+                state_current is not None
+                and incoming_tick_rank == state_rank
+                and metric_version > int(state_current["metric_version"])
+            )
+            if state_current is None:
+                connection.execute(
+                    """
+                    INSERT INTO metric_runner_state(
+                      source_heat_id,observed_at_us,source_frame_id,source_message_id,source_key,
+                      metric_version,boundary_state_json,updated_at_us
+                    ) VALUES (?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        source_heat_id,
+                        observed_at_us,
+                        runner_state.source_frame_id,
+                        source_message_id,
+                        source_key,
+                        metric_version,
+                        runner_state.boundary_state_json,
+                        created_at_us,
+                    ),
+                )
+                runner_state_written = True
+            elif incoming_tick_rank > state_rank or version_upgrade:
+                connection.execute(
+                    """
+                    UPDATE metric_runner_state
+                    SET observed_at_us = ?, source_frame_id = ?, source_message_id = ?, source_key = ?,
+                        metric_version = ?, boundary_state_json = ?, updated_at_us = ?
+                    WHERE source_heat_id = ?
+                    """,
+                    (
+                        observed_at_us,
+                        runner_state.source_frame_id,
+                        source_message_id,
+                        source_key,
+                        metric_version,
+                        runner_state.boundary_state_json,
+                        created_at_us,
+                        source_heat_id,
+                    ),
+                )
+                runner_state_written = True
+    return MetricMaterializationResult(
+        tuple(inserted),
+        tuple(updated),
+        tuple(skipped),
+        tuple(current_inserted),
+        tuple(current_updated),
+        tuple(current_skipped),
+        runner_state_written,
+    )

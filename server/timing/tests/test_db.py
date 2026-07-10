@@ -65,14 +65,25 @@ class TimingDatabaseTests(unittest.TestCase):
     def test_migration_is_repeatable_and_enables_wal(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "timing.db"
-            self.assertEqual(migrate(path), ["0001", "0002", "0003"])
+            self.assertEqual(migrate(path), ["0001", "0002", "0003", "0004"])
             self.assertEqual(migrate(path), [])
             connection = connect(path)
             try:
                 self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0].lower(), "wal")
                 self.assertEqual(connection.execute("PRAGMA foreign_keys").fetchone()[0], 1)
                 tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-                self.assertTrue({"feed_frames", "feed_messages", "laps", "participant_identity_segments", "metric_samples", "stream_events"}.issubset(tables))
+                self.assertTrue(
+                    {
+                        "feed_frames",
+                        "feed_messages",
+                        "laps",
+                        "participant_identity_segments",
+                        "metric_samples",
+                        "metric_current",
+                        "metric_runner_state",
+                        "stream_events",
+                    }.issubset(tables)
+                )
             finally:
                 connection.close()
 
@@ -341,7 +352,7 @@ class TimingDatabaseTests(unittest.TestCase):
             finally:
                 connection.close()
 
-            self.assertEqual(migrate(path), ["0003"])
+            self.assertEqual(migrate(path), ["0003", "0004"])
             connection = connect(path)
             try:
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM participants").fetchone()[0], 1)

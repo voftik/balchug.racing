@@ -153,7 +153,9 @@ class PaceMetrics:
     slow_lap_numbers: tuple[int, ...] | None
 
 
-def calculate_pace_metrics(laps: Sequence[LapSample]) -> PaceMetrics:
+def calculate_pace_metrics(
+    laps: Sequence[LapSample], *, include_slow_lap_history: bool = True
+) -> PaceMetrics:
     """Calculate Pace3/5/10, robust consistency, and clean-lap anomalies.
 
     Pace windows use the last N clean laps in source order.  A slow-lap event
@@ -179,7 +181,7 @@ def calculate_pace_metrics(laps: Sequence[LapSample]) -> PaceMetrics:
     p10 = _percentile(last10, 0.10) if len(last10) == 10 else None
     p90 = _percentile(last10, 0.90) if len(last10) == 10 else None
     range10 = p90 - p10 if p10 is not None and p90 is not None else None
-    if len(clean) < 11:
+    if not include_slow_lap_history or len(clean) < 11:
         slow_lap_numbers: tuple[int, ...] | None = None
     else:
         anomalies: list[int] = []
@@ -238,6 +240,7 @@ def pace_rank(participant_id: str, pace_by_participant: Mapping[str, int | float
 class GapSample:
     """One normalized gap observation between our car and a selected target."""
 
+    target_participant_id: str | None = None
     observed_at_us: int | None = None
     gap_ms: int | None = None
     our_lap_number: int | None = None
@@ -252,7 +255,9 @@ def is_eligible_gap_sample(sample: GapSample) -> bool:
     """Whether an observation is safe for an interval/catch calculation."""
 
     return (
-        _is_int(sample.observed_at_us, minimum=0)
+        isinstance(sample.target_participant_id, str)
+        and bool(sample.target_participant_id)
+        and _is_int(sample.observed_at_us, minimum=0)
         and _is_int(sample.gap_ms, minimum=0)
         and _is_int(sample.our_lap_number, minimum=0)
         and sample.our_lap_number == sample.target_lap_number
@@ -318,8 +323,13 @@ def calculate_gap_trend(
     if len(ordered) < 2 or not is_eligible_gap_sample(ordered[-1]):
         return None
 
+    latest_target = ordered[-1].target_participant_id
     suffix_start = len(ordered) - 1
-    while suffix_start > 0 and is_eligible_gap_sample(ordered[suffix_start - 1]):
+    while (
+        suffix_start > 0
+        and is_eligible_gap_sample(ordered[suffix_start - 1])
+        and ordered[suffix_start - 1].target_participant_id == latest_target
+    ):
         suffix_start -= 1
     suffix = ordered[suffix_start:]
     latest = suffix[-1]

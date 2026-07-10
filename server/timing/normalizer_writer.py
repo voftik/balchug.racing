@@ -22,6 +22,7 @@ from typing import Any, Iterator
 from .config import now_us
 from .ingest_store import StoredFrame
 from .lifecycle import OUR_START_NUMBER, OUR_TEAM_NAME
+from .metric_runner import TimingMetricRunner
 from .normalization import (
     ConnectionClockCalibrator,
     CautionPeriod,
@@ -132,6 +133,15 @@ def _duration_us_to_ms(value: Any) -> int | None:
     return source_us // 1_000
 
 
+def _event_ts_time(value: Any) -> int | None:
+    """Return a real provider event timestamp, excluding the unset zero."""
+
+    timestamp = parse_ts_time(value)
+    if timestamp is None or timestamp == 0 or is_open_ended_ts_time(value):
+        return None
+    return timestamp
+
+
 def _gap_ms(value: Any) -> int | None:
     """The current GAP/DIFF cells are decimal seconds, never a TsTime."""
     number = _number(value)
@@ -220,6 +230,7 @@ class TimingNormalizer:
         self._provider_heat_start_ts: int | None = None
         self._finish_sector_ids: set[int] = set()
         self._primed = False
+        self._metric_runner = TimingMetricRunner()
 
     def __call__(
         self,
@@ -244,6 +255,18 @@ class TimingNormalizer:
             self._ensure_heat(connection, contexts[0].received_at_us)
             for context in contexts:
                 self._apply_message(connection, context, write=True)
+        # Derived tactical state is deliberately downstream of the committed
+        # normalized facts. A retry reuses the same frame time/source key and
+        # is idempotent in metric_current and metric_samples.
+        last = contexts[-1]
+        self._metric_runner.process_frame(
+            connection,
+            source_heat_id=self.heat_id,
+            source_frame_id=frame.id,
+            observed_at_us=frame.received_at_us,
+            source_message_id=last.id,
+            source_key=last.source_key,
+        )
 
     def _prime(self, connection: sqlite3.Connection) -> None:
         """Restore in-memory sparse state from already committed derived frames."""
@@ -355,6 +378,11 @@ class TimingNormalizer:
         handle = context.handle
         if handle in {"s_i", "s_t"}:
             self._observe_clock(connection, context, write=write)
+            # h_i normally arrives before the first server-clock sample. Write
+            # the heat again once calibrated so session elapsed time is based
+            # on the provider clock rather than the recorder start time.
+            if write and self.heat:
+                self._write_heat(connection, context)
             if write and self.statistics:
                 self._write_statistics(connection, context)
             return
@@ -519,15 +547,18 @@ class TimingNormalizer:
 
     def _write_heat(self, connection: sqlite3.Connection, context: FrameMessage) -> None:
         provider_start = parse_ts_time(self.heat.get("s"))
+        provider_finish = parse_ts_time(self.heat.get("e"))
         calibrated_start = self._clock(context.connection_id).to_utc_us(provider_start)
+        calibrated_finish = self._clock(context.connection_id).to_utc_us(provider_finish)
         connection.execute(
             """
             UPDATE source_heats
             SET external_name = COALESCE(?, external_name),
-                provider_started_at_us = COALESCE(?, provider_started_at_us)
+                provider_started_at_us = COALESCE(?, provider_started_at_us),
+                provider_finished_at_us = COALESCE(?, provider_finished_at_us)
             WHERE id = ?
             """,
-            (_text(self.heat.get("n")), calibrated_start, self.heat_id),
+            (_text(self.heat.get("n")), calibrated_start, calibrated_finish, self.heat_id),
         )
 
     def _ensure_layout(self, connection: sqlite3.Connection, context: FrameMessage) -> int | None:
@@ -1039,6 +1070,7 @@ class TimingNormalizer:
                     current_lap=source_laps,
                     last_lap_ms=_duration_us_to_ms(row.get("last_lap")),
                     state_kind=state.kind,
+                    sectors=sectors,
                 )
             self._reconcile_pit_and_tire_stint(
                 connection,
@@ -1061,6 +1093,7 @@ class TimingNormalizer:
         current_lap: int,
         last_lap_ms: int | None,
         state_kind: str,
+        sectors: Mapping[str, Any],
     ) -> None:
         """Create source-numbered lap rows for an explicit LAPS increase.
 
@@ -1085,7 +1118,7 @@ class TimingNormalizer:
                     "lap_number": lap_number,
                     "completed_at_us": completed_at_us,
                     "duration_ms": last_lap_ms if is_latest else None,
-                    "sectors_json": None,
+                    "sectors_json": _json(sectors) if is_latest and sectors else None,
                     "flag": self._current_flag_kind(connection),
                     "is_in_lap": int(is_latest and state_kind == "IN_PIT"),
                     "is_out_lap": int(is_latest and state_kind == "OUT_LAP"),
@@ -1705,8 +1738,12 @@ class TimingNormalizer:
         calibration_id = self._latest_calibration_id(connection, context.connection_id)
         green_raw = _text(self.statistics.get("g"))
         finish_raw = _text(self.statistics.get("f"))
-        green_provider = parse_ts_time(green_raw)
-        finish_provider = parse_ts_time(finish_raw)
+        # Statistics uses ``0`` while a heat is still running. It is not a
+        # Time Service instant and must never become a year-2000 boundary.
+        green_provider = _event_ts_time(green_raw)
+        finish_provider = _event_ts_time(finish_raw)
+        green_at_us = clock.to_utc_us(green_provider)
+        finish_at_us = clock.to_utc_us(finish_provider)
         summary = update.summary
         event_key = f"{context.source_key}:statistics"
         typed_values = {
@@ -1714,11 +1751,11 @@ class TimingNormalizer:
             "heat_name_raw": _text(summary.get("heat_name")),
             "green_flag_provider_ts_raw": green_raw,
             "green_flag_provider_ts_us": green_provider,
-            "green_flag_at_us": clock.to_utc_us(green_provider),
+            "green_flag_at_us": green_at_us,
             "green_flag_calibration_id": calibration_id,
             "finish_flag_provider_ts_raw": finish_raw,
             "finish_flag_provider_ts_us": finish_provider,
-            "finish_flag_at_us": clock.to_utc_us(finish_provider),
+            "finish_flag_at_us": finish_at_us,
             "finish_flag_calibration_id": calibration_id,
             "participants_started": summary.get("participants_started"),
             "participants_classified": summary.get("participants_classified"),
@@ -1796,6 +1833,21 @@ class TimingNormalizer:
             self._write_class_best_lap(connection, context, record, calibration_id)
         for caution in update.caution_periods:
             self._write_caution_period(connection, context, caution, calibration_id)
+        self._reconcile_initial_green_boundary(
+            connection,
+            context,
+            provider_ts=green_provider,
+            boundary_at_us=green_at_us,
+            calibration_id=calibration_id,
+        )
+        self._reconcile_finish_boundary(
+            connection,
+            context,
+            provider_ts=finish_provider,
+            boundary_at_us=finish_at_us,
+            calibration_id=calibration_id,
+        )
+        self._reconcile_exact_flag_adjacencies(connection, context)
 
     def _best_record_values(self, record: Any, context: FrameMessage, calibration_id: int | None) -> dict[str, Any]:
         occurred_at = self._clock(context.connection_id).to_utc_us(record.occurred_at_ts_time)
@@ -1942,7 +1994,25 @@ class TimingNormalizer:
             "clock_stopped_raw": _text(caution.clock_stopped_raw),
             "clock_stopped": int(caution.clock_stopped) if caution.clock_stopped is not None else None,
             "remark_raw": caution.remark,
-            "raw_record_json": _json(caution.__dict__),
+            "raw_record_json": _json(
+                {
+                    "provider_key": caution.provider_key,
+                    "flag": {
+                        "raw": caution.flag.raw,
+                        "kind": caution.flag.kind,
+                        "provider_code": caution.flag.provider_code,
+                        "provider_label": caution.flag.provider_label,
+                    },
+                    "started_at_raw": caution.started_at_raw,
+                    "started_at_ts_time": caution.started_at_ts_time,
+                    "ended_at_raw": caution.ended_at_raw,
+                    "ended_at_ts_time": caution.ended_at_ts_time,
+                    "is_open": caution.is_open,
+                    "clock_stopped_raw": caution.clock_stopped_raw,
+                    "clock_stopped": caution.clock_stopped,
+                    "remark": caution.remark,
+                }
+            ),
             "source_message_id": context.id,
             "source_key": context.source_key,
             "source_event_key": f"{context.source_key}:caution:{reconciliation_key}",
@@ -2104,7 +2174,600 @@ class TimingNormalizer:
                 ),
             )
         self._close_caution_if_live_flag_superseded(connection, period_id, caution.flag)
+        persisted = connection.execute(
+            """
+            SELECT calibrated_started_at_us,calibrated_ended_at_us
+            FROM track_flag_periods WHERE id = ?
+            """,
+            (period_id,),
+        ).fetchone()
+        self._reconcile_caution_timeline(
+            connection,
+            context,
+            period_id=period_id,
+            caution=caution,
+            # A provider timestamp can be received again after the rolling
+            # connection calibration changed. Keep one resolved boundary and
+            # copy that exact value to its neighbours.
+            started_at_us=(
+                int(persisted["calibrated_started_at_us"])
+                if persisted is not None and persisted["calibrated_started_at_us"] is not None
+                else None
+            ),
+            ended_at_us=(
+                int(persisted["calibrated_ended_at_us"])
+                if persisted is not None and persisted["calibrated_ended_at_us"] is not None
+                else None
+            ),
+            calibration_id=calibration_id,
+        )
         self._invalidate_clean_laps_for_caution(connection, period_id)
+
+    def _set_period_start_boundary(
+        self,
+        connection: sqlite3.Connection,
+        context: FrameMessage,
+        *,
+        period: sqlite3.Row,
+        boundary_at_us: int,
+        provider_ts: int,
+        calibration_id: int | None,
+    ) -> None:
+        """Replace a provisional status start with one provider boundary."""
+
+        connection.execute(
+            """
+            UPDATE track_flag_periods
+            SET started_at_us = ?, start_provider_ts_raw = ?, start_provider_ts_us = ?,
+                calibrated_started_at_us = ?, start_clock_calibration_id = ?,
+                reconciliation_source_message_id = ?, reconciliation_source_key = ?, reconciled_at_us = ?
+            WHERE id = ?
+            """,
+            (
+                boundary_at_us,
+                str(provider_ts),
+                provider_ts,
+                boundary_at_us,
+                calibration_id,
+                context.id,
+                context.source_key,
+                now_us(),
+                period["id"],
+            ),
+        )
+        if period["source_key"] is None:
+            return
+        connection.execute(
+            """
+            UPDATE track_flag_current
+            SET started_at_us = ?, start_provider_ts_raw = ?, start_provider_ts_us = ?,
+                calibrated_started_at_us = ?, start_clock_calibration_id = ?,
+                reconciliation_source_message_id = ?, reconciliation_source_key = ?, reconciled_at_us = ?,
+                updated_at_us = ?
+            WHERE source_heat_id = ? AND source_key = ?
+            """,
+            (
+                boundary_at_us,
+                str(provider_ts),
+                provider_ts,
+                boundary_at_us,
+                calibration_id,
+                context.id,
+                context.source_key,
+                now_us(),
+                context.received_at_us,
+                self.heat_id,
+                period["source_key"],
+            ),
+        )
+
+    def _set_period_end_boundary(
+        self,
+        connection: sqlite3.Connection,
+        context: FrameMessage,
+        *,
+        period: sqlite3.Row,
+        boundary_at_us: int,
+        provider_ts: int,
+        calibration_id: int | None,
+    ) -> None:
+        """Replace a provisional status end without discarding its observation."""
+
+        connection.execute(
+            """
+            UPDATE track_flag_periods
+            SET ended_at_us = ?, end_provider_ts_raw = ?, end_provider_ts_us = ?,
+                calibrated_ended_at_us = ?, end_clock_calibration_id = ?,
+                ended_source_message_id = COALESCE(ended_source_message_id, ?),
+                ended_source_key = COALESCE(ended_source_key, ?),
+                reconciliation_source_message_id = ?, reconciliation_source_key = ?, reconciled_at_us = ?
+            WHERE id = ?
+            """,
+            (
+                boundary_at_us,
+                str(provider_ts),
+                provider_ts,
+                boundary_at_us,
+                calibration_id,
+                context.id,
+                context.source_key,
+                context.id,
+                context.source_key,
+                now_us(),
+                period["id"],
+            ),
+        )
+
+    def _align_preceding_status(
+        self,
+        connection: sqlite3.Connection,
+        context: FrameMessage,
+        *,
+        excluded_period_id: int | None,
+        boundary_at_us: int,
+        provider_ts: int,
+        calibration_id: int | None,
+    ) -> sqlite3.Row | None:
+        """Close the provisional status containing an authoritative transition."""
+
+        conditions = [
+            "source_heat_id = ?",
+            "started_at_us < ?",
+            "(ended_at_us IS NULL OR ended_at_us > ?)",
+            "calibrated_ended_at_us IS NULL",
+        ]
+        parameters: list[Any] = [self.heat_id, boundary_at_us, boundary_at_us]
+        if excluded_period_id is not None:
+            conditions.append("id <> ?")
+            parameters.append(excluded_period_id)
+        period = connection.execute(
+            f"""
+            SELECT id,source_key FROM track_flag_periods
+            WHERE {' AND '.join(conditions)}
+            ORDER BY started_at_us DESC,id DESC
+            LIMIT 1
+            """,
+            parameters,
+        ).fetchone()
+        if period is not None:
+            self._set_period_end_boundary(
+                connection,
+                context,
+                period=period,
+                boundary_at_us=boundary_at_us,
+                provider_ts=provider_ts,
+                calibration_id=calibration_id,
+            )
+        return period
+
+    def _align_following_status(
+        self,
+        connection: sqlite3.Connection,
+        context: FrameMessage,
+        *,
+        period_id: int,
+        period_flag: str,
+        boundary_at_us: int,
+        provider_ts: int,
+        calibration_id: int | None,
+    ) -> sqlite3.Row | None:
+        """Move a directly observed successor onto an exact preceding end."""
+
+        period = connection.execute(
+            """
+            SELECT id,source_key
+            FROM track_flag_periods
+            WHERE source_heat_id = ? AND id <> ? AND flag <> ?
+              AND calibrated_started_at_us IS NULL
+              AND started_at_us >= ?
+              AND ABS(COALESCE(observed_started_at_us, started_at_us) - ?) <= ?
+            ORDER BY ABS(COALESCE(observed_started_at_us, started_at_us) - ?),id
+            LIMIT 1
+            """,
+            (
+                self.heat_id,
+                period_id,
+                period_flag,
+                boundary_at_us,
+                boundary_at_us,
+                FLAG_RECONCILIATION_WINDOW_US,
+                boundary_at_us,
+            ),
+        ).fetchone()
+        if period is not None:
+            self._set_period_start_boundary(
+                connection,
+                context,
+                period=period,
+                boundary_at_us=boundary_at_us,
+                provider_ts=provider_ts,
+                calibration_id=calibration_id,
+            )
+        return period
+
+    def _synthesize_following_status(
+        self,
+        connection: sqlite3.Connection,
+        context: FrameMessage,
+        *,
+        preceding: sqlite3.Row | None,
+        caution: CautionPeriod,
+        boundary_at_us: int,
+        calibration_id: int | None,
+    ) -> None:
+        """Split a long direct status when history arrives after a reconnect."""
+
+        if preceding is None or caution.ended_at_ts_time is None:
+            return
+        current = connection.execute(
+            """
+            SELECT flag,provider_code,provider_label,source_flag_kind_raw,source_key
+            FROM track_flag_current WHERE source_heat_id = ?
+            """,
+            (self.heat_id,),
+        ).fetchone()
+        if (
+            current is None
+            or current["source_key"] != preceding["source_key"]
+            or self._same_flag_state(current, caution.flag)
+        ):
+            return
+        source_key = (
+            f"statistics-boundary:{self.heat_id}:{caution.provider_key}:"
+            f"{caution.ended_at_ts_time}:{current['flag']}"
+        )
+        _insert_ignore(
+            connection,
+            "track_flag_periods",
+            {
+                "source_heat_id": self.heat_id,
+                "flag": current["flag"],
+                "provider_code": current["provider_code"],
+                "provider_label": current["provider_label"],
+                "started_at_us": boundary_at_us,
+                "source_message_id": context.id,
+                "source_key": source_key,
+                "created_at_us": now_us(),
+                "start_provider_ts_raw": str(caution.ended_at_ts_time),
+                "start_provider_ts_us": caution.ended_at_ts_time,
+                "observed_started_at_us": None,
+                "calibrated_started_at_us": boundary_at_us,
+                "start_clock_calibration_id": calibration_id,
+                "source_flag_kind_raw": current["source_flag_kind_raw"],
+                "reconciliation_source_message_id": context.id,
+                "reconciliation_source_key": context.source_key,
+                "reconciled_at_us": now_us(),
+            },
+        )
+        _upsert(
+            connection,
+            "track_flag_current",
+            {
+                "source_heat_id": self.heat_id,
+                "flag": current["flag"],
+                "provider_code": current["provider_code"],
+                "provider_label": current["provider_label"],
+                "started_at_us": boundary_at_us,
+                "source_message_id": context.id,
+                "source_key": source_key,
+                "updated_at_us": context.received_at_us,
+                "start_provider_ts_raw": str(caution.ended_at_ts_time),
+                "start_provider_ts_us": caution.ended_at_ts_time,
+                "observed_started_at_us": None,
+                "calibrated_started_at_us": boundary_at_us,
+                "start_clock_calibration_id": calibration_id,
+                "source_flag_kind_raw": current["source_flag_kind_raw"],
+                "reconciliation_key": None,
+                "reconciliation_source_message_id": context.id,
+                "reconciliation_source_key": context.source_key,
+                "reconciled_at_us": now_us(),
+            },
+            conflict_columns=("source_heat_id",),
+        )
+
+    def _reconcile_caution_timeline(
+        self,
+        connection: sqlite3.Connection,
+        context: FrameMessage,
+        *,
+        period_id: int,
+        caution: CautionPeriod,
+        started_at_us: int | None,
+        ended_at_us: int | None,
+        calibration_id: int | None,
+    ) -> None:
+        """Make provider caution boundaries exclusive with their neighbour states."""
+
+        preceding: sqlite3.Row | None = None
+        if started_at_us is not None and caution.started_at_ts_time is not None:
+            preceding = self._align_preceding_status(
+                connection,
+                context,
+                excluded_period_id=period_id,
+                boundary_at_us=started_at_us,
+                provider_ts=caution.started_at_ts_time,
+                calibration_id=calibration_id,
+            )
+        if ended_at_us is None or caution.ended_at_ts_time is None:
+            return
+        successor = self._align_following_status(
+            connection,
+            context,
+            period_id=period_id,
+            period_flag=caution.flag.kind,
+            boundary_at_us=ended_at_us,
+            provider_ts=caution.ended_at_ts_time,
+            calibration_id=calibration_id,
+        )
+        if successor is None:
+            self._synthesize_following_status(
+                connection,
+                context,
+                preceding=preceding,
+                caution=caution,
+                boundary_at_us=ended_at_us,
+                calibration_id=calibration_id,
+            )
+
+    def _reconcile_initial_green_boundary(
+        self,
+        connection: sqlite3.Connection,
+        context: FrameMessage,
+        *,
+        provider_ts: int | None,
+        boundary_at_us: int | None,
+        calibration_id: int | None,
+    ) -> None:
+        """Use Statistics' heat-start Green time when the first state is Green."""
+
+        if provider_ts is None or boundary_at_us is None:
+            return
+        period = connection.execute(
+            """
+            SELECT id,source_key,flag,started_at_us,calibrated_started_at_us
+            FROM track_flag_periods
+            WHERE source_heat_id = ?
+            ORDER BY started_at_us,id
+            LIMIT 1
+            """,
+            (self.heat_id,),
+        ).fetchone()
+        if period is None or period["flag"] != "GREEN" or period["started_at_us"] <= boundary_at_us:
+            return
+        if period["calibrated_started_at_us"] is not None:
+            return
+        self._set_period_start_boundary(
+            connection,
+            context,
+            period=period,
+            boundary_at_us=boundary_at_us,
+            provider_ts=provider_ts,
+            calibration_id=calibration_id,
+        )
+
+    def _reconcile_finish_boundary(
+        self,
+        connection: sqlite3.Connection,
+        context: FrameMessage,
+        *,
+        provider_ts: int | None,
+        boundary_at_us: int | None,
+        calibration_id: int | None,
+    ) -> None:
+        """Treat Statistics' finish timestamp as the exact end-state transition."""
+
+        if provider_ts is None or boundary_at_us is None:
+            return
+        current = connection.execute(
+            """
+            SELECT flag,provider_code,provider_label,source_flag_kind_raw,source_key
+            FROM track_flag_current WHERE source_heat_id = ?
+            """,
+            (self.heat_id,),
+        ).fetchone()
+        period = None
+        if current is not None and current["flag"] == "FINISH":
+            period = connection.execute(
+                """
+                SELECT id,source_key,calibrated_started_at_us,start_provider_ts_us
+                FROM track_flag_periods
+                WHERE source_heat_id = ? AND source_key = ?
+                """,
+                (self.heat_id, current["source_key"]),
+            ).fetchone()
+        if period is None:
+            period = connection.execute(
+                """
+                SELECT id,source_key,calibrated_started_at_us,start_provider_ts_us
+                FROM track_flag_periods
+                WHERE source_heat_id = ? AND flag = 'FINISH'
+                  AND ABS(COALESCE(observed_started_at_us, started_at_us) - ?) <= ?
+                ORDER BY ABS(COALESCE(observed_started_at_us, started_at_us) - ?),id
+                LIMIT 1
+                """,
+                (self.heat_id, boundary_at_us, FLAG_RECONCILIATION_WINDOW_US, boundary_at_us),
+            ).fetchone()
+        if period is not None:
+            canonical_boundary_at_us = (
+                int(period["calibrated_started_at_us"])
+                if period["calibrated_started_at_us"] is not None
+                else boundary_at_us
+            )
+            canonical_provider_ts = (
+                int(period["start_provider_ts_us"])
+                if period["start_provider_ts_us"] is not None
+                else provider_ts
+            )
+            self._align_preceding_status(
+                connection,
+                context,
+                excluded_period_id=int(period["id"]),
+                boundary_at_us=canonical_boundary_at_us,
+                provider_ts=canonical_provider_ts,
+                calibration_id=calibration_id,
+            )
+            if period["calibrated_started_at_us"] is None:
+                self._set_period_start_boundary(
+                    connection,
+                    context,
+                    period=period,
+                    boundary_at_us=canonical_boundary_at_us,
+                    provider_ts=canonical_provider_ts,
+                    calibration_id=calibration_id,
+                )
+            return
+
+        self._align_preceding_status(
+            connection,
+            context,
+            excluded_period_id=None,
+            boundary_at_us=boundary_at_us,
+            provider_ts=provider_ts,
+            calibration_id=calibration_id,
+        )
+        source_key = f"statistics-finish:{self.heat_id}:{provider_ts}"
+        _insert_ignore(
+            connection,
+            "track_flag_periods",
+            {
+                "source_heat_id": self.heat_id,
+                "flag": "FINISH",
+                "provider_code": "5",
+                "provider_label": "Finish flag",
+                "started_at_us": boundary_at_us,
+                "source_message_id": context.id,
+                "source_key": source_key,
+                "created_at_us": now_us(),
+                "start_provider_ts_raw": str(provider_ts),
+                "start_provider_ts_us": provider_ts,
+                "observed_started_at_us": context.received_at_us,
+                "calibrated_started_at_us": boundary_at_us,
+                "start_clock_calibration_id": calibration_id,
+                "source_flag_kind_raw": "5",
+                "reconciliation_source_message_id": context.id,
+                "reconciliation_source_key": context.source_key,
+                "reconciled_at_us": now_us(),
+            },
+        )
+        _upsert(
+            connection,
+            "track_flag_current",
+            {
+                "source_heat_id": self.heat_id,
+                "flag": "FINISH",
+                "provider_code": "5",
+                "provider_label": "Finish flag",
+                "started_at_us": boundary_at_us,
+                "source_message_id": context.id,
+                "source_key": source_key,
+                "updated_at_us": context.received_at_us,
+                "start_provider_ts_raw": str(provider_ts),
+                "start_provider_ts_us": provider_ts,
+                "observed_started_at_us": context.received_at_us,
+                "calibrated_started_at_us": boundary_at_us,
+                "start_clock_calibration_id": calibration_id,
+                "source_flag_kind_raw": "5",
+                "reconciliation_key": None,
+                "reconciliation_source_message_id": context.id,
+                "reconciliation_source_key": context.source_key,
+                "reconciled_at_us": now_us(),
+            },
+            conflict_columns=("source_heat_id",),
+        )
+
+    def _reconcile_exact_flag_adjacencies(
+        self,
+        connection: sqlite3.Connection,
+        context: FrameMessage,
+    ) -> None:
+        """Use one calibrated instant for both sides of the same raw boundary."""
+
+        rows = connection.execute(
+            """
+            SELECT id,flag,source_key,reconciliation_key,started_at_us,ended_at_us,
+                   start_provider_ts_us,end_provider_ts_us,
+                   calibrated_started_at_us,calibrated_ended_at_us,
+                   start_clock_calibration_id,end_clock_calibration_id
+            FROM track_flag_periods
+            WHERE source_heat_id = ?
+            ORDER BY started_at_us,id
+            """,
+            (self.heat_id,),
+        ).fetchall()
+        for left, right in zip(rows, rows[1:]):
+            if (
+                left["end_provider_ts_us"] is None
+                or right["start_provider_ts_us"] is None
+                or int(left["end_provider_ts_us"]) != int(right["start_provider_ts_us"])
+            ):
+                continue
+            if right["flag"] == "FINISH" and right["calibrated_started_at_us"] is not None:
+                boundary_at_us = int(right["calibrated_started_at_us"])
+                calibration_id = right["start_clock_calibration_id"]
+            elif right["reconciliation_key"] is not None and right["calibrated_started_at_us"] is not None:
+                boundary_at_us = int(right["calibrated_started_at_us"])
+                calibration_id = right["start_clock_calibration_id"]
+            elif left["reconciliation_key"] is not None and left["calibrated_ended_at_us"] is not None:
+                boundary_at_us = int(left["calibrated_ended_at_us"])
+                calibration_id = left["end_clock_calibration_id"]
+            else:
+                continue
+            if boundary_at_us < int(left["started_at_us"]):
+                continue
+            connection.execute(
+                """
+                UPDATE track_flag_periods
+                SET ended_at_us = ?, calibrated_ended_at_us = ?, end_clock_calibration_id = ?,
+                    reconciliation_source_message_id = ?, reconciliation_source_key = ?, reconciled_at_us = ?
+                WHERE id = ?
+                """,
+                (
+                    boundary_at_us,
+                    boundary_at_us,
+                    calibration_id,
+                    context.id,
+                    context.source_key,
+                    now_us(),
+                    left["id"],
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE track_flag_periods
+                SET started_at_us = ?, calibrated_started_at_us = ?, start_clock_calibration_id = ?,
+                    reconciliation_source_message_id = ?, reconciliation_source_key = ?, reconciled_at_us = ?
+                WHERE id = ?
+                """,
+                (
+                    boundary_at_us,
+                    boundary_at_us,
+                    calibration_id,
+                    context.id,
+                    context.source_key,
+                    now_us(),
+                    right["id"],
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE track_flag_current
+                SET started_at_us = ?, calibrated_started_at_us = ?, start_clock_calibration_id = ?,
+                    reconciliation_source_message_id = ?, reconciliation_source_key = ?, reconciled_at_us = ?,
+                    updated_at_us = ?
+                WHERE source_heat_id = ? AND source_key = ?
+                """,
+                (
+                    boundary_at_us,
+                    boundary_at_us,
+                    calibration_id,
+                    context.id,
+                    context.source_key,
+                    now_us(),
+                    context.received_at_us,
+                    self.heat_id,
+                    right["source_key"],
+                ),
+            )
 
     def _invalidate_clean_laps_for_caution(self, connection: sqlite3.Connection, period_id: int) -> None:
         """Remove a clean mark if later flag history proves that a lap was interrupted."""

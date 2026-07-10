@@ -40,8 +40,9 @@ def clean_lap(number, duration):
     )
 
 
-def green_gap(timestamp, gap, lap, *, target_lap=None, flag=GREEN_FLAG):
+def green_gap(timestamp, gap, lap, *, target_lap=None, target_id="target", flag=GREEN_FLAG):
     return GapSample(
+        target_participant_id=target_id,
         observed_at_us=timestamp,
         gap_ms=gap,
         our_lap_number=lap,
@@ -102,6 +103,19 @@ class CleanLapAndPaceTests(unittest.TestCase):
 
 
 class GapMetricsTests(unittest.TestCase):
+    def test_target_change_breaks_the_gap_window(self):
+        samples = (
+            green_gap(0, 10_000, 10, target_id="leader"),
+            green_gap(30_000_000, 8_500, 11, target_id="leader"),
+            green_gap(60_000_000, 6_000, 12, target_id="new-ahead"),
+        )
+        self.assertIsNone(calculate_gap_trend(samples, relation=GAP_RELATION_AHEAD, window_s=60))
+        resumed = samples + (green_gap(120_000_000, 4_000, 13, target_id="new-ahead"),)
+        trend = calculate_gap_trend(resumed, relation=GAP_RELATION_AHEAD, window_s=60)
+        self.assertIsNotNone(trend)
+        self.assertEqual(trend.started_gap_ms, 6_000)
+        self.assertEqual(trend.ended_gap_ms, 4_000)
+
     def test_green_same_lap_gap_trend_has_fixed_closure_sign_and_label(self):
         samples = (
             green_gap(0, 10_000, 10),
