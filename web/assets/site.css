@@ -66,15 +66,19 @@ main{flex:1;padding:26px 0 36px;display:flex;flex-direction:column;}
 
 /* ---- Footer ---- */
 footer{border-top:1px solid var(--line);background:var(--white);}
-.foot-inner{display:flex;align-items:center;gap:16px 22px;padding:20px 0;flex-wrap:wrap;}
-.foot-inner .fbrand{font-family:var(--display);text-transform:uppercase;letter-spacing:.12em;font-size:12.5px;color:var(--navy);}
-.foot-inner .fbrand b{color:var(--red);}
-.fnav{display:flex;gap:14px;flex-wrap:wrap;}
-.fnav a{font-size:12.5px;color:var(--muted);text-decoration:none;}
-.fnav a:hover{color:var(--red);}
-.foot-inner .fmeta{margin-left:auto;color:var(--muted);font-size:12px;}
-.foot-inner .fmeta a{color:var(--navy);text-decoration:none;border-bottom:1px solid var(--line);}
-.foot-inner .fmeta a:hover{color:var(--red);border-color:var(--red);}
+.foot-inner{display:grid;grid-template-columns:minmax(112px,1fr) auto minmax(142px,1fr);align-items:center;
+  gap:16px;padding:18px 0;}
+.foot-logo{display:flex;align-items:center;width:max-content;}
+.foot-logo img{display:block;width:auto;height:26px;}
+.boris-btn{display:inline-flex;align-items:center;justify-content:center;min-height:36px;padding:8px 12px;
+  border:1px solid var(--red);border-radius:6px;background:var(--red);color:#fff;cursor:pointer;
+  font-family:var(--display);font-size:11px;letter-spacing:0;text-transform:uppercase;line-height:1;
+  text-decoration:none;white-space:nowrap;transition:.15s;}
+.boris-btn:hover{background:var(--red-2);border-color:var(--red-2);color:#fff;}
+.team-site{justify-self:end;color:var(--navy);font-family:var(--display);font-size:10.5px;letter-spacing:0;
+  text-transform:uppercase;text-decoration:none;white-space:nowrap;}
+.team-site:hover{color:var(--red);}
+.titlebar .boris-btn{margin-left:auto;}
 
 /* ---- Встроенный контент (iframe) ---- */
 .embed-wrap{position:relative;height:calc(100vh - 232px);min-height:560px;background:var(--navy);
@@ -97,5 +101,9 @@ footer{border-top:1px solid var(--line);background:var(--white);}
 @media (max-width:680px){
   .brand .kicker{display:none;}
   .head-cta{margin-left:0;}
-  .titlebar .src-link{margin-left:0;}
+  .titlebar .src-link,.titlebar .boris-btn{margin-left:0;}
+}
+@media (max-width:520px){
+  .foot-inner{grid-template-columns:1fr;gap:14px;padding:18px 0;justify-items:start;}
+  .team-site{justify-self:start;}
 }

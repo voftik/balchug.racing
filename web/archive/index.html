@@ -43,11 +43,9 @@
   .rec .meta{font-size:11.5px;color:var(--muted);display:flex;flex-wrap:wrap;gap:4px 10px;}
   .rec .meta b{color:var(--navy);font-weight:600;}
 
-  /* Акцентная кнопка «для Бориса» (без эмодзи) + индикация включённого режима */
-  #adminBtn{background:var(--red);border:1px solid var(--red);color:#fff;font-weight:700;}
-  #adminBtn:hover{background:var(--red-2);border-color:var(--red-2);color:#fff;}
-  body.admin #adminBtn{background:var(--ok);border-color:var(--ok);color:#06121f;}
-  body.admin #adminBtn::after{content:" · вкл";}
+  /* Индикация включённого режима на обоих триггерах Бориса. */
+  body.admin .boris-btn{background:var(--ok);border-color:var(--ok);color:#06121f;}
+  body.admin .boris-btn::after{content:" · вкл";}
 
   /* Кнопки управления на карточке — видны только в режиме админа */
   .rec .admin-actions{display:none;gap:7px;margin-top:9px;padding-top:9px;border-top:1px dashed var(--line);}
@@ -142,7 +140,7 @@
       <div class="titlebar reveal">
         <h1>Архив записей</h1>
         <span class="sub">Онборд-видео · телеметрия · сезоны команды</span>
-        <a class="src-link" id="adminBtn" href="#">Кнопка для Бориса</a>
+        <button class="boris-btn" type="button" data-boris-trigger>Кнопка для Бориса</button>
       </div>
 
       <div class="filters reveal">
@@ -192,15 +190,9 @@
 
   <footer>
     <div class="wrap foot-inner">
-      <span class="fbrand">BALCHUG <b>RACING</b></span>
-      <nav class="fnav">
-        <a href="/">Онборд</a>
-        <a href="/telemetry/">Телеметрия трассы</a>
-        <a href="/weather/">Радар осадков</a>
-        <a href="/archive/">Архив</a>
-        <a href="https://solo.liveu.tv/" target="_blank" rel="noopener">Кабинет LiveU ↗</a>
-      </nav>
-      <span class="fmeta">Приватная трансляция команды · <a href="https://balchug-racing.ru/" target="_blank" rel="noopener">balchug-racing.ru</a></span>
+      <a class="foot-logo" href="/" aria-label="BALCHUG Racing — главная"><img src="/assets/logo.svg" alt="BALCHUG Racing" /></a>
+      <button class="boris-btn" type="button" data-boris-trigger>Кнопка для Бориса</button>
+      <a class="team-site" href="https://balchug-racing.ru/" target="_blank" rel="noopener">balchug-racing.ru ↗</a>
     </div>
   </footer>
 

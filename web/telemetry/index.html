@@ -63,15 +63,9 @@
 
   <footer>
     <div class="wrap foot-inner">
-      <span class="fbrand">BALCHUG <b>RACING</b></span>
-      <nav class="fnav">
-        <a href="/">Онборд</a>
-        <a href="/telemetry/">Телеметрия трассы</a>
-        <a href="/weather/">Радар осадков</a>
-        <a href="/archive/">Архив</a>
-        <a href="https://solo.liveu.tv/" target="_blank" rel="noopener">Кабинет LiveU ↗</a>
-      </nav>
-      <span class="fmeta">Источник: <a id="fsrc" href="#" target="_blank" rel="noopener">getraceresults.com</a></span>
+      <a class="foot-logo" href="/" aria-label="BALCHUG Racing — главная"><img src="/assets/logo.svg" alt="BALCHUG Racing" /></a>
+      <a class="boris-btn" href="/archive/#boris">Кнопка для Бориса</a>
+      <a class="team-site" href="https://balchug-racing.ru/" target="_blank" rel="noopener">balchug-racing.ru ↗</a>
     </div>
   </footer>
 
@@ -90,7 +84,6 @@
 
     var lt=document.getElementById("lt"), ld=document.getElementById("ld"),
         sub=document.getElementById("sub"), extLink=document.getElementById("extLink"),
-        fsrc=document.getElementById("fsrc"),
         btns=document.querySelectorAll("[data-track]");
 
     var cur=DEFAULT_TRACK;
@@ -100,7 +93,7 @@
       ld.classList.remove("hidden");
       lt.src=t.url;
       sub.textContent=t.name+" · live timing";
-      extLink.href=t.url; fsrc.href=t.url;
+      extLink.href=t.url;
       document.title="BALCHUG Racing — Телеметрия трассы ("+t.name+")";
       for(var i=0;i<btns.length;i++){
         var active=btns[i].getAttribute("data-track")===cur;

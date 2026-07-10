@@ -158,7 +158,10 @@
   }
   function closeBoris() { borisModal.classList.remove("open"); }
 
-  $("adminBtn").addEventListener("click", function (e) { e.preventDefault(); openBoris(); });
+  var borisTriggers = document.querySelectorAll("[data-boris-trigger]");
+  for (var i = 0; i < borisTriggers.length; i++) {
+    borisTriggers[i].addEventListener("click", function (e) { e.preventDefault(); openBoris(); });
+  }
   borisModal.addEventListener("click", function (e) { if (e.target === borisModal) closeBoris(); });
   document.addEventListener("keydown", function (e) { if (e.key === "Escape") closeBoris(); });
 

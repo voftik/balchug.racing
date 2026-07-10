@@ -70,15 +70,9 @@
 
   <footer>
     <div class="wrap foot-inner">
-      <span class="fbrand">BALCHUG <b>RACING</b></span>
-      <nav class="fnav">
-        <a href="/">Онборд</a>
-        <a href="/telemetry/">Телеметрия трассы</a>
-        <a href="/weather/">Радар осадков</a>
-        <a href="/archive/">Архив</a>
-        <a href="https://solo.liveu.tv/" target="_blank" rel="noopener">Кабинет LiveU ↗</a>
-      </nav>
-      <span class="fmeta">Источник: <a id="fsrc" href="#" target="_blank" rel="noopener">windy.com</a></span>
+      <a class="foot-logo" href="/" aria-label="BALCHUG Racing — главная"><img src="/assets/logo.svg" alt="BALCHUG Racing" /></a>
+      <a class="boris-btn" href="/archive/#boris">Кнопка для Бориса</a>
+      <a class="team-site" href="https://balchug-racing.ru/" target="_blank" rel="noopener">balchug-racing.ru ↗</a>
     </div>
   </footer>
 
@@ -117,7 +111,7 @@
 
     var map=document.getElementById("map"), ld=document.getElementById("ld"),
         sub=document.getElementById("sub"), note=document.getElementById("note"),
-        extLink=document.getElementById("extLink"), fsrc=document.getElementById("fsrc"),
+        extLink=document.getElementById("extLink"),
         trackBtns=document.querySelectorAll("[data-track]"),
         srcBtns=document.querySelectorAll("[data-src]");
 
@@ -134,7 +128,7 @@
       ld.classList.remove("hidden");
       map.src=s.build(t);
       sub.textContent=t.name+" · осадки";
-      extLink.href=s.ext(t); fsrc.href=s.ext(t); fsrc.textContent=s.host;
+      extLink.href=s.ext(t);
       setActive(trackBtns,"data-track",curTrack);
       setActive(srcBtns,"data-src",curSrc);
       // подсказка по покрытию
