@@ -40,6 +40,9 @@
     manifestController: null,
     snapshotTimer: 0,
     snapshotRequestId: 0,
+    activeSnapshotRequestId: 0,
+    snapshotInFlight: false,
+    pendingSnapshotAtUs: null,
     lastSnapshotStartedMs: 0,
     selectionEpoch: 0,
     exactSnapshots: new Map(),
@@ -228,6 +231,9 @@
     if (state.snapshotController) state.snapshotController.abort();
     window.clearTimeout(state.snapshotTimer);
     state.snapshotRequestId += 1;
+    state.activeSnapshotRequestId = 0;
+    state.snapshotInFlight = false;
+    state.pendingSnapshotAtUs = null;
     state.entry = entry;
     state.manifest = null;
     state.payload = null;
@@ -300,8 +306,16 @@
   function scheduleExactSnapshot() {
     if (!state.manifest) return;
     window.clearTimeout(state.snapshotTimer);
+    if (state.snapshotInFlight) {
+      state.pendingSnapshotAtUs = state.atUs;
+      if (!state.playing && state.snapshotController) state.snapshotController.abort();
+      return;
+    }
     if (state.playing) {
-      if (performance.now() - state.lastSnapshotStartedMs < 160) return;
+      if (performance.now() - state.lastSnapshotStartedMs < 160) {
+        state.pendingSnapshotAtUs = state.atUs;
+        return;
+      }
       requestExactSnapshot();
       return;
     }
@@ -310,11 +324,16 @@
 
   function requestExactSnapshot() {
     if (!state.manifest || !state.entry) return;
-    if (state.snapshotController) state.snapshotController.abort();
+    if (state.snapshotInFlight) {
+      state.pendingSnapshotAtUs = state.atUs;
+      return;
+    }
     state.snapshotController = new AbortController();
     state.lastSnapshotStartedMs = performance.now();
     var requestedAtUs = state.atUs;
     var requestId = ++state.snapshotRequestId;
+    state.activeSnapshotRequestId = requestId;
+    state.snapshotInFlight = true;
     var epoch = state.selectionEpoch;
     var entryId = selectEntryId(state.entry);
     var url = API + "/sessions/" + encodeURIComponent(state.entry.session.id) + "/archive/snapshot?generation=" +
@@ -327,7 +346,21 @@
       renderConfirmedSnapshot();
     }).catch(function (error) {
       if (error && error.name === "AbortError") return;
+    }).then(function () {
+      finishExactSnapshot(epoch, requestId);
     });
+  }
+
+  function finishExactSnapshot(epoch, requestId) {
+    if (epoch !== state.selectionEpoch || requestId !== state.activeSnapshotRequestId) return;
+    state.snapshotInFlight = false;
+    state.activeSnapshotRequestId = 0;
+    state.snapshotController = null;
+    if (state.pendingSnapshotAtUs === null || !state.manifest) return;
+    state.pendingSnapshotAtUs = null;
+    var delay = state.playing ? Math.max(0, 160 - (performance.now() - state.lastSnapshotStartedMs)) : 0;
+    if (delay > 0) state.snapshotTimer = window.setTimeout(requestExactSnapshot, delay);
+    else requestExactSnapshot();
   }
 
   function cacheExactSnapshot(payload, effectiveAtUs) {
@@ -659,12 +692,17 @@
   }
 
   function stopPlayback() {
+    var wasPlaying = state.playing;
     state.playing = false;
     window.cancelAnimationFrame(state.raf);
     state.raf = 0;
     elements.play.innerHTML = "&#9654;";
     elements.play.setAttribute("aria-label", "Воспроизвести");
     elements.play.title = "Воспроизвести";
+    if (wasPlaying && state.pendingSnapshotAtUs !== null && !state.snapshotInFlight && state.manifest) {
+      window.clearTimeout(state.snapshotTimer);
+      state.snapshotTimer = window.setTimeout(requestExactSnapshot, 0);
+    }
   }
 
   function playTick(now) {

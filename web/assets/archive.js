@@ -14,7 +14,9 @@
     items: Object.create(null),
     currentItem: null,
     timingEntries: [],
-    timingLoaded: false
+    timingLoaded: false,
+    timingSelectionEpoch: 0,
+    timingSelectionTimer: 0
   };
 
   // ---- форматтеры ----
@@ -130,10 +132,10 @@
     slot.hidden = false;
     var label = document.createElement("span");
     label.className = "ta-video-label";
-    label.textContent = "Видео сессии";
+    label.textContent = "Видео совпадающего контекста";
     var note = document.createElement("span");
     note.className = "ta-video-note";
-    note.textContent = "Дата, трасса, тип · шкалы независимы";
+    note.textContent = "Дата, трасса, тип · прямое соответствие не подтверждено";
     var links = document.createElement("div");
     links.className = "ta-video-links";
     videos.forEach(function (item) {
@@ -141,7 +143,7 @@
       button.type = "button";
       button.className = "ta-video-link";
       button.textContent = item.title || "Видео";
-      button.title = "Открыть видео сессии. Временная шкала видео независима от телеметрии.";
+      button.title = "Открыть видео с совпадающим контекстом. Временные шкалы независимы; прямая связь не подтверждена.";
       button.addEventListener("click", function () { openItem(item.id); });
       links.appendChild(button);
     });
@@ -151,17 +153,22 @@
   }
   function chooseTimingEntry(entry) {
     var selected = timingSelection(entry);
+    state.timingSelectionEpoch += 1;
+    var epoch = state.timingSelectionEpoch;
+    window.clearTimeout(state.timingSelectionTimer);
     try { localStorage.setItem("balchug_timing_archive_selection", selected); } catch (error) {}
     if (timingArchive && timingArchive.scrollIntoView) {
       timingArchive.scrollIntoView({ behavior: "smooth", block: "start" });
     }
     var attempts = 0;
     function applySelection() {
+      if (epoch !== state.timingSelectionEpoch) return;
       attempts += 1;
       if (!timingSelect || !timingSelect.querySelector('option[value="' + selected + '"]')) {
-        if (attempts < 30) window.setTimeout(applySelection, 100);
+        if (attempts < 30) state.timingSelectionTimer = window.setTimeout(applySelection, 100);
         return;
       }
+      state.timingSelectionTimer = 0;
       timingSelect.value = selected;
       timingSelect.dispatchEvent(new Event("change", { bubbles: true }));
     }
@@ -192,8 +199,8 @@
     slot.hidden = false;
     var label = document.createElement("span");
     label.className = "timing-card-label";
-    label.textContent = "Телеметрия сессии";
-    label.title = "Связь по дате, трассе и типу сессии; временные шкалы независимы.";
+    label.textContent = "Телеметрия совпадающего контекста";
+    label.title = "Совпали дата, трасса и тип. Это не подтверждает прямую связь записей.";
     slot.appendChild(label);
     entries.forEach(function (entry) { slot.appendChild(timingButton(entry, "timing-card-link")); });
   }
@@ -209,10 +216,10 @@
     slot.hidden = false;
     var heading = document.createElement("div");
     heading.className = "timing-relation-title";
-    heading.textContent = "Сохранённая телеметрия сессии";
+    heading.textContent = "Телеметрия совпадающего контекста";
     var note = document.createElement("p");
     note.className = "timing-relation-note";
-    note.textContent = "Связь определена по дате, трассе и типу сессии. Временные шкалы видео и телеметрии независимы.";
+    note.textContent = "Совпали дата, трасса и тип. Это не подтверждает прямую связь записей; временные шкалы независимы.";
     var links = document.createElement("div");
     links.className = "timing-relation-links";
     entries.forEach(function (entry) { links.appendChild(timingButton(entry, "timing-relation-link")); });
