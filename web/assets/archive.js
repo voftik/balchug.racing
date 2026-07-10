@@ -135,7 +135,7 @@
     label.textContent = "Видео совпадающего контекста";
     var note = document.createElement("span");
     note.className = "ta-video-note";
-    note.textContent = "Дата, трасса, тип · прямое соответствие не подтверждено";
+    note.textContent = "Дата, трасса, тип · временные шкалы независимы";
     var links = document.createElement("div");
     links.className = "ta-video-links";
     videos.forEach(function (item) {
@@ -200,7 +200,7 @@
     var label = document.createElement("span");
     label.className = "timing-card-label";
     label.textContent = "Телеметрия совпадающего контекста";
-    label.title = "Совпали дата, трасса и тип. Это не подтверждает прямую связь записей.";
+    label.title = "Совпали дата, трасса и тип. Временные шкалы записей независимы.";
     slot.appendChild(label);
     entries.forEach(function (entry) { slot.appendChild(timingButton(entry, "timing-card-link")); });
   }
@@ -219,7 +219,7 @@
     heading.textContent = "Телеметрия совпадающего контекста";
     var note = document.createElement("p");
     note.className = "timing-relation-note";
-    note.textContent = "Совпали дата, трасса и тип. Это не подтверждает прямую связь записей; временные шкалы независимы.";
+    note.textContent = "Совпали дата, трасса и тип. Временные шкалы записей независимы; это контекстная, а не временная связь.";
     var links = document.createElement("div");
     links.className = "timing-relation-links";
     entries.forEach(function (entry) { links.appendChild(timingButton(entry, "timing-relation-link")); });
