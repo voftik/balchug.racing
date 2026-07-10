@@ -93,7 +93,9 @@ unknown source literals never manufacture a pit stop.
 
 Known current flag codes: `-1/0` not started, `1` ready, `2` red, `3`
 safety-car/yellow, `4` Code 60, `5` finish, `6` green, `7` FCY. The normalizer
-stores both the code and canonical flag period.
+stores both the code and canonical flag period. A future unknown numeric code
+or text label is stored as its own `UNKNOWN` period with the original value; it
+never silently becomes Green or merges with a different unknown status.
 
 ### Flag time and reconciliation
 
@@ -107,6 +109,11 @@ flag kind `k`, raw provider start `f`, raw provider end `t`, clock-stopped `s`
 and remark `r`. After provider-clock calibration, its start/end replace the
 provisional observed boundaries while both raw values and receive provenance are
 retained. `9223372036854775807` means that the period is still open.
+
+The aggregate Statistics stream can lag the live `h_h` signal. An old open
+history record therefore cannot reopen a period after the next live flag has
+already arrived: it remains closed at that next frame's observed time until the
+provider supplies an exact end boundary, which then replaces the fallback.
 
 Current capture example: the transition to `f=2` arrived at
 `16:20:48.364Z`; caution history records the Red Flag start as raw

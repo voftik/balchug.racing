@@ -41,6 +41,10 @@ from .result_grid import ResultGrid
 
 NORMALIZER_VERSION = "timeservice-normalizer-v1"
 OUR_TEAM_KEY = " ".join(OUR_TEAM_NAME.casefold().split())
+# A live `h_h.f` transition and the matching Statistics history entry normally
+# arrive seconds apart. Older history must be inserted as its own event rather
+# than being attached to the current live period.
+FLAG_RECONCILIATION_WINDOW_US = 120 * 1_000_000
 
 
 class NormalizerError(RuntimeError):
@@ -381,10 +385,7 @@ class TimingNormalizer:
                 self._write_heat(connection, context)
                 if "f" in patch:
                     new_flag = canonical_flag(self.heat.get("f"))
-                    if old_flag is None or (old_flag.kind, old_flag.provider_code) != (
-                        new_flag.kind,
-                        new_flag.provider_code,
-                    ):
+                    if old_flag is None or not self._same_flag_values(old_flag, new_flag):
                         self._write_immediate_flag(connection, context, new_flag)
             return
         if handle == "r_l":
@@ -1068,6 +1069,7 @@ class TimingNormalizer:
         """
         for lap_number in range(previous_lap + 1, current_lap + 1):
             is_latest = lap_number == current_lap
+            completed_at_us = context.received_at_us if is_latest else None
             _insert_ignore(
                 connection,
                 "laps",
@@ -1081,14 +1083,17 @@ class TimingNormalizer:
                     "source_heat_id": self.heat_id,
                     "participant_id": participant_id,
                     "lap_number": lap_number,
-                    "completed_at_us": context.received_at_us if is_latest else None,
+                    "completed_at_us": completed_at_us,
                     "duration_ms": last_lap_ms if is_latest else None,
                     "sectors_json": None,
                     "flag": self._current_flag_kind(connection),
-                    "is_in_lap": 0,
+                    "is_in_lap": int(is_latest and state_kind == "IN_PIT"),
                     "is_out_lap": int(is_latest and state_kind == "OUT_LAP"),
-                    "crosses_pit": 0,
-                    "is_clean": 0,
+                    "crosses_pit": int(is_latest and state_kind == "IN_PIT"),
+                    "is_clean": int(
+                        is_latest
+                        and self._is_clean_lap(connection, participant_id, completed_at_us, state_kind)
+                    ),
                     "source_message_id": context.id,
                     "source_key": context.source_key,
                     "created_at_us": now_us(),
@@ -1097,10 +1102,13 @@ class TimingNormalizer:
 
     def _write_immediate_flag(self, connection: sqlite3.Connection, context: FrameMessage, flag: FlagState) -> None:
         current = connection.execute(
-            "SELECT flag,provider_code,started_at_us,source_key FROM track_flag_current WHERE source_heat_id = ?",
+            """
+            SELECT flag,provider_code,provider_label,source_flag_kind_raw,started_at_us,source_key
+            FROM track_flag_current WHERE source_heat_id = ?
+            """,
             (self.heat_id,),
         ).fetchone()
-        if current is not None and current["flag"] == flag.kind and str(current["provider_code"]) == str(flag.provider_code):
+        if current is not None and self._same_flag_state(current, flag):
             return
         if current is not None:
             connection.execute(
@@ -1156,6 +1164,27 @@ class TimingNormalizer:
             },
             conflict_columns=("source_heat_id",),
         )
+
+    @staticmethod
+    def _same_flag_state(current: sqlite3.Row, flag: FlagState) -> bool:
+        """Keep a period for each distinct source flag, including unknown ones."""
+        return TimingNormalizer._same_flag_values(
+            FlagState(
+                raw=current["source_flag_kind_raw"],
+                kind=current["flag"],
+                provider_code=canonical_flag(current["provider_code"]).provider_code,
+                provider_label=current["provider_label"],
+            ),
+            flag,
+        )
+
+    @staticmethod
+    def _same_flag_values(left: FlagState, right: FlagState) -> bool:
+        if left.kind != right.kind or left.provider_code != right.provider_code:
+            return False
+        if left.kind != "UNKNOWN":
+            return True
+        return _key(left.provider_label or _text(left.raw)) == _key(right.provider_label or _text(right.raw))
 
     def _pit_entered_at_us(self, pit_time_raw: str | None, context: FrameMessage) -> int:
         if pit_time_raw and pit_time_raw[:1].upper() == "S":
@@ -1588,10 +1617,12 @@ class TimingNormalizer:
                 "duration_ms": duration_ms,
                 "sectors_json": None,
                 "flag": self._current_flag_kind(connection),
-                "is_in_lap": 0,
+                "is_in_lap": int(state["state_kind"] == "IN_PIT"),
                 "is_out_lap": int(state["state_kind"] == "OUT_LAP"),
-                "crosses_pit": 0,
-                "is_clean": 0,
+                "crosses_pit": int(state["state_kind"] == "IN_PIT"),
+                "is_clean": int(
+                    self._is_clean_lap(connection, participant_id, source_completed_at_us, state["state_kind"])
+                ),
                 "source_message_id": context.id,
                 "source_key": context.source_key,
                 "created_at_us": now_us(),
@@ -1611,6 +1642,54 @@ class TimingNormalizer:
                     "UPDATE tire_stints SET completed_laps = completed_laps + 1, updated_at_us = ? WHERE id = ?",
                     (now_us(), active_stint["id"]),
                 )
+
+    def _is_clean_lap(
+        self,
+        connection: sqlite3.Connection,
+        participant_id: str,
+        completed_at_us: int | None,
+        state_kind: str | None,
+    ) -> bool:
+        """Return true only when the complete observed lap interval is Green."""
+        if completed_at_us is None or state_kind in {"IN_PIT", "OUT_LAP"}:
+            return False
+        current_flag = self._current_flag_kind(connection)
+        if current_flag != "GREEN":
+            return False
+        previous = connection.execute(
+            """
+            SELECT completed_at_us FROM laps
+            WHERE source_heat_id = ? AND participant_id = ? AND completed_at_us IS NOT NULL
+            ORDER BY lap_number DESC LIMIT 1
+            """,
+            (self.heat_id, participant_id),
+        ).fetchone()
+        if previous is None:
+            # A recording that starts halfway through a lap cannot prove that
+            # the entire lap was clean, even if its finish is green.
+            return False
+        started_at_us = int(previous["completed_at_us"])
+        non_green = connection.execute(
+            """
+            SELECT 1 FROM track_flag_periods
+            WHERE source_heat_id = ? AND flag <> 'GREEN' AND started_at_us < ?
+              AND (ended_at_us IS NULL OR ended_at_us > ?)
+            LIMIT 1
+            """,
+            (self.heat_id, completed_at_us, started_at_us),
+        ).fetchone()
+        if non_green is not None:
+            return False
+        gap = connection.execute(
+            """
+            SELECT 1 FROM ingest_gaps
+            WHERE analysis_session_id = ? AND started_at_us < ?
+              AND (ended_at_us IS NULL OR ended_at_us > ?)
+            LIMIT 1
+            """,
+            (self.analysis_session_id, completed_at_us, started_at_us),
+        ).fetchone()
+        return gap is None
 
     def _current_flag_kind(self, connection: sqlite3.Connection) -> str | None:
         row = connection.execute(
@@ -1890,10 +1969,11 @@ class TimingNormalizer:
                 """
                 SELECT id FROM track_flag_periods
                 WHERE source_heat_id = ? AND flag = ? AND reconciliation_key IS NULL
+                  AND ABS(COALESCE(observed_started_at_us, started_at_us) - ?) <= ?
                 ORDER BY ABS(COALESCE(observed_started_at_us, started_at_us) - ?), id
                 LIMIT 1
                 """,
-                (self.heat_id, caution.flag.kind, candidate_time),
+                (self.heat_id, caution.flag.kind, candidate_time, FLAG_RECONCILIATION_WINDOW_US, candidate_time),
             ).fetchone()
         if period is None:
             cursor = connection.execute(
@@ -1942,17 +2022,33 @@ class TimingNormalizer:
             connection.execute(
                 """
                 UPDATE track_flag_periods
-                SET start_provider_ts_raw = ?, end_provider_ts_raw = ?, start_provider_ts_us = ?,
-                    end_provider_ts_us = ?, calibrated_started_at_us = ?, calibrated_ended_at_us = ?,
-                    started_at_us = COALESCE(?, started_at_us), ended_at_us = ?,
-                    observed_ended_at_us = CASE WHEN ? IS NULL THEN observed_ended_at_us ELSE ? END,
-                    start_clock_calibration_id = ?, end_clock_calibration_id = ?, source_flag_kind_raw = ?,
+                SET start_provider_ts_raw = ?,
+                    end_provider_ts_raw = CASE
+                        WHEN ? IS NOT NULL THEN ?
+                        WHEN end_provider_ts_raw IS NULL THEN ?
+                        ELSE end_provider_ts_raw
+                    END,
+                    start_provider_ts_us = COALESCE(?, start_provider_ts_us),
+                    end_provider_ts_us = COALESCE(?, end_provider_ts_us),
+                    calibrated_started_at_us = COALESCE(?, calibrated_started_at_us),
+                    calibrated_ended_at_us = COALESCE(?, calibrated_ended_at_us),
+                    started_at_us = COALESCE(?, started_at_us),
+                    ended_at_us = COALESCE(?, ended_at_us),
+                    observed_ended_at_us = COALESCE(
+                        observed_ended_at_us,
+                        CASE WHEN ? IS NULL THEN NULL ELSE ? END
+                    ),
+                    start_clock_calibration_id = COALESCE(?, start_clock_calibration_id),
+                    end_clock_calibration_id = CASE WHEN ? IS NULL THEN end_clock_calibration_id ELSE ? END,
+                    source_flag_kind_raw = ?,
                     clock_stopped_raw = ?, remark_raw = ?, reconciliation_key = ?,
                     reconciliation_source_message_id = ?, reconciliation_source_key = ?, reconciled_at_us = ?
                 WHERE id = ?
                 """,
                 (
                     _text(caution.started_at_raw),
+                    ended_at_us,
+                    _text(caution.ended_at_raw),
                     _text(caution.ended_at_raw),
                     caution.started_at_ts_time,
                     caution.ended_at_ts_time,
@@ -1963,6 +2059,7 @@ class TimingNormalizer:
                     ended_at_us,
                     context.received_at_us,
                     calibration_id,
+                    ended_at_us,
                     calibration_id if ended_at_us is not None else None,
                     _text(caution.flag.raw),
                     _text(caution.clock_stopped_raw),
@@ -1975,10 +2072,13 @@ class TimingNormalizer:
                 ),
             )
         current = connection.execute(
-            "SELECT flag FROM track_flag_current WHERE source_heat_id = ?",
+            """
+            SELECT flag,provider_code,provider_label,source_flag_kind_raw
+            FROM track_flag_current WHERE source_heat_id = ?
+            """,
             (self.heat_id,),
         ).fetchone()
-        if current is not None and current["flag"] == caution.flag.kind and ended_at_us is None:
+        if current is not None and self._same_flag_state(current, caution.flag) and ended_at_us is None:
             connection.execute(
                 """
                 UPDATE track_flag_current
@@ -2003,6 +2103,102 @@ class TimingNormalizer:
                     self.heat_id,
                 ),
             )
+        self._close_caution_if_live_flag_superseded(connection, period_id, caution.flag)
+        self._invalidate_clean_laps_for_caution(connection, period_id)
+
+    def _invalidate_clean_laps_for_caution(self, connection: sqlite3.Connection, period_id: int) -> None:
+        """Remove a clean mark if later flag history proves that a lap was interrupted."""
+        period = connection.execute(
+            "SELECT flag,started_at_us,ended_at_us FROM track_flag_periods WHERE id = ?",
+            (period_id,),
+        ).fetchone()
+        if period is None or period["flag"] == "GREEN" or period["started_at_us"] is None:
+            return
+        if period["ended_at_us"] is None:
+            connection.execute(
+                """
+                WITH lap_intervals AS (
+                  SELECT id,completed_at_us,
+                         LAG(completed_at_us) OVER (
+                           PARTITION BY participant_id ORDER BY lap_number
+                         ) AS lap_started_at_us
+                  FROM laps
+                  WHERE source_heat_id = ? AND completed_at_us IS NOT NULL
+                )
+                UPDATE laps SET is_clean = 0
+                WHERE id IN (
+                  SELECT id FROM lap_intervals
+                  WHERE lap_started_at_us IS NOT NULL
+                    AND completed_at_us > ?
+                )
+                """,
+                (self.heat_id, period["started_at_us"]),
+            )
+            return
+        connection.execute(
+            """
+            WITH lap_intervals AS (
+              SELECT id,completed_at_us,
+                     LAG(completed_at_us) OVER (
+                       PARTITION BY participant_id ORDER BY lap_number
+                     ) AS lap_started_at_us
+              FROM laps
+              WHERE source_heat_id = ? AND completed_at_us IS NOT NULL
+            )
+            UPDATE laps SET is_clean = 0
+            WHERE id IN (
+              SELECT id FROM lap_intervals
+              WHERE lap_started_at_us IS NOT NULL
+                AND lap_started_at_us < ? AND completed_at_us > ?
+            )
+            """,
+            (self.heat_id, period["ended_at_us"], period["started_at_us"]),
+        )
+
+    def _close_caution_if_live_flag_superseded(
+        self,
+        connection: sqlite3.Connection,
+        period_id: int,
+        flag: FlagState,
+    ) -> None:
+        """Do not let a delayed open Statistics record reopen a live-closed flag."""
+        current = connection.execute(
+            """
+            SELECT flag,provider_code,provider_label,source_flag_kind_raw,started_at_us,
+                   observed_started_at_us,source_message_id,source_key
+            FROM track_flag_current WHERE source_heat_id = ?
+            """,
+            (self.heat_id,),
+        ).fetchone()
+        if current is None or self._same_flag_state(current, flag):
+            return
+        period = connection.execute(
+            "SELECT started_at_us,ended_at_us,observed_ended_at_us FROM track_flag_periods WHERE id = ?",
+            (period_id,),
+        ).fetchone()
+        if period is None or period["ended_at_us"] is not None:
+            return
+        boundary_us = current["observed_started_at_us"] or current["started_at_us"]
+        if boundary_us is None or (
+            period["started_at_us"] is not None and int(boundary_us) < int(period["started_at_us"])
+        ):
+            return
+        connection.execute(
+            """
+            UPDATE track_flag_periods
+            SET ended_at_us = ?, observed_ended_at_us = COALESCE(observed_ended_at_us, ?),
+                ended_source_message_id = COALESCE(ended_source_message_id, ?),
+                ended_source_key = COALESCE(ended_source_key, ?)
+            WHERE id = ? AND ended_at_us IS NULL
+            """,
+            (
+                boundary_us,
+                boundary_us,
+                current["source_message_id"],
+                current["source_key"],
+                period_id,
+            ),
+        )
 
 
 class TimingNormalizerRegistry:

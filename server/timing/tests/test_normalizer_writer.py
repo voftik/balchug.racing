@@ -183,6 +183,151 @@ class TimingNormalizerWriterTests(unittest.TestCase):
             (401, 66),
         )
 
+    def test_delayed_open_red_history_cannot_reopen_a_period_after_finish(self):
+        provider_start = 10_000_000
+        provider_red_start = 10_002_000
+        provider_red_end = 10_004_000
+        offset = 10_800_000_000
+        received = TIME_SERVICE_EPOCH_UNIX_US + provider_start + offset
+        self.apply(
+            [["h_i", {"n": "Practice - Open-Pit", "f": 6, "s": provider_start}], ["s_i", provider_start]],
+            received_at_us=received,
+        )
+        self.apply([["h_h", {"f": 2}]], received_at_us=received + 3_000_000)
+        open_red = {
+            "i": {
+                "1": {
+                    "k": "RedFlag",
+                    "f": str(provider_red_start),
+                    "t": "9223372036854775807",
+                    "s": "0",
+                    "r": "",
+                }
+            }
+        }
+        self.apply([["a_u", open_red]], received_at_us=received + 4_000_000)
+        finish_received = received + 5_000_000
+        self.apply([["h_h", {"f": 5}]], received_at_us=finish_received)
+
+        # The next aggregate snapshot may still call the Red period open. It
+        # must not undo the observed transition to Finish.
+        self.apply([["a_u", open_red]], received_at_us=received + 6_000_000)
+        red = self.connection.execute(
+            """
+            SELECT started_at_us,ended_at_us,observed_ended_at_us,end_provider_ts_raw,
+                   calibrated_ended_at_us
+            FROM track_flag_periods WHERE flag='RED'
+            """
+        ).fetchone()
+        self.assertEqual(red["started_at_us"], TIME_SERVICE_EPOCH_UNIX_US + provider_red_start + offset)
+        self.assertEqual(red["ended_at_us"], finish_received)
+        self.assertEqual(red["observed_ended_at_us"], finish_received)
+        self.assertEqual(red["end_provider_ts_raw"], "9223372036854775807")
+        self.assertIsNone(red["calibrated_ended_at_us"])
+
+        # When the provider later supplies the real boundary, it replaces the
+        # receive-time fallback without changing the recorded observation.
+        closed_red = {
+            "i": {
+                "1": {
+                    "k": "RedFlag",
+                    "f": str(provider_red_start),
+                    "t": str(provider_red_end),
+                    "s": "0",
+                    "r": "",
+                }
+            }
+        }
+        self.apply([["a_u", closed_red]], received_at_us=received + 7_000_000)
+        red = self.connection.execute(
+            """
+            SELECT ended_at_us,observed_ended_at_us,end_provider_ts_raw,calibrated_ended_at_us
+            FROM track_flag_periods WHERE flag='RED'
+            """
+        ).fetchone()
+        expected_end = TIME_SERVICE_EPOCH_UNIX_US + provider_red_end + offset
+        self.assertEqual(red["ended_at_us"], expected_end)
+        self.assertEqual(red["calibrated_ended_at_us"], expected_end)
+        self.assertEqual(red["observed_ended_at_us"], finish_received)
+        self.assertEqual(red["end_provider_ts_raw"], str(provider_red_end))
+        self.assertEqual(self.connection.execute("SELECT flag FROM track_flag_current").fetchone()[0], "FINISH")
+
+    def test_unknown_live_flag_values_remain_distinct_track_statuses(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 15_000_000
+        self.apply([["h_i", {"n": "Practice", "f": 6, "s": 15_000_000}]], received_at_us=received)
+        self.apply([["h_h", {"f": 8}]], received_at_us=received + 1_000_000)
+        self.apply([["h_h", {"f": "BlueFlag"}]], received_at_us=received + 2_000_000)
+        self.apply([["h_h", {"f": "BlackFlag"}]], received_at_us=received + 3_000_000)
+
+        periods = self.connection.execute(
+            """
+            SELECT flag,provider_code,provider_label,source_flag_kind_raw,started_at_us,ended_at_us
+            FROM track_flag_periods ORDER BY id
+            """
+        ).fetchall()
+        self.assertEqual(
+            [tuple(period[:4]) for period in periods],
+            [
+                ("GREEN", "6", "Green flag", "6"),
+                ("UNKNOWN", "8", None, "8"),
+                ("UNKNOWN", None, "BlueFlag", "BlueFlag"),
+                ("UNKNOWN", None, "BlackFlag", "BlackFlag"),
+            ],
+        )
+        self.assertEqual([period["ended_at_us"] for period in periods[:-1]], [received + 1_000_000, received + 2_000_000, received + 3_000_000])
+        current = self.connection.execute(
+            "SELECT flag,provider_label,source_flag_kind_raw FROM track_flag_current"
+        ).fetchone()
+        self.assertEqual(tuple(current), ("UNKNOWN", "BlackFlag", "BlackFlag"))
+
+    def test_late_red_history_invalidates_a_previously_clean_green_lap(self):
+        provider_start = 25_000_000
+        received = TIME_SERVICE_EPOCH_UNIX_US + provider_start
+        self.apply(
+            [
+                ["h_i", {"n": "Practice", "f": 6, "s": provider_start}],
+                ["s_i", provider_start],
+                [
+                    "r_i",
+                    {
+                        "l": {"h": [{"n": "NR"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "STATE"}, {"n": "LAPS"}]},
+                        "r": [[0, 0, "21"], [0, 1, "BALCHUG Racing"], [0, 2, "CN PRO"], [0, 3, "E25000000"], [0, 4, "5"]],
+                    },
+                ],
+            ],
+            received_at_us=received,
+        )
+        self.apply([["r_c", [[0, 4, "6"]]]], received_at_us=received + 1_000_000)
+        self.apply([["r_c", [[0, 4, "7"]]]], received_at_us=received + 2_000_000)
+        self.assertEqual(
+            self.connection.execute("SELECT is_clean FROM laps WHERE lap_number = 7").fetchone()[0], 1
+        )
+
+        # This provider history arrives after the grid update but proves that
+        # the candidate lap crossed a Red interval from 1.5 to 2.5 seconds.
+        self.apply(
+            [
+                [
+                    "a_u",
+                    {
+                        "i": {
+                            "1": {
+                                "k": "RedFlag",
+                                "f": str(provider_start + 1_500_000),
+                                "t": str(provider_start + 2_500_000),
+                                "s": "0",
+                                "r": "",
+                            }
+                        }
+                    },
+                ]
+            ],
+            received_at_us=received + 3_000_000,
+        )
+        self.assertEqual(
+            self.connection.execute("SELECT is_clean FROM laps WHERE lap_number = 7").fetchone()[0], 0
+        )
+
     def test_state_transitions_complete_pit_and_automatically_open_a_new_tire_stint(self):
         received = TIME_SERVICE_EPOCH_UNIX_US + 20_000_000
         self.apply(
