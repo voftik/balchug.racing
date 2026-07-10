@@ -70,10 +70,6 @@ def discover_migrations(directory: Path = MIGRATIONS_DIR) -> list[Migration]:
     return migrations
 
 
-def _quote_sql(value: str) -> str:
-    return "'" + value.replace("'", "''") + "'"
-
-
 def _statements(sql: str) -> list[str]:
     """Split one migration using SQLite's own statement-completeness parser."""
     result: list[str] = []
@@ -158,7 +154,7 @@ def encode_checkpoint(state: Any) -> tuple[str, bytes, str]:
     return "gzip", gzip.compress(serialized, compresslevel=6, mtime=0), hashlib.sha256(serialized).hexdigest()
 
 
-def decode_checkpoint(codec: str, payload: bytes) -> Any:
+def decode_checkpoint(codec: str, payload: bytes, *, expected_hash: str | None = None) -> Any:
     """Decode a stored checkpoint without silently accepting an unknown codec."""
     try:
         if codec == "gzip":
@@ -167,6 +163,9 @@ def decode_checkpoint(codec: str, payload: bytes) -> Any:
             serialized = payload
         else:
             raise CheckpointError(f"Unsupported checkpoint codec: {codec}")
+        actual_hash = hashlib.sha256(serialized).hexdigest()
+        if expected_hash is not None and actual_hash != expected_hash:
+            raise CheckpointError("Checkpoint payload hash does not match its stored state hash")
         return json.loads(serialized)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise CheckpointError("Checkpoint payload could not be decoded") from exc
@@ -208,4 +207,4 @@ def load_latest_checkpoint(connection: sqlite3.Connection, source_heat_id: int) 
         "SELECT * FROM state_checkpoints WHERE source_heat_id = ? ORDER BY observed_at_us DESC LIMIT 1",
         (source_heat_id,),
     ).fetchone()
-    return (row, decode_checkpoint(row["codec"], row["payload"])) if row else None
+    return (row, decode_checkpoint(row["codec"], row["payload"], expected_hash=row["state_hash"])) if row else None

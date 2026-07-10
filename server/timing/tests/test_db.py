@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 
 from timing.config import now_us
-from timing.db import CheckpointError, MigrationError, backup_database, connect, load_latest_checkpoint, migrate, save_checkpoint
+from timing.db import CheckpointError, MigrationError, backup_database, connect, encode_checkpoint, load_latest_checkpoint, migrate, save_checkpoint
 from timing.retention import apply_retention, plan_retention
 
 
@@ -205,6 +205,13 @@ class TimingDatabaseTests(unittest.TestCase):
                         observed_at_us=1_000_000,
                         state={"heat": {"f": 2}},
                     )
+                _, corrupted_payload, _ = encode_checkpoint({"heat": {"f": 2}})
+                connection.execute(
+                    "UPDATE state_checkpoints SET payload = ? WHERE source_heat_id = ?",
+                    (corrupted_payload, heat_id),
+                )
+                with self.assertRaises(CheckpointError):
+                    load_latest_checkpoint(connection, heat_id)
             finally:
                 connection.close()
 
@@ -238,7 +245,19 @@ class TimingDatabaseTests(unittest.TestCase):
                 timestamp = now_us()
                 old = timestamp - 10 * 86_400_000_000
                 _, active_message = self.insert_frame(connection, "active", received_at_us=old)
-                finished_frame, finished_message = self.insert_frame(connection, "finished", received_at_us=old)
+                _finished_frame, finished_message = self.insert_frame(connection, "finished", received_at_us=old)
+                connection.execute(
+                    """
+                    INSERT INTO feed_frames(
+                      analysis_session_id,ingest_connection_id,frame_sequence,received_at_us,monotonic_ns,
+                      raw_payload,raw_sha256,decode_state,processed_at_us,created_at_us
+                    ) VALUES ('finished','connection-finished',2,? ,?,'{}','anchor','decoded',?,?)
+                    """,
+                    (old, old * 1000, old, timestamp),
+                )
+                anchor_frame = connection.execute(
+                    "SELECT id FROM feed_frames WHERE ingest_connection_id = 'connection-finished' AND frame_sequence = 2"
+                ).fetchone()[0]
                 connection.execute(
                     "INSERT INTO participants(id,source_heat_id,external_key,team_name,class_name,first_seen_at_us,last_seen_at_us) VALUES ('car-1',?,'42','BALCHUG Racing','CN PRO',?,?)",
                     (finished_heat, timestamp, timestamp),
@@ -256,20 +275,35 @@ class TimingDatabaseTests(unittest.TestCase):
                       source_heat_id,source_frame_id,source_key,observed_at_us,state_hash,codec,payload,created_at_us
                     ) VALUES (?,?,'connection-finished:1',?,'hash','identity','{}',?)
                     """,
-                    (finished_heat, finished_frame, timestamp, timestamp),
+                    (finished_heat, anchor_frame, timestamp, timestamp),
                 )
                 connection.execute("INSERT INTO stream_events(analysis_session_id,source_heat_id,event_type,payload_json,created_at_us) VALUES ('active',?,'state','{}',?)", (active_heat, old))
                 connection.execute("INSERT INTO stream_events(analysis_session_id,source_heat_id,event_type,payload_json,created_at_us) VALUES ('finished',?,'state','{}',?)", (finished_heat, old))
                 connection.commit()
                 plan = plan_retention(connection, now_at_us=timestamp)
                 self.assertEqual(plan.total, 2)
-                self.assertEqual(connection.execute("SELECT COUNT(*) FROM feed_frames").fetchone()[0], 2)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM feed_frames").fetchone()[0], 3)
+                connection.execute("UPDATE analysis_sessions SET lifecycle = 'stopped' WHERE id = 'active'")
+                connection.execute("UPDATE analysis_sessions SET lifecycle = 'active' WHERE id = 'finished'")
+                connection.commit()
+                self.assertEqual(apply_retention(connection, plan), 0)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM feed_frames").fetchone()[0], 3)
+                connection.execute("UPDATE analysis_sessions SET lifecycle = 'stopped' WHERE id = 'finished'")
+                connection.execute("UPDATE analysis_sessions SET lifecycle = 'active' WHERE id = 'active'")
+                connection.commit()
+                plan = plan_retention(connection, now_at_us=timestamp)
                 self.assertEqual(apply_retention(connection, plan), 2)
-                self.assertEqual(connection.execute("SELECT COUNT(*) FROM feed_frames").fetchone()[0], 1)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM feed_frames").fetchone()[0], 2)
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM stream_events").fetchone()[0], 1)
                 self.assertIsNone(connection.execute("SELECT source_message_id FROM laps WHERE id='lap-1'").fetchone()[0])
+                self.assertEqual(
+                    connection.execute("SELECT source_frame_id FROM state_checkpoints WHERE source_heat_id = ?", (finished_heat,)).fetchone()[0],
+                    anchor_frame,
+                )
                 self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
                 self.assertIsNotNone(active_message)
+                with self.assertRaises(ValueError):
+                    plan_retention(connection, now_at_us=timestamp, raw_days=-1)
             finally:
                 connection.close()
 

@@ -27,7 +27,7 @@ provider heat whose display title is not itself called “Race”.
 | `position` / `POS` | `participant_state_current.position_overall` | Absolute overall position; never substituted for class position |
 | `marker` | `participant_state_current.marker` | Preserve source marker/status |
 | `startnumber` / `NR` | `participants.start_number` | `21` is the known Balchug entry number; a conflicting team/number observation is an identity conflict, not a silent match |
-| `State` | `participant_state_current.state_raw/state_kind` | Source contains timestamp/status encodings such as in-pit |
+| `State` / `STATE` | `participant_state_current.state_raw/state_kind` | Raw source value plus canonical state; source may show a running timer, `In Pit`, `OutLap` or future tokens |
 | `Team name` / `TEAM` | participant + identity segment `team_name` | `BALCHUG Racing` identifies our car |
 | `CurrentDriver` / `DRIVER IN CAR` | current state + identity segment `driver_name_raw` | A change opens a new automatic driver segment |
 | `class` / `CLS` | participant + identity segment `class_name` | `CN PRO` scopes tactics and competitor selection |
@@ -49,6 +49,22 @@ a car model from an earlier heat.
 
 Values in sparse `r_c` cells can be prefixed (`E`, `S`, `L`) and must remain raw
 until their per-column semantics are decoded; they are not universally integers.
+
+## STATE interpretation contract
+
+`STATE` is not a lap-time field. The normalizer preserves every raw value in
+`state_raw` and maps only recognized status forms to `state_kind`:
+
+- a running source timer or recognized elapsed-state encoding -> `ON_TRACK`;
+- `In Pit` and equivalent source forms -> `IN_PIT`;
+- `OutLap` and equivalent source forms -> `OUT_LAP`;
+- a new or unrecognized token -> `UNKNOWN`, never a guessed pit or zero time.
+
+Pit entry/exit is not inferred from one text cell alone. The state transition is
+reconciled with `t_p.lastPassingIsInPit` and the source `PIT` count, then
+debounced before creating or closing a `pit_stops` record. This keeps a transient
+or reordered table update from manufacturing a stop, while keeping the original
+STATE observation available for replay.
 
 ## Heat, flag, tracker and statistics handles
 

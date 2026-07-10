@@ -79,7 +79,18 @@ case "$LLM_PROXY" in
     systemctl enable --now wireproxy
     systemctl restart wireproxy
     systemctl is-active --quiet wireproxy
-    curl -fsS --max-time 20 --proxy "$LLM_PROXY" https://openrouter.ai/api/v1/models -o /dev/null
+    proxy_ready=0
+    for attempt in $(seq 1 20); do
+      if curl -fsS --max-time 5 --proxy "$LLM_PROXY" https://openrouter.ai/api/v1/models -o /dev/null 2>/dev/null; then
+        proxy_ready=1
+        break
+      fi
+      sleep 1
+    done
+    if [ "$proxy_ready" -ne 1 ]; then
+      echo "Wireproxy did not become ready for OpenRouter within 20 seconds" >&2
+      exit 1
+    fi
     ;;
 esac
 
