@@ -78,6 +78,7 @@ def plan_retention(
 def apply_retention(connection: sqlite3.Connection, plan: RetentionPlan) -> int:
     """Apply a reviewed plan, rechecking that it is still safe to delete."""
     deleted = 0
+    deleted_stream_cursors: dict[str, int] = {}
     with connection:
         for frame_id in plan.feed_frame_ids:
             cursor = connection.execute(
@@ -101,6 +102,17 @@ def apply_retention(connection: sqlite3.Connection, plan: RetentionPlan) -> int:
             )
             deleted += max(cursor.rowcount, 0)
         for event_id in plan.stream_event_ids:
+            event = connection.execute(
+                """
+                SELECT analysis_session_id FROM stream_events
+                WHERE id = ?
+                  AND created_at_us < ?
+                  AND analysis_session_id IN (
+                    SELECT id FROM analysis_sessions WHERE lifecycle IN ('stopped', 'aborted')
+                  )
+                """,
+                (event_id, plan.stream_before_us),
+            ).fetchone()
             cursor = connection.execute(
                 """
                 DELETE FROM stream_events
@@ -113,6 +125,20 @@ def apply_retention(connection: sqlite3.Connection, plan: RetentionPlan) -> int:
                 (event_id, plan.stream_before_us),
             )
             deleted += max(cursor.rowcount, 0)
+            if event is not None and cursor.rowcount > 0:
+                session_id = event["analysis_session_id"]
+                deleted_stream_cursors[session_id] = max(deleted_stream_cursors.get(session_id, 0), event_id)
+        for session_id, cursor_id in deleted_stream_cursors.items():
+            connection.execute(
+                """
+                INSERT INTO stream_event_cursor_floors(analysis_session_id,deleted_through_id,updated_at_us)
+                VALUES (?,?,?)
+                ON CONFLICT(analysis_session_id) DO UPDATE SET
+                  deleted_through_id = MAX(deleted_through_id, excluded.deleted_through_id),
+                  updated_at_us = excluded.updated_at_us
+                """,
+                (session_id, cursor_id, now_us()),
+            )
     return deleted
 
 

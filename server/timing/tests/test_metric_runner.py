@@ -103,6 +103,12 @@ class MetricRunnerIntegrationTests(unittest.TestCase):
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM state_ticks").fetchone()[0], 1)
         first_history_count = self.connection.execute("SELECT COUNT(*) FROM metric_samples").fetchone()[0]
         self.assertEqual(first_history_count, 3)
+        first_events = self.connection.execute(
+            "SELECT id,event_type,event_key,source_frame_id FROM stream_events ORDER BY id"
+        ).fetchall()
+        self.assertEqual([event["event_type"] for event in first_events], ["state", "metric"])
+        self.assertTrue(all(event["event_key"] for event in first_events))
+        self.assertTrue(all(event["source_frame_id"] is not None for event in first_events))
 
         self.apply([["s_t", provider_start + 1_000_000]], received_at_us=received + 1_000_000)
         session_row = self.connection.execute(
@@ -116,6 +122,7 @@ class MetricRunnerIntegrationTests(unittest.TestCase):
         self.assertEqual(json.loads(session_row["values_json"])["session_elapsed_s"], 1.0)
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM state_ticks").fetchone()[0], 2)
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM metric_samples").fetchone()[0], first_history_count)
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM stream_events").fetchone()[0], 4)
 
     def test_restart_restores_the_prior_boundary_before_a_red_transition(self):
         provider_start = 50_000_000
@@ -140,6 +147,11 @@ class MetricRunnerIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(state)
         self.assertEqual(state["metric_version"], METRIC_ENGINE_VERSION)
         self.assertIn('"flag"', state["boundary_state_json"])
+        event_types = {
+            row["event_type"]
+            for row in self.connection.execute("SELECT event_type FROM stream_events")
+        }
+        self.assertTrue({"state", "metric", "flag", "alert"}.issubset(event_types))
 
     def test_retry_after_metric_runner_failure_preserves_the_pending_red_transition(self):
         provider_start = 60_000_000
@@ -173,6 +185,9 @@ class MetricRunnerIntegrationTests(unittest.TestCase):
         ).fetchone()
         alerts = json.loads(session["values_json"])["alerts"]
         self.assertIn("red_flag_or_session_reset", {alert["key"] for alert in alerts})
+        event_count = self.connection.execute("SELECT COUNT(*) FROM stream_events").fetchone()[0]
+        self.normalizer(self.connection, frame, decoded)
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM stream_events").fetchone()[0], event_count)
 
 
 if __name__ == "__main__":

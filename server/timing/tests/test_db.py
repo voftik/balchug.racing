@@ -65,7 +65,7 @@ class TimingDatabaseTests(unittest.TestCase):
     def test_migration_is_repeatable_and_enables_wal(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "timing.db"
-            self.assertEqual(migrate(path), ["0001", "0002", "0003", "0004"])
+            self.assertEqual(migrate(path), ["0001", "0002", "0003", "0004", "0005"])
             self.assertEqual(migrate(path), [])
             connection = connect(path)
             try:
@@ -82,6 +82,7 @@ class TimingDatabaseTests(unittest.TestCase):
                         "metric_current",
                         "metric_runner_state",
                         "stream_events",
+                        "stream_event_cursor_floors",
                     }.issubset(tables)
                 )
             finally:
@@ -352,7 +353,7 @@ class TimingDatabaseTests(unittest.TestCase):
             finally:
                 connection.close()
 
-            self.assertEqual(migrate(path), ["0003", "0004"])
+            self.assertEqual(migrate(path), ["0003", "0004", "0005"])
             connection = connect(path)
             try:
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM participants").fetchone()[0], 1)
@@ -534,6 +535,11 @@ class TimingDatabaseTests(unittest.TestCase):
                 self.assertEqual(apply_retention(connection, plan), 2)
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM feed_frames").fetchone()[0], 2)
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM stream_events").fetchone()[0], 1)
+                floor = connection.execute(
+                    "SELECT deleted_through_id FROM stream_event_cursor_floors WHERE analysis_session_id = 'finished'"
+                ).fetchone()
+                self.assertIsNotNone(floor)
+                self.assertGreater(floor["deleted_through_id"], 0)
                 self.assertIsNone(connection.execute("SELECT source_message_id FROM laps WHERE id='lap-1'").fetchone()[0])
                 self.assertEqual(
                     connection.execute("SELECT source_frame_id FROM state_checkpoints WHERE source_heat_id = ?", (finished_heat,)).fetchone()[0],

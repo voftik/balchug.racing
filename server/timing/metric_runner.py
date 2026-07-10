@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -23,6 +24,7 @@ from .metric_engine import (
     serialize_metric_boundary_state,
 )
 from .metric_store import (
+    HeatMetricInput,
     METRIC_SAMPLE_INTERVAL_US,
     MetricMaterializationResult,
     MetricSampleCandidate,
@@ -32,6 +34,10 @@ from .metric_store import (
     materialize_metric_samples,
     MetricRunnerStateCandidate,
 )
+from .stream_events import StreamEventCandidate
+
+
+STREAM_SCHEMA_VERSION = "timing-live.v1"
 
 
 class MetricRunnerError(RuntimeError):
@@ -115,12 +121,126 @@ class TimingMetricRunner:
                 state_hash=self._state_hash(evaluation.candidates),
                 boundary_state_json=serialize_metric_boundary_state(evaluation.boundary_state),
             ),
+            stream_events=self._stream_events(
+                heat,
+                evaluation,
+                source_frame_id=source_frame_id,
+                source_message_id=source_message_id,
+                source_key=source_key,
+                observed_at_us=observed_at_us,
+            ),
         )
         if materialization.runner_state_written:
             self._previous[source_heat_id] = evaluation.boundary_state
         elif previous is not None:
             self._previous[source_heat_id] = previous
         return MetricRunResult(evaluation=evaluation, materialization=materialization)
+
+    @staticmethod
+    def _stream_events(
+        heat: HeatMetricInput,
+        evaluation: MetricEngineResult,
+        *,
+        source_frame_id: int,
+        source_message_id: int | None,
+        source_key: str,
+        observed_at_us: int,
+    ) -> tuple[StreamEventCandidate, ...]:
+        """Turn one durable metric boundary into compact SSE replay records.
+
+        Event payloads deliberately identify changed facts instead of copying a
+        sixty-car dashboard for every frame. Clients fetch the coherent
+        read-only snapshot at the supplied cursor when they need full values.
+        """
+
+        metadata = {
+            "schema_version": STREAM_SCHEMA_VERSION,
+            "session_id": heat.session.id,
+            "source_heat_id": heat.source_heat_id,
+            "generation": heat.generation,
+            "source_frame_id": source_frame_id,
+            "source_message_id": source_message_id,
+            "source_key": source_key,
+            "observed_at_us": observed_at_us,
+        }
+        prefix = f"metric:{heat.source_heat_id}:{source_frame_id}"
+        events: list[StreamEventCandidate] = [
+            StreamEventCandidate(
+                "state",
+                f"{prefix}:state",
+                {**metadata, "data": {"event_keys": list(evaluation.event_keys)}},
+            ),
+            StreamEventCandidate(
+                "metric",
+                f"{prefix}:metric",
+                {
+                    **metadata,
+                    "data": {
+                        "metric_version": METRIC_ENGINE_VERSION,
+                        "scopes": [
+                            {"scope_kind": candidate.scope_kind, "scope_key": candidate.scope_key}
+                            for candidate in evaluation.candidates
+                        ],
+                    },
+                },
+            ),
+        ]
+
+        seen: set[tuple[str, str | None]] = set()
+        for boundary in evaluation.event_keys:
+            event_type: str | None = None
+            participant_id: str | None = None
+            if boundary == "track_flag":
+                event_type = "flag"
+            elif boundary == "source_gap":
+                event_type = "quality"
+            elif boundary.startswith("lap:"):
+                event_type, participant_id = "lap", boundary.split(":", 1)[1]
+            elif boundary.startswith("pit_or_stint:"):
+                event_type, participant_id = "pit", boundary.split(":", 1)[1]
+            if event_type is None or (event_type, participant_id) in seen:
+                continue
+            seen.add((event_type, participant_id))
+            data: dict[str, Any] = {"boundary": boundary}
+            if participant_id is not None:
+                data["participant_id"] = participant_id
+            if event_type == "flag" and heat.current_flag is not None:
+                data["flag"] = {
+                    "value": heat.current_flag.flag,
+                    "started_at_us": heat.current_flag.started_at_us,
+                    "provider_code": heat.current_flag.provider_code,
+                    "provider_label": heat.current_flag.provider_label,
+                }
+            if event_type == "quality":
+                data["open_ingest_gap"] = (
+                    {
+                        "started_at_us": heat.open_ingest_gap.started_at_us,
+                        "reason": heat.open_ingest_gap.reason,
+                    }
+                    if heat.open_ingest_gap is not None
+                    else None
+                )
+            suffix = participant_id or "track"
+            events.append(StreamEventCandidate(event_type, f"{prefix}:{event_type}:{suffix}", {**metadata, "data": data}))
+
+        session_values = next(
+            (
+                candidate.values
+                for candidate in evaluation.candidates
+                if candidate.scope_kind == "session" and candidate.scope_key == heat.session.id
+            ),
+            {},
+        )
+        alerts = session_values.get("alerts") if isinstance(session_values, Mapping) else None
+        if isinstance(alerts, tuple) and alerts and evaluation.event_keys:
+            events.append(
+                StreamEventCandidate(
+                    "alert",
+                    f"{prefix}:alert",
+                    {**metadata, "data": {"alerts": list(alerts)}},
+                )
+            )
+        return tuple(events)
 
     @staticmethod
     def _state_hash(candidates: tuple[MetricSampleCandidate, ...]) -> str:

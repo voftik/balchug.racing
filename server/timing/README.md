@@ -119,6 +119,39 @@ Race duration accepts only 4, 6, 12 or 24 hours in seconds; required pits are
 2 through 8. Extra fields and all manual identity, class, tyre, fuel or driver
 configuration are rejected.
 
+## Live dashboard read API
+
+The engineer panel reads normalized facts and calculated metrics from the same
+timing database through a separate, read-only API surface. These endpoints are
+public same-origin reads; they never accept a driver, tyre, fuel, competitor,
+or other tactical input. Lifecycle writes above remain the only bearer-token
+operations.
+
+```text
+GET /api/timing/sessions/{id}/state
+GET /api/timing/sessions/{id}/metrics
+GET /api/timing/sessions/{id}/metrics/history?scope_kind=participant&scope_key={participant_id}
+GET /api/timing/sessions/{id}/laps?participant_id={participant_id}&limit=200
+GET /api/timing/sessions/{id}/pit-stops?participant_id={participant_id}&limit=200
+GET /api/timing/sessions/{id}/stream
+```
+
+All responses use `timing-live.v1`. A state snapshot includes a durable stream
+cursor, measured provider facts, computed tactical metrics, and explicit
+system assumptions (a completed pit-out starts fresh tyres; tyre age is
+completed laps in that reconstructed stint). The API computes freshness when
+it reads: `LIVE` through 3 seconds, `STALE` through 10 seconds, then
+`OFFLINE`; an open source gap, Finish flag, or stopped/aborted analysis session
+is immediately offline. Historical charts are constrained to 24 hours and at
+most 720 points; lap and pit detail requests are bounded to 500 rows.
+
+`/stream` is server-sent events. Its first response is a `snapshot`; reconnect
+with the browser's `Last-Event-ID` to receive only unseen durable `state`,
+`metric`, `lap`, `flag`, `pit`, and `alert` events. If history was retained
+away, a generation changes, or a slow client falls behind its bounded queue,
+the stream sends `reset` with a complete new snapshot. Heartbeats and
+freshness-only `quality` events have no cursor and cannot hide a stale source.
+
 ## Ingest worker operation
 
 `balchug-timing-ingest.service` runs `python -m timing.worker` as `www-data`.

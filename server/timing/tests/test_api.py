@@ -5,9 +5,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+from starlette.requests import Request
 
-from timing.api import app
-from timing.db import migrate
+from timing.api import app, timing_stream
+from timing.db import connect, migrate
 
 
 class TimingApiTests(unittest.IsolatedAsyncioTestCase):
@@ -28,6 +29,10 @@ class TimingApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.client.aclose()
+        broker = getattr(app.state, "timing_stream_broker", None)
+        if broker is not None:
+            await broker.stop()
+            delattr(app.state, "timing_stream_broker")
         self.environment.stop()
         self.temporary.cleanup()
 
@@ -136,6 +141,208 @@ class TimingApiTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(response.status_code, 503)
         self.assertIsNone((await self.client.get("/sources/moscow/sessions/active")).json()["session"])
+
+    async def test_public_read_routes_expose_only_bounded_normalized_timing_data(self):
+        created = await self.create("igora", {"mode": "practice"}, "read-surface-session")
+        session_id = created.json()["session"]["id"]
+        connection = connect(self.database)
+        try:
+            timestamp = 10_000_000
+            connection.execute(
+                """
+                INSERT INTO source_heats(analysis_session_id,generation,external_name,created_at_us)
+                VALUES (?,1,'Practice - Open-Pit',?)
+                """,
+                (session_id, timestamp),
+            )
+            heat_id = connection.execute("SELECT id FROM source_heats WHERE analysis_session_id = ?", (session_id,)).fetchone()[0]
+            connection.execute(
+                """
+                INSERT INTO participants(
+                  id,source_heat_id,external_key,start_number,team_name,car_name,class_name,class_name_key,
+                  is_ours,active,first_seen_at_us,last_seen_at_us
+                ) VALUES ('ours',?,'nr:21','21','BALCHUG Racing','Ligier JS53 evo2','CN PRO','cn pro',1,1,?,?)
+                """,
+                (heat_id, timestamp, timestamp),
+            )
+            connection.execute(
+                """
+                INSERT INTO participant_state_current(
+                  source_heat_id,participant_id,position_overall,position_class,laps,state,state_raw,state_kind,
+                  current_driver_name,source_key,updated_at_us
+                ) VALUES (?,'ours',4,1,8,'ON_TRACK','E10000000','ON_TRACK','Лобода Михаил','grid:10',?)
+                """,
+                (heat_id, timestamp),
+            )
+            connection.execute(
+                """
+                INSERT INTO state_ticks(
+                  source_heat_id,observed_second,observed_at_us,source_key,state_hash,freshness_ms,created_at_us
+                ) VALUES (?,10,?,'tick:10','hash',0,?)
+                """,
+                (heat_id, timestamp, timestamp),
+            )
+            connection.execute(
+                """
+                INSERT INTO track_flag_current(
+                  source_heat_id,flag,provider_code,provider_label,started_at_us,source_key,updated_at_us
+                ) VALUES (?,'GREEN','6','Green flag',?,'flag:10',?)
+                """,
+                (heat_id, timestamp, timestamp),
+            )
+            connection.execute(
+                """
+                INSERT INTO metric_current(
+                  source_heat_id,scope_kind,scope_key,observed_at_us,metric_version,values_json,
+                  source_key,created_at_us,updated_at_us
+                ) VALUES (?,'participant','ours',?,1,'{"pace_5_ms":107200}','metric:10',?,?)
+                """,
+                (heat_id, timestamp, timestamp, timestamp),
+            )
+            connection.execute(
+                """
+                INSERT INTO metric_samples(
+                  source_heat_id,scope_kind,scope_key,observed_second,observed_at_us,metric_version,
+                  values_json,source_key,created_at_us
+                ) VALUES (?,'participant','ours',10,?,1,'{"pace_5_ms":107200}','metric:10',?)
+                """,
+                (heat_id, timestamp, timestamp),
+            )
+            connection.execute(
+                """
+                INSERT INTO laps(
+                  id,source_heat_id,participant_id,lap_number,completed_at_us,duration_ms,
+                  is_in_lap,is_out_lap,crosses_pit,is_clean,source_key,created_at_us
+                ) VALUES ('lap-8',?,'ours',8,?,107200,0,0,0,1,'lap:8',?)
+                """,
+                (heat_id, timestamp, timestamp),
+            )
+            connection.execute(
+                """
+                INSERT INTO pit_stops(
+                  id,source_heat_id,participant_id,stop_number,entered_at_us,pit_lane_ms,completed,
+                  entered_source_key,created_at_us,updated_at_us
+                ) VALUES ('pit-1',?,'ours',1,?,30000,0,'pit:in',?,?)
+                """,
+                (heat_id, timestamp, timestamp, timestamp),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        state = await self.client.get(f"/sessions/{session_id}/state")
+        self.assertEqual(state.status_code, 200)
+        self.assertEqual(state.headers["cache-control"], "no-store")
+        self.assertEqual(state.json()["schema_version"], "timing-live.v1")
+        self.assertEqual(state.json()["measured"]["participants"][0]["driver_name"], "Лобода Михаил")
+
+        metrics = await self.client.get(f"/sessions/{session_id}/metrics?scope_kind=participant&scope_key=ours")
+        self.assertEqual(metrics.status_code, 200)
+        self.assertEqual(metrics.json()["metrics"][0]["values"]["pace_5_ms"], 107200)
+        self.assertEqual(
+            (await self.client.get(f"/sessions/{session_id}/metrics?scope_kind=participant")).status_code,
+            422,
+        )
+        self.assertEqual(
+            (
+                await self.client.get(
+                    f"/sessions/{session_id}/metrics/history?scope_kind=participant&scope_key=unknown"
+                )
+            ).status_code,
+            404,
+        )
+
+        laps = await self.client.get(f"/sessions/{session_id}/laps?participant_id=ours&limit=1")
+        pits = await self.client.get(f"/sessions/{session_id}/pit-stops?participant_id=ours&limit=1")
+        self.assertEqual(laps.json()["items"][0]["lap_number"], 8)
+        self.assertEqual(pits.json()["items"][0]["pit_lane_ms"], 30_000)
+
+        connection = connect(self.database)
+        try:
+            connection.execute(
+                """
+                INSERT INTO stream_events(
+                  analysis_session_id,source_heat_id,event_type,event_key,observed_at_us,payload_json,created_at_us
+                ) VALUES (?,?,'state','api-stream-state',?,'{"generation":1,"data":{"event_keys":[]}}',?)
+                """,
+                (session_id, heat_id, timestamp, timestamp),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        disconnected = False
+
+        async def receive():
+            nonlocal disconnected
+            if disconnected:
+                return {"type": "http.disconnect"}
+            disconnected = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "path": f"/sessions/{session_id}/stream",
+                "headers": [],
+                "query_string": b"",
+                "client": ("127.0.0.1", 1234),
+                "server": ("timing.test", 80),
+                "scheme": "http",
+            },
+            receive=receive,
+        )
+        stream = await timing_stream(session_id, request)
+        first_chunk = await anext(stream.body_iterator)
+        self.assertIn(b"event: snapshot", first_chunk)
+        self.assertIn(b"id: 1", first_chunk)
+        await stream.body_iterator.aclose()
+
+        connection = connect(self.database)
+        try:
+            connection.execute(
+                """
+                INSERT INTO stream_events(
+                  analysis_session_id,source_heat_id,event_type,event_key,observed_at_us,payload_json,created_at_us
+                ) VALUES (?,?,'lap','api-stream-lap',?,'{"generation":1,"data":{"participant_id":"ours"}}',?)
+                """,
+                (session_id, heat_id, timestamp + 1, timestamp + 1),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        reconnected = False
+
+        async def reconnect_receive():
+            nonlocal reconnected
+            if reconnected:
+                return {"type": "http.disconnect"}
+            reconnected = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        replay_stream = await timing_stream(
+            session_id,
+            Request(
+                {
+                    "type": "http",
+                    "method": "GET",
+                    "path": f"/sessions/{session_id}/stream",
+                    "headers": [],
+                    "query_string": b"",
+                    "client": ("127.0.0.1", 1234),
+                    "server": ("timing.test", 80),
+                    "scheme": "http",
+                },
+                receive=reconnect_receive,
+            ),
+            last_event_id="1",
+        )
+        replay_chunk = await anext(replay_stream.body_iterator)
+        self.assertIn(b"event: lap", replay_chunk)
+        self.assertIn(b"id: 2", replay_chunk)
+        await replay_stream.body_iterator.aclose()
 
 
 if __name__ == "__main__":

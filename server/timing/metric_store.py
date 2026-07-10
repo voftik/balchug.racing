@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any, Iterator
 
 from .config import now_us
+from .stream_events import StreamEventCandidate, StreamEventError, append_stream_events
 
 
 METRIC_SAMPLE_INTERVAL_US = 5_000_000
@@ -319,6 +320,7 @@ class MetricMaterializationResult:
     current_updated: tuple[MetricScope, ...] = ()
     current_skipped: tuple[MetricScope, ...] = ()
     runner_state_written: bool = False
+    stream_events_written: int = 0
 
     @property
     def written(self) -> tuple[MetricScope, ...]:
@@ -897,6 +899,7 @@ def materialize_metric_samples(
     event_boundary: bool = False,
     interval_us: int = METRIC_SAMPLE_INTERVAL_US,
     runner_state: MetricRunnerStateCandidate | None = None,
+    stream_events: Sequence[StreamEventCandidate] = (),
 ) -> MetricMaterializationResult:
     """Materialize current state and sparse chart history from one metric tick.
 
@@ -929,6 +932,12 @@ def materialize_metric_samples(
             raise MetricStoreError("runner_state state_hash must be a non-empty string")
         if not isinstance(runner_state.boundary_state_json, str) or not runner_state.boundary_state_json:
             raise MetricStoreError("runner_state boundary_state_json must be a non-empty string")
+    try:
+        prepared_stream_events = tuple(stream_events)
+    except TypeError as error:
+        raise MetricStoreError("stream_events must be an iterable of StreamEventCandidate values") from error
+    if prepared_stream_events and runner_state is None:
+        raise MetricStoreError("stream events require a durable metric runner state")
 
     prepared: list[tuple[MetricScope, str, str, bool]] = []
     seen_scopes: set[MetricScope] = set()
@@ -957,9 +966,12 @@ def materialize_metric_samples(
     current_updated: list[MetricScope] = []
     current_skipped: list[MetricScope] = []
     runner_state_written = False
+    stream_events_written = 0
     with _write_transaction(connection):
-        heat_exists = connection.execute("SELECT 1 FROM source_heats WHERE id = ?", (source_heat_id,)).fetchone()
-        if heat_exists is None:
+        heat = connection.execute(
+            "SELECT analysis_session_id FROM source_heats WHERE id = ?", (source_heat_id,)
+        ).fetchone()
+        if heat is None:
             raise MetricStoreError(f"Source heat does not exist: {source_heat_id}")
         created_at_us = now_us()
         for scope, values_json, history_values_json, candidate_event in prepared:
@@ -1238,6 +1250,20 @@ def materialize_metric_samples(
                     ),
                 )
                 runner_state_written = True
+        if runner_state_written and prepared_stream_events:
+            try:
+                stream_events_written = append_stream_events(
+                    connection,
+                    analysis_session_id=heat["analysis_session_id"],
+                    source_heat_id=source_heat_id,
+                    source_frame_id=runner_state.source_frame_id,
+                    source_message_id=source_message_id,
+                    source_key=source_key,
+                    observed_at_us=observed_at_us,
+                    events=prepared_stream_events,
+                )
+            except StreamEventError as error:
+                raise MetricStoreError(f"Invalid stream event: {error}") from error
     return MetricMaterializationResult(
         tuple(inserted),
         tuple(updated),
@@ -1246,4 +1272,5 @@ def materialize_metric_samples(
         tuple(current_updated),
         tuple(current_skipped),
         runner_state_written,
+        stream_events_written,
     )
