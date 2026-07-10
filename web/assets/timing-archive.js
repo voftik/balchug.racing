@@ -28,7 +28,9 @@
     comparisonLegendTitle: $("timingComparisonLegendTitle"),
     comparisonLegendText: $("timingComparisonLegendText"),
     pitPanel: $("timingPitPanel"),
+    pitMeta: $("timingPitMeta"),
     pitChart: $("timingPitChart"),
+    pitDescription: $("timingPitDescription"),
     lapPanel: $("timingLapPanel"),
     lapChart: $("timingLapChart"),
     lapLegend: $("timingLapLegend"),
@@ -1084,10 +1086,10 @@
       if (!pitsByParticipant[pit.participant_id]) pitsByParticipant[pit.participant_id] = [];
       pitsByParticipant[pit.participant_id].push(pit);
     });
+    // In aggregate mode every class car keeps a row.  An empty row is useful
+    // evidence that no confirmed pit-stop was recorded for that car.
     var participants = (data.participants || []).filter(function (participant) {
-      if (!requiredIds[participant.participant_id]) return false;
-      // A selected rival remains visible even before its first pit-stop.
-      return !!pitsByParticipant[participant.participant_id] || participant.participant_id === oursId || participant.participant_id === selectedId;
+      return !!requiredIds[participant.participant_id];
     });
     if (!participants.length) {
       var ours = (data.participants || []).find(function (participant) { return participant.participant_id === oursId; });
@@ -1125,6 +1127,7 @@
       context.font = "11px Arial";
       context.fillText("В сохранённой части нет подтверждённых пит-стопов выбранных машин", left, headerHeight + 19);
     }
+    var compactLabels = width < 440;
     visual.participants.forEach(function (participant, index) {
       var top = headerHeight + index * rowHeight;
       var isOurs = participant.participant_id === visual.oursId;
@@ -1134,7 +1137,9 @@
       context.beginPath(); context.moveTo(0, top + rowHeight - 0.5); context.lineTo(width, top + rowHeight - 0.5); context.stroke();
       context.fillStyle = "#1B365D";
       context.font = "10px Arial";
-      var label = (participant.start_number ? "#" + participant.start_number + " " : "") + (participant.team_name || "Машина");
+      var teamName = String(participant.team_name || "Машина");
+      var compactTeam = teamName.trim().split(/\s+/)[0].slice(0, 10);
+      var label = (participant.start_number ? "#" + participant.start_number + " " : "") + (compactLabels ? compactTeam : teamName);
       context.save(); context.beginPath(); context.rect(0, top, Math.max(1, left - 6), rowHeight); context.clip(); context.fillText(label, 4, top + 19); context.restore();
       (visual.pitsByParticipant[participant.participant_id] || []).forEach(function (pit) {
         var start = numericValue(pit.timeline_started_at_us);
@@ -1164,10 +1169,38 @@
     return { left: left, right: right, range: range };
   }
 
+  function pitParticipantLabel(participant) {
+    var number = participant.start_number ? "#" + participant.start_number + " " : "";
+    return number + String(participant.team_name || "Машина");
+  }
+
+  function renderPitSummary(visual) {
+    var carsWithPits = visual.participants.filter(function (participant) {
+      return (visual.pitsByParticipant[participant.participant_id] || []).length > 0;
+    }).length;
+    var participantCount = formatNounCount(visual.participants.length, "машина", "машины", "машин");
+    var pitCars = carsWithPits === 1 ? "1 с пит-стопом" : carsWithPits + " с пит-стопами";
+    elements.pitMeta.textContent = participantCount + " · " + pitCars;
+    var range = state.manifest.range;
+    var description = visual.participants.map(function (participant) {
+      var stops = visual.pitsByParticipant[participant.participant_id] || [];
+      if (!stops.length) return pitParticipantLabel(participant) + ": подтверждённых пит-стопов нет";
+      return pitParticipantLabel(participant) + ": " + stops.map(function (pit) {
+        var entered = numericValue(pit.timeline_started_at_us);
+        var time = entered === null ? "" : " с " + formatElapsed((entered - range.first_at_us) / 1000000);
+        var duration = numericValue(pit.pit_lane_ms);
+        return "пит-стоп #" + pit.stop_number + time + (duration === null ? ", незавершён" : ", " + formatLap(duration));
+      }).join(", ");
+    }).join(". ");
+    elements.pitDescription.textContent = "Хронология пит-стопов. " + description;
+  }
+
   function drawPitTimeline() {
     var data = comparisonVisualData();
     if (!data || !state.manifest || !Array.isArray(data.pit_stops)) {
       elements.pitPanel.hidden = true;
+      elements.pitMeta.textContent = "";
+      elements.pitDescription.textContent = "";
       state.pitBase = null;
       state.pitBaseKey = "";
       return;
@@ -1179,6 +1212,7 @@
     var ratio = window.devicePixelRatio || 1;
     var baseKey = [visual.key, surface.width, surface.height, ratio].join(":");
     if (!state.pitBase || state.pitBaseKey !== baseKey) {
+      renderPitSummary(visual);
       var base = staticCanvas(surface.width, surface.height, ratio);
       var geometry = drawPitTimelineBase(base.context, visual, surface.width, surface.height);
       state.pitBase = base.canvas;
@@ -1273,10 +1307,10 @@
     var min = Math.min.apply(Math, values);
     var max = Math.max.apply(Math, values);
     if (min === max) { min -= 1; max += 1; }
-    var yAt = function (value) { return 16 + (height - 32) - (value - min) / (max - min) * (height - 32); };
+    var yAt = function (value) { return 16 + (value - min) / (max - min) * (height - 32); };
     context.fillStyle = "#6E7E98";
     context.font = "10px Arial";
-    context.fillText("Круг", 2, 26);
+    context.fillText("Время", 2, 26);
     context.fillText(formatLap(min), width - right - 48, 26);
     context.fillText(formatLap(max), width - right - 48, height - 16);
     context.strokeStyle = "#E4E9F0";
@@ -1501,7 +1535,7 @@
     var paceHeight = 57;
     drawLabels("Темп", paceTop, paceHeight, paceBounds, formatLap);
     if (paceBounds) {
-      var paceY = function (value) { return paceTop + paceHeight - (value - paceBounds.min) / (paceBounds.max - paceBounds.min) * paceHeight; };
+      var paceY = function (value) { return paceTop + (value - paceBounds.min) / (paceBounds.max - paceBounds.min) * paceHeight; };
       var aggregate = state.comparison && state.comparison.comparison && state.comparison.comparison.mode === "all";
       if (aggregate) drawBand(samples, paceY);
       drawStep(samples, "ours", paceY, "#F0143D");
@@ -1516,7 +1550,7 @@
     var deltaHeight = 57;
     drawLabels("Разница", deltaTop, deltaHeight, deltaBounds, formatGap);
     if (deltaBounds) {
-      var deltaY = function (value) { return deltaTop + deltaHeight - (value - deltaBounds.min) / (deltaBounds.max - deltaBounds.min) * deltaHeight; };
+      var deltaY = function (value) { return deltaTop + (value - deltaBounds.min) / (deltaBounds.max - deltaBounds.min) * deltaHeight; };
       context.strokeStyle = "#AAB4C3";
       context.lineWidth = 1;
       context.setLineDash([3, 3]);
