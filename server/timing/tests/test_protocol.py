@@ -1,7 +1,7 @@
 import json
 import unittest
 
-from timing.protocol import ProtocolError, SignalRMessage, _messages_from_entries, decode_utf16_payload, parse_bootstrap
+from timing.protocol import LiveTimingClient, ProtocolError, SignalRMessage, _messages_from_entries, decode_utf16_payload, parse_bootstrap
 
 
 class ProtocolTests(unittest.TestCase):
@@ -10,6 +10,11 @@ class ProtocolTests(unittest.TestCase):
         bootstrap = parse_bootstrap(html, "https://livetiming.getraceresults.com/igora")
         self.assertEqual(bootstrap.timekeeper_id, "abc123")
         self.assertEqual(bootstrap.display_marker, "19100")
+
+    def test_provider_origin_is_derived_from_the_timing_source(self):
+        client = LiveTimingClient("https://livetiming.getraceresults.com/igora")
+        self.assertEqual(client.origin, "https://livetiming.getraceresults.com")
+        self.assertEqual(client._endpoint("/lt/negotiate"), "https://livetiming.getraceresults.com/lt/negotiate")
 
     def test_missing_bootstrap_is_a_protocol_error(self):
         with self.assertRaises(ProtocolError):

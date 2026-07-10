@@ -47,6 +47,7 @@ class TimingReducer:
     result_layout: Any = None
     result_snapshot: Any = None
     result_cells: dict[str, Any] = field(default_factory=dict)
+    result_meta_changes: list[Any] = field(default_factory=list)
     removed_rows: list[Any] = field(default_factory=list)
     tracker_passings: list[Any] = field(default_factory=list)
     latest_heat: Any = None
@@ -57,7 +58,11 @@ class TimingReducer:
     def _apply_result_cells(self, changes: Any) -> None:
         for change in _changes(changes):
             if len(change) >= 3 and isinstance(change[0], int) and isinstance(change[1], int):
-                self.result_cells[f"{change[0]}:{change[1]}"] = copy.deepcopy(change[2:])
+                if change[0] >= 0 and change[1] >= 0:
+                    self.result_cells[f"{change[0]}:{change[1]}"] = copy.deepcopy(change[2:])
+                else:
+                    self.result_meta_changes.append(copy.deepcopy(change))
+        self.result_meta_changes = self.result_meta_changes[-100:]
 
     def apply(self, handle: str, args: list[Any]) -> None:
         value = _payload(args)
@@ -69,6 +74,7 @@ class TimingReducer:
         elif handle == "r_i":
             self.result_snapshot = copy.deepcopy(value)
             self.result_cells.clear()
+            self.result_meta_changes.clear()
             self.removed_rows.clear()
             if isinstance(value, dict):
                 self.result_layout = copy.deepcopy(value.get("l", self.result_layout))
@@ -83,7 +89,12 @@ class TimingReducer:
                 self.tracker_passings.append(copy.deepcopy(passing))
             self.tracker_passings = self.tracker_passings[-1000:]
         elif handle in {"h_h", "h_i"}:
-            self.latest_heat = copy.deepcopy(value)
+            # h_h is commonly a partial patch. Keep the h_i flag, heat name
+            # and clock fields unless the delta explicitly replaces them.
+            if isinstance(self.latest_heat, dict) and isinstance(value, dict):
+                self.latest_heat = {**self.latest_heat, **copy.deepcopy(value)}
+            else:
+                self.latest_heat = copy.deepcopy(value)
         elif handle == "s_t":
             self.latest_server_time = copy.deepcopy(value)
         elif handle in {"a_i", "a_u", "t_i", "m_i", "s_i", "h_i"}:
@@ -109,6 +120,7 @@ class TimingReducer:
                 "result_layout": self.result_layout,
                 "result_snapshot": self.result_snapshot,
                 "result_cells": self.result_cells,
+                "result_meta_changes": self.result_meta_changes,
                 "removed_rows": self.removed_rows,
                 "tracker_passings": self.tracker_passings,
                 "latest_heat": self.latest_heat,

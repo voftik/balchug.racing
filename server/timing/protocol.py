@@ -208,8 +208,9 @@ class LiveTimingClient:
         # ``total`` must stay open for the full race. Connect/bootstrap failures
         # are bounded separately, while the caller owns the recording duration.
         timeout = aiohttp.ClientTimeout(total=None, sock_connect=self.timeout, sock_read=None)
-        headers = {"Origin": "https://balchug.racing"}
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        # Bootstrap and negotiate are ordinary upstream requests. Only the
+        # WebSocket carries an Origin, and it must be the provider origin.
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             bootstrap = await self.bootstrap(session)
             negotiated = await self.negotiate(session, bootstrap)
             params = {
@@ -223,7 +224,9 @@ class LiveTimingClient:
             if bootstrap.display_marker:
                 params["_tkdm"] = bootstrap.display_marker
             websocket_url = self._endpoint("/lt/connect").replace("https://", "wss://", 1).replace("http://", "ws://", 1)
-            async with session.ws_connect(websocket_url, params=params, heartbeat=20, origin=self.origin) as ws:
+            # The provider already pushes at its own cadence. Sending client
+            # heartbeats is unnecessary traffic and can mask source silence.
+            async with session.ws_connect(websocket_url, params=params, heartbeat=None, origin=self.origin) as ws:
                 async for frame in ws:
                     if frame.type == aiohttp.WSMsgType.TEXT:
                         yield bootstrap, frame.data

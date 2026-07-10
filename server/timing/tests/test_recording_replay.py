@@ -18,6 +18,17 @@ class RecordingReplayTests(unittest.TestCase):
         self.assertEqual(reducer.tracker_passings[0][4], -1)
         self.assertEqual(reducer.tracker_passings[1][4], 1)
 
+    def test_partial_heat_delta_keeps_green_flag_and_result_meta_is_not_a_car(self):
+        fixture = Path(__file__).parent.parent / "fixtures" / "signalr-replay-v1.ndjson"
+        reducer = replay_file(fixture)
+        reducer.apply("h_i", [{"n": "Heat", "f": 6}])
+        reducer.apply("h_h", [{"r": 123}])
+        reducer.apply("r_c", [[[-1, -1, "source-meta"], [1, 0, "1"]]])
+        self.assertEqual(reducer.latest_heat["f"], 6)
+        self.assertEqual(reducer.latest_heat["r"], 123)
+        self.assertNotIn(-1, reducer.result_rows())
+        self.assertEqual(reducer.result_meta_changes[-1], [-1, -1, "source-meta"])
+
     def test_replay_is_deterministic_and_applies_sparse_deltas(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary) / "capture"
