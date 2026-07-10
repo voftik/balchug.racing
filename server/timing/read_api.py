@@ -23,6 +23,7 @@ from typing import Any, Literal
 from .config import now_us
 from .db import connect
 from .metric_store import PLAYBACK_PAYLOAD_CODEC, PLAYBACK_PROJECTION_VERSION
+from .normalization import OPEN_ENDED_TS_TIME, time_service_to_unix_us
 from .playback import PLAYBACK_SCHEMA_VERSION
 
 
@@ -47,6 +48,11 @@ ARCHIVE_FINALIZATION_WINDOW_US = 60 * US_PER_SECOND
 # server-side class benchmark, which is calculated from the complete facts.
 MAX_ARCHIVE_COMPARISON_LAPS_PER_PARTICIPANT = 2_000
 ARCHIVE_COMPARISON_LAP_BUCKET_US = 60 * US_PER_SECOND
+# Time Service emits an explicit server clock about every 30 seconds.  Archive
+# playback remains seekable on receive time, while this bounded map lets a UI
+# label its x-axis with the clock actually shown on the timing dashboard.
+ARCHIVE_SOURCE_CLOCK_MAX_INTERPOLATION_US = 90 * US_PER_SECOND
+MAX_ARCHIVE_SOURCE_CLOCK_ANCHORS = 4_000
 
 SCOPE_KINDS = frozenset(("participant", "class", "session"))
 FreshnessStatus = Literal["LIVE", "STALE", "OFFLINE"]
@@ -1375,6 +1381,147 @@ def _archive_point_rows(
     return list(rows), count
 
 
+def _valid_source_clock_timestamp(value: Any) -> int | None:
+    """Return a usable raw Time Service clock value without treating zero as time."""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value <= 0 or value == OPEN_ENDED_TS_TIME:
+        return None
+    return value
+
+
+def _archive_source_clock_anchors(
+    connection: sqlite3.Connection,
+    *,
+    heat_id: int,
+    first_at_us: int,
+    last_at_us: int,
+) -> list[dict[str, Any]]:
+    """Return explicit Time Service clock anchors around one replay range.
+
+    Archive seek stays on the durable receive-time coordinate.  These anchors
+    are intentionally additive: a client can interpolate *labels* between
+    adjacent samples from the same SignalR connection without claiming that
+    each historical frame carried its own provider timestamp.
+    """
+
+    lower_bound = max(0, first_at_us - ARCHIVE_SOURCE_CLOCK_MAX_INTERPOLATION_US)
+    upper_bound = last_at_us + ARCHIVE_SOURCE_CLOCK_MAX_INTERPOLATION_US
+    rows = connection.execute(
+        """
+        SELECT sample.ingest_connection_id,sample.provider_timestamp_us,sample.received_at_us,
+               (
+                 SELECT calibration.id
+                 FROM connection_clock_calibrations AS calibration
+                 WHERE calibration.source_heat_id = ?
+                   AND calibration.ingest_connection_id = sample.ingest_connection_id
+                   AND calibration.valid_from_observed_at_us <= sample.received_at_us
+                 ORDER BY calibration.valid_from_observed_at_us DESC,calibration.id DESC
+                 LIMIT 1
+               ) AS calibration_id,
+               (
+                 SELECT calibration.offset_us
+                 FROM connection_clock_calibrations AS calibration
+                 WHERE calibration.source_heat_id = ?
+                   AND calibration.ingest_connection_id = sample.ingest_connection_id
+                   AND calibration.valid_from_observed_at_us <= sample.received_at_us
+                 ORDER BY calibration.valid_from_observed_at_us DESC,calibration.id DESC
+                 LIMIT 1
+               ) AS offset_us
+        FROM connection_clock_samples AS sample
+        WHERE sample.source_heat_id = ?
+          AND sample.received_at_us >= ? AND sample.received_at_us <= ?
+        ORDER BY sample.received_at_us,sample.id
+        LIMIT ?
+        """,
+        (heat_id, heat_id, heat_id, lower_bound, upper_bound, MAX_ARCHIVE_SOURCE_CLOCK_ANCHORS),
+    ).fetchall()
+    anchors: list[dict[str, Any]] = []
+    for row in rows:
+        provider_timestamp_us = _valid_source_clock_timestamp(row["provider_timestamp_us"])
+        offset_us = row["offset_us"]
+        provider_epoch_us = time_service_to_unix_us(provider_timestamp_us)
+        if provider_timestamp_us is None or provider_epoch_us is None or offset_us is None:
+            continue
+        anchors.append(
+            {
+                "capture_at_us": int(row["received_at_us"]),
+                "provider_ts_time_us": provider_timestamp_us,
+                "calibrated_utc_at_us": provider_epoch_us + int(offset_us),
+                "basis": "provider_explicit",
+                "connection_id": row["ingest_connection_id"],
+                "calibration_id": int(row["calibration_id"]) if row["calibration_id"] is not None else None,
+            }
+        )
+    return anchors
+
+
+def _archive_time_axes(
+    connection: sqlite3.Connection,
+    *,
+    heat_id: int,
+    session: Mapping[str, Any],
+    first_at_us: int,
+    last_at_us: int,
+) -> dict[str, Any]:
+    """Describe immutable playback and provider-clock axes without conflating them."""
+
+    timezone_name = session["timezone_name"]
+    anchors = _archive_source_clock_anchors(
+        connection,
+        heat_id=heat_id,
+        first_at_us=first_at_us,
+        last_at_us=last_at_us,
+    )
+    origin_row = connection.execute(
+        """
+        SELECT green_flag_provider_ts_us,green_flag_at_us
+        FROM heat_statistics_current
+        WHERE source_heat_id = ?
+        """,
+        (heat_id,),
+    ).fetchone()
+    origin_provider_us = _valid_source_clock_timestamp(
+        origin_row["green_flag_provider_ts_us"] if origin_row is not None else None
+    )
+    origin_at_us = origin_row["green_flag_at_us"] if origin_row is not None else None
+    session_origin = (
+        {
+            "provider_ts_time_us": origin_provider_us,
+            "calibrated_utc_at_us": int(origin_at_us),
+            "basis": "provider_explicit_calibrated",
+        }
+        if origin_provider_us is not None and origin_at_us is not None
+        else None
+    )
+    if session_origin is None and anchors:
+        first_anchor = anchors[0]
+        session_origin = {
+            "provider_ts_time_us": first_anchor["provider_ts_time_us"],
+            "calibrated_utc_at_us": first_anchor["calibrated_utc_at_us"],
+            "basis": "provider_explicit",
+        }
+    return {
+        "playback": {
+            "id": "capture_received",
+            "seekable": True,
+            "origin_received_at_us": first_at_us,
+            "timezone_name": timezone_name,
+        },
+        "source": {
+            "id": "timeservice",
+            "label": "Время табло Time Service",
+            "timezone_name": timezone_name,
+            "provider_epoch": "2000-01-01T00:00:00Z",
+            "interpolation_max_gap_us": ARCHIVE_SOURCE_CLOCK_MAX_INTERPOLATION_US,
+            "fallback": "capture_received",
+            "session_origin": session_origin,
+            "anchors": anchors,
+        },
+    }
+
+
 def _comparison_number(value: Any) -> int | float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         return None
@@ -1601,26 +1748,57 @@ def _archive_comparison_lap_rows(
         FROM laps f
         JOIN participants p ON p.id = f.participant_id
         WHERE f.source_heat_id = ? AND f.participant_id IN ({placeholders})
-          AND f.completed_at_us IS NOT NULL AND f.completed_at_us >= ? AND f.completed_at_us <= ?
+          AND f.completed_at_us IS NOT NULL
         ORDER BY f.participant_id,f.completed_at_us,f.lap_number
         """,
-        (heat_id, *participant_ids, first_at_us, last_at_us),
+        (heat_id, *participant_ids),
     ).fetchall()
+    pit_rows = connection.execute(
+        f"""
+        SELECT participant_id,entered_at_us,exited_at_us,completed
+        FROM pit_stops
+        WHERE source_heat_id = ? AND participant_id IN ({placeholders})
+        ORDER BY participant_id,entered_at_us,stop_number
+        """,
+        (heat_id, *participant_ids),
+    ).fetchall()
+    pits_by_participant: dict[str, list[sqlite3.Row]] = {}
+    for pit in pit_rows:
+        pits_by_participant.setdefault(pit["participant_id"], []).append(pit)
     grouped: dict[str, list[dict[str, Any]]] = {}
+    previous_completed_at_us: dict[str, int] = {}
     for row in rows:
+        participant_id = row["participant_id"]
+        completed_at_us = int(row["completed_at_us"])
+        previous_at_us = previous_completed_at_us.get(participant_id)
+        crosses_pit_interval = False
+        if previous_at_us is not None:
+            for pit in pits_by_participant.get(participant_id, ()):
+                if not bool(pit["completed"]):
+                    continue
+                entered_at_us = int(pit["entered_at_us"])
+                exited_at_us = int(pit["exited_at_us"]) if pit["exited_at_us"] is not None else None
+                if entered_at_us < completed_at_us and (exited_at_us is None or exited_at_us > previous_at_us):
+                    crosses_pit_interval = True
+                    break
+        previous_completed_at_us[participant_id] = completed_at_us
+        if completed_at_us < first_at_us or completed_at_us > last_at_us:
+            continue
+        source_is_clean = bool(row["is_clean"])
         grouped.setdefault(row["participant_id"], []).append(
             {
-                "participant_id": row["participant_id"],
+                "participant_id": participant_id,
                 "start_number": row["start_number"],
                 "team_name": row["team_name"],
                 "lap_number": int(row["lap_number"]),
-                "completed_at_us": int(row["completed_at_us"]),
+                "completed_at_us": completed_at_us,
                 "duration_ms": row["duration_ms"],
                 "flag": row["flag"],
                 "is_in_lap": bool(row["is_in_lap"]),
                 "is_out_lap": bool(row["is_out_lap"]),
-                "crosses_pit": bool(row["crosses_pit"]),
-                "is_clean": bool(row["is_clean"]),
+                "crosses_pit": bool(row["crosses_pit"]) or crosses_pit_interval,
+                "source_is_clean": source_is_clean,
+                "is_clean": source_is_clean and not crosses_pit_interval,
             }
         )
     return grouped
@@ -1894,9 +2072,9 @@ def read_archive_comparison(
                     else "median confirmed rolling pace for on-track competitors in our archived class, excluding our car"
                 ),
                 "lap_series": (
-                    "clean laps for our car and the selected participant; display points are bounded and preserve non-clean breaks"
+                    "clean laps for our car and the selected participant; an interval that intersects a persisted pit stop is excluded even if an older source row was marked clean; display points are bounded and preserve non-clean breaks"
                     if mode == "participant"
-                    else "one-minute median of the latest clean lap per competitor, excluding our car"
+                    else "one-minute median of the latest clean lap per competitor, excluding our car; pit-crossing intervals are excluded"
                 ),
                 "pit_stops": "confirmed pit in/out facts clipped only for timeline display; pit_lane_ms remains the measured full duration",
                 "missing_values": "null values are not interpolated or converted to zero",
@@ -2112,6 +2290,13 @@ def read_archive_manifest(
         )
         first_at_us = int(heat["first_at_us"])
         last_at_us = int(heat["last_at_us"])
+        time_axes = _archive_time_axes(
+            connection,
+            heat_id=int(heat["id"]),
+            session=session,
+            first_at_us=first_at_us,
+            last_at_us=last_at_us,
+        )
         return {
             "schema_version": ARCHIVE_SCHEMA_VERSION,
             "session": _session_payload(session),
@@ -2142,7 +2327,12 @@ def read_archive_manifest(
                 first_at_us=first_at_us,
                 last_at_us=last_at_us,
             ),
-            "semantics": {"state": "last_observed", "series": "step"},
+            "time_axes": time_axes,
+            "semantics": {
+                "state": "last_observed",
+                "series": "step",
+                "time_axes": "playback uses durable receive time; source uses explicit Time Service clock anchors and may only be interpolated within one connection",
+            },
             "system_assumption": _system_assumptions(),
         }
 

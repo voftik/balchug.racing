@@ -477,6 +477,34 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual([tuple(stint) for stint in stints], [(1, 5, 6, 1), (2, 6, None, 0)])
 
+    def test_completed_pit_interval_rejects_the_next_lap_as_clean(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 22_000_000
+        self.apply(
+            [
+                ["s_i", 22_000_000],
+                [
+                    "r_i",
+                    {
+                        "l": {"h": [{"n": "NR"}, {"n": "STATE"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "LAPS"}, {"n": "PIT"}, {"n": "LAST"}]},
+                        "r": [[0, 0, "21"], [0, 1, "E22000000"], [0, 2, "BALCHUG Racing"], [0, 3, "CN PRO"], [0, 4, "5"], [0, 5, "0"], [0, 6, "110000000"]],
+                    },
+                ],
+            ],
+            received_at_us=received,
+        )
+        self.apply([["r_c", [[0, 4, "6"], [0, 6, "109000000"]]]], received_at_us=received + 1_000_000)
+        self.apply([["r_c", [[0, 1, "SIn Pit"], [0, 5, "1"]]]], received_at_us=received + 2_000_000)
+        self.apply([["r_c", [[0, 1, "SOutLap"]]]], received_at_us=received + 3_000_000)
+        self.apply(
+            [["r_c", [[0, 1, "E22004000"], [0, 4, "7"], [0, 6, "109500000"]]]],
+            received_at_us=received + 4_000_000,
+        )
+
+        lap = self.connection.execute(
+            "SELECT is_clean FROM laps WHERE lap_number = 7"
+        ).fetchone()
+        self.assertEqual(lap["is_clean"], 0)
+
     def test_initial_in_pit_row_is_a_baseline_not_a_historical_pit_stop(self):
         received = TIME_SERVICE_EPOCH_UNIX_US + 20_000_000
         self.apply(

@@ -21,6 +21,7 @@
     kpis: $("timingKpis"),
     benchmark: $("timingBenchmark"),
     chart: $("timingChart"),
+    chartAxis: $("timingChartAxis"),
     chartRange: $("timingChartRange"),
     comparison: $("timingComparison"),
     comparisonLegend: $("timingComparisonLegend"),
@@ -30,9 +31,12 @@
     pitPanel: $("timingPitPanel"),
     pitMeta: $("timingPitMeta"),
     pitChart: $("timingPitChart"),
+    pitAxis: $("timingPitAxis"),
     pitDescription: $("timingPitDescription"),
     lapPanel: $("timingLapPanel"),
     lapChart: $("timingLapChart"),
+    lapAxis: $("timingLapAxis"),
+    lapReadout: $("timingLapReadout"),
     lapLegend: $("timingLapLegend"),
     lapLegendKey: $("timingLapLegendKey"),
     lapLegendTitle: $("timingLapLegendTitle"),
@@ -87,6 +91,7 @@
     lapBaseKey: "",
     lapGeometry: null,
     lapLastPlayheadX: null,
+    lapReadoutKey: "",
     visualsLastDrawMs: 0,
     chartRangeText: "",
     observedText: "",
@@ -177,6 +182,130 @@
     } catch (error) {
       return new Date(atUs / 1000).toISOString().slice(11, 19);
     }
+  }
+
+  function sourceClockDefinition() {
+    var axes = asObject(state.manifest && state.manifest.time_axes);
+    var source = asObject(axes.source);
+    return source.id === "timeservice" && Array.isArray(source.anchors) ? source : null;
+  }
+
+  function sourceClockAt(captureAtUs) {
+    if (typeof captureAtUs !== "number") return null;
+    var source = sourceClockDefinition();
+    if (!source) return null;
+    var anchors = source.anchors;
+    var left = null;
+    var right = null;
+    for (var index = 0; index < anchors.length; index += 1) {
+      var anchor = anchors[index];
+      if (!anchor || typeof anchor.capture_at_us !== "number" || typeof anchor.calibrated_utc_at_us !== "number") continue;
+      if (anchor.capture_at_us === captureAtUs) {
+        return {
+          calibratedAtUs: anchor.calibrated_utc_at_us,
+          providerAtUs: anchor.provider_ts_time_us,
+          basis: "provider_explicit"
+        };
+      }
+      if (anchor.capture_at_us < captureAtUs) left = anchor;
+      if (anchor.capture_at_us > captureAtUs) { right = anchor; break; }
+    }
+    if (!left || !right || left.connection_id !== right.connection_id) return null;
+    var captureSpan = right.capture_at_us - left.capture_at_us;
+    var maximumSpan = numericValue(source.interpolation_max_gap_us) || 0;
+    if (captureSpan <= 0 || (maximumSpan && captureSpan > maximumSpan)) return null;
+    var ratio = (captureAtUs - left.capture_at_us) / captureSpan;
+    return {
+      calibratedAtUs: Math.round(left.calibrated_utc_at_us + (right.calibrated_utc_at_us - left.calibrated_utc_at_us) * ratio),
+      providerAtUs: (
+        typeof left.provider_ts_time_us === "number" && typeof right.provider_ts_time_us === "number"
+          ? Math.round(left.provider_ts_time_us + (right.provider_ts_time_us - left.provider_ts_time_us) * ratio)
+          : null
+      ),
+      basis: "provider_interpolated"
+    };
+  }
+
+  function formatClockLabel(atUs, compact, withDate) {
+    if (typeof atUs !== "number") return "—";
+    try {
+      var options = {
+        timeZone: archiveTimezone(),
+        hour: "2-digit",
+        minute: "2-digit"
+      };
+      if (!compact) options.second = "2-digit";
+      if (withDate) { options.day = "2-digit"; options.month = "2-digit"; }
+      return new Intl.DateTimeFormat("ru-RU", options).format(new Date(atUs / 1000));
+    } catch (error) {
+      return formatAbsolute(atUs);
+    }
+  }
+
+  function clockDateKey(atUs) {
+    if (typeof atUs !== "number") return "";
+    try {
+      return new Intl.DateTimeFormat("ru-RU", {
+        timeZone: archiveTimezone(), day: "2-digit", month: "2-digit", year: "numeric"
+      }).format(new Date(atUs / 1000));
+    } catch (error) {
+      return new Date(atUs / 1000).toISOString().slice(0, 10);
+    }
+  }
+
+  function timelineClockAt(captureAtUs) {
+    var source = sourceClockAt(captureAtUs);
+    return source ? { atUs: source.calibratedAtUs, source: true, basis: source.basis } :
+      { atUs: captureAtUs, source: false, basis: "capture_received" };
+  }
+
+  function timelineAxisTicks(range, width) {
+    var count = width < 440 ? 3 : 5;
+    var first = timelineClockAt(range.first_at_us);
+    var last = timelineClockAt(range.last_at_us);
+    var sourceAvailable = first.source && last.source;
+    var compact = width < 440 && (range.last_at_us - range.first_at_us) >= 10 * 60 * 1000000;
+    var withDate = clockDateKey(first.atUs) !== clockDateKey(last.atUs);
+    var ticks = [];
+    for (var index = 0; index < count; index += 1) {
+      var ratio = count === 1 ? 0 : index / (count - 1);
+      var captureAtUs = Math.round(range.first_at_us + (range.last_at_us - range.first_at_us) * ratio);
+      var moment = timelineClockAt(captureAtUs);
+      ticks.push({
+        ratio: ratio,
+        text: formatClockLabel(moment.atUs, compact, withDate),
+        source: moment.source
+      });
+    }
+    return { sourceAvailable: sourceAvailable, ticks: ticks };
+  }
+
+  function renderTimelineAxis(element, geometry) {
+    if (!element || !geometry || !geometry.range) return;
+    var width = geometry.width || element.getBoundingClientRect().width || 1;
+    var axis = timelineAxisTicks(geometry.range, width);
+    var key = [
+      geometry.range.first_at_us, geometry.range.last_at_us, Math.round(width), geometry.left, geometry.right,
+      axis.sourceAvailable, axis.ticks.map(function (tick) { return tick.text; }).join("|")
+    ].join(":");
+    if (element.dataset.axisKey === key) return;
+    element.dataset.axisKey = key;
+    element.hidden = false;
+    element.dataset.axisLabel = axis.sourceAvailable ? "Время табло" : "Время записи";
+    element.title = axis.sourceAvailable ? "Отметки времени Time Service из потока табло" : "Время получения записи";
+    element.style.setProperty("--axis-left", Math.round(geometry.left) + "px");
+    element.style.setProperty("--axis-right", Math.round(geometry.right) + "px");
+    element.replaceChildren();
+    var plot = document.createElement("div");
+    plot.className = "ta-stream-axis-plot";
+    axis.ticks.forEach(function (tick) {
+      var label = document.createElement("span");
+      label.className = "ta-stream-axis-tick";
+      label.style.left = (tick.ratio * 100) + "%";
+      label.textContent = tick.text;
+      plot.appendChild(label);
+    });
+    element.appendChild(plot);
   }
 
   function formatEntryDate(atUs, timezone) {
@@ -608,6 +737,7 @@
     state.lapBaseKey = "";
     state.lapGeometry = null;
     state.lapLastPlayheadX = null;
+    state.lapReadoutKey = "";
     state.visualsLastDrawMs = 0;
     state.chartRangeText = "";
     state.observedText = "";
@@ -624,6 +754,10 @@
     root.classList.remove("is-terminal-snapshot");
     elements.coverage.hidden = true;
     elements.coverage.className = "ta-coverage";
+    elements.chartAxis.hidden = true;
+    elements.pitAxis.hidden = true;
+    elements.lapAxis.hidden = true;
+    elements.lapReadout.hidden = true;
     renderComparisonLoading();
     controlsDisabled(true);
     setEmpty("Загрузка телеметрической сессии…");
@@ -801,7 +935,9 @@
     if (!state.manifest || typeof effectiveAtUs !== "number") return;
     var captured = formatElapsed((effectiveAtUs - state.manifest.range.first_at_us) / 1000000);
     var cursor = formatElapsed((state.atUs - state.manifest.range.first_at_us) / 1000000);
-    var observedText = "срез " + captured + " · курсор " + cursor + " · " + formatAbsolute(effectiveAtUs);
+    var sourceClock = sourceClockAt(effectiveAtUs);
+    var observedMoment = sourceClock ? "табло " + formatAbsolute(sourceClock.calibratedAtUs) : "запись " + formatAbsolute(effectiveAtUs);
+    var observedText = "срез " + captured + " · курсор " + cursor + " · " + observedMoment;
     if (observedText !== state.observedText) {
       state.observedText = observedText;
       elements.observed.textContent = observedText;
@@ -887,9 +1023,12 @@
     if (comparison.mode === "participant") {
       var selected = participants.find(function (participant) { return participant.participantId === comparison.participant_id; });
       var selectedMeta = comparisonParticipant(comparison.participant_id);
+      var selectedHasPace = (response.points || []).some(function (point) {
+        return numericValue(point && point.benchmark_pace_5_ms) !== null;
+      });
       benchmarkPace = onTrackPace(selected);
       titleText = selectedMeta ? comparisonOptionLabel(selectedMeta) : "Выбранный соперник";
-      noteText = "Подтверждённый темп выбранной машины";
+      noteText = selectedHasPace ? "Темп выбранной машины за пять чистых кругов" : "Недостаточно пяти чистых кругов для темпа";
       contextLabel = "Позиция в классе";
       contextValue = selected && selected.positionClass !== null && selected.positionClass !== undefined ? "P" + selected.positionClass : "—";
     } else {
@@ -951,8 +1090,8 @@
       { id: "state", label: "Состояние", value: firstDefined(session.current_state, oursState.state_kind, oursState.state) },
       { id: "last", label: "Последний круг", value: formatLap(firstDefined(session.last_lap_ms, oursState.last_lap_ms)) },
       { id: "pace5", label: "Темп (5 кр.)", value: formatLap(session.pace_5_ms) },
-      { id: "ahead", label: "Впереди", value: formatGap(session.gap_to_ahead_ms) },
-      { id: "behind", label: "Сзади", value: formatGap(session.gap_to_behind_ms) },
+      { id: "ahead", label: "До соперника впереди", value: formatGap(session.gap_to_ahead_ms) },
+      { id: "behind", label: "До соперника сзади", value: formatGap(session.gap_to_behind_ms) },
       { id: "tyres", label: "Возраст шин", value: formatLapCount(firstDefined(session.tyre_age_laps, oursState.tyre_age_laps)) },
       { id: "pits", label: "Пит-стопы", value: firstDefined(session.pits_completed, oursState.provider_pit_count) },
       { id: "best", label: "Лучший круг", value: formatLap(firstDefined(session.best_lap_ms, oursState.best_lap_ms)) },
@@ -1109,7 +1248,7 @@
 
   function drawPitTimelineBase(context, visual, width, height) {
     var rowHeight = 30;
-    var headerHeight = 22;
+    var headerHeight = 4;
     var range = state.manifest.range;
     var left = width < 440 ? 92 : 136;
     var right = 10;
@@ -1117,11 +1256,6 @@
     var total = Math.max(1, range.last_at_us - range.first_at_us);
     var xAt = function (atUs) { return left + (atUs - range.first_at_us) / total * usableWidth; };
     drawTimelineFlags(context, xAt, width, height, range, left, right);
-    context.fillStyle = "#6E7E98";
-    context.font = "9px Arial";
-    context.fillText("00:00", left, 12);
-    context.fillText(formatElapsed((range.last_at_us - range.first_at_us) / 2_000_000), left + usableWidth / 2 - 18, 12);
-    context.fillText(formatElapsed((range.last_at_us - range.first_at_us) / 1_000_000), width - right - 42, 12);
     if (!visual.pits.length) {
       context.fillStyle = "#6E7E98";
       context.font = "11px Arial";
@@ -1166,7 +1300,7 @@
         }
       });
     });
-    return { left: left, right: right, range: range };
+    return { left: left, right: right, range: range, width: width };
   }
 
   function pitParticipantLabel(participant) {
@@ -1181,13 +1315,13 @@
     var participantCount = formatNounCount(visual.participants.length, "машина", "машины", "машин");
     var pitCars = carsWithPits === 1 ? "1 с пит-стопом" : carsWithPits + " с пит-стопами";
     elements.pitMeta.textContent = participantCount + " · " + pitCars;
-    var range = state.manifest.range;
     var description = visual.participants.map(function (participant) {
       var stops = visual.pitsByParticipant[participant.participant_id] || [];
       if (!stops.length) return pitParticipantLabel(participant) + ": подтверждённых пит-стопов нет";
       return pitParticipantLabel(participant) + ": " + stops.map(function (pit) {
         var entered = numericValue(pit.timeline_started_at_us);
-        var time = entered === null ? "" : " с " + formatElapsed((entered - range.first_at_us) / 1000000);
+        var moment = entered === null ? null : timelineClockAt(entered);
+        var time = moment === null ? "" : " в " + formatAbsolute(moment.atUs);
         var duration = numericValue(pit.pit_lane_ms);
         return "пит-стоп #" + pit.stop_number + time + (duration === null ? ", незавершён" : ", " + formatLap(duration));
       }).join(", ");
@@ -1201,13 +1335,14 @@
       elements.pitPanel.hidden = true;
       elements.pitMeta.textContent = "";
       elements.pitDescription.textContent = "";
+      elements.pitAxis.hidden = true;
       state.pitBase = null;
       state.pitBaseKey = "";
       return;
     }
     var visual = pitVisualConfiguration(data);
     elements.pitPanel.hidden = false;
-    var height = 22 + Math.max(1, visual.participants.length) * 30 + 6;
+    var height = 4 + Math.max(1, visual.participants.length) * 30 + 6;
     var surface = prepareCanvas(elements.pitChart, height, false);
     var ratio = window.devicePixelRatio || 1;
     var baseKey = [visual.key, surface.width, surface.height, ratio].join(":");
@@ -1221,6 +1356,7 @@
       state.pitLastPlayheadX = null;
     }
     var geometry = state.pitGeometry;
+    renderTimelineAxis(elements.pitAxis, geometry);
     var total = Math.max(1, geometry.range.last_at_us - geometry.range.first_at_us);
     var playhead = geometry.left + (state.atUs - geometry.range.first_at_us) / total * Math.max(1, surface.width - geometry.left - geometry.right);
     var playheadPixel = Math.round(playhead);
@@ -1240,6 +1376,7 @@
       if (clean) points.push({
         atUs: lap.completed_at_us,
         value: duration,
+        lapNumber: numericValue(lap.lap_number),
         breakBefore: breakBefore || lap.break_before === true
       });
       breakBefore = !clean;
@@ -1258,6 +1395,8 @@
         p25: numericValue(point.p25_duration_ms),
         p75: numericValue(point.p75_duration_ms),
         count: numericValue(point.participant_count),
+        windowStartedAtUs: start,
+        windowEndedAtUs: end,
         breakBefore: previousEnd !== null && start !== previousEnd
       };
       previousEnd = end;
@@ -1284,6 +1423,90 @@
     }
   }
 
+  function latestLapPoint(points, atUs) {
+    var result = null;
+    (points || []).forEach(function (point) {
+      if (typeof point.atUs === "number" && point.atUs <= atUs) result = point;
+    });
+    return result;
+  }
+
+  function lapMomentLabel(point) {
+    if (!point) return "";
+    var moment = timelineClockAt(point.atUs);
+    return formatAbsolute(moment.atUs);
+  }
+
+  function lapReadoutItem(label, value, detail, className) {
+    var item = document.createElement("div");
+    item.className = "ta-lap-readout-item " + className;
+    var title = document.createElement("b");
+    title.textContent = value;
+    title.title = value;
+    var caption = document.createElement("span");
+    caption.textContent = label + (detail ? " · " + detail : "");
+    item.appendChild(title);
+    item.appendChild(caption);
+    return item;
+  }
+
+  function renderLapReadout(data, geometry) {
+    if (!elements.lapReadout || !geometry) return;
+    var own = latestLapPoint(geometry.own, state.atUs);
+    var benchmark = latestLapPoint(geometry.benchmark, state.atUs);
+    var aggregate = geometry.aggregate;
+    var comparison = asObject(data.comparison);
+    var competitor = comparison.mode === "participant" ? comparisonParticipant(comparison.participant_id) : null;
+    var ownValue = own ? "Круг #" + valueOrDash(own.lapNumber) + " · " + formatLap(own.value) : "Нет чистого круга";
+    var ownDetail = own ? lapMomentLabel(own) : "до курсора";
+    var benchmarkLabel = aggregate ? "Медиана соперников" : (competitor ? comparisonOptionLabel(competitor) : "Выбранный соперник");
+    var benchmarkValue;
+    var benchmarkDetail;
+    if (benchmark) {
+      benchmarkValue = aggregate ? "Медиана · " + formatLap(benchmark.value) :
+        "Круг #" + valueOrDash(benchmark.lapNumber) + " · " + formatLap(benchmark.value);
+      benchmarkDetail = lapMomentLabel(benchmark);
+      if (aggregate && benchmark.count !== null) benchmarkDetail += " · " + formatNounCount(benchmark.count, "машина", "машины", "машин");
+    } else if (aggregate) {
+      benchmarkValue = "Нет чистого круга";
+      benchmarkDetail = "соперников до курсора";
+    } else {
+      benchmarkValue = "Нет чистого круга";
+      benchmarkDetail = "темп 5 кругов недоступен";
+    }
+    var key = [state.comparisonSelection, own && own.atUs, benchmark && benchmark.atUs, ownValue, benchmarkValue].join("|");
+    if (key === state.lapReadoutKey) return;
+    state.lapReadoutKey = key;
+    elements.lapReadout.style.gridTemplateColumns = state.comparisonSelection === "ours" ? "1fr" : "";
+    elements.lapReadout.replaceChildren();
+    elements.lapReadout.appendChild(lapReadoutItem("BALCHUG Racing", ownValue, ownDetail, "ours"));
+    if (state.comparisonSelection !== "ours") {
+      elements.lapReadout.appendChild(lapReadoutItem(benchmarkLabel, benchmarkValue, benchmarkDetail, aggregate ? "aggregate" : "competitor"));
+    }
+    elements.lapReadout.hidden = false;
+  }
+
+  function drawFocusedLapPoint(context, point, geometry, color, prefix, offset) {
+    if (!point || !geometry.yAt) return;
+    var x = geometry.xAt(point.atUs);
+    var y = geometry.yAt(point.value);
+    context.save();
+    context.fillStyle = "#fff";
+    context.strokeStyle = color;
+    context.lineWidth = 2;
+    context.beginPath(); context.arc(x, y, 5, 0, Math.PI * 2); context.fill(); context.stroke();
+    var label = prefix + formatLap(point.value);
+    context.font = "10px Arial";
+    var labelWidth = Math.ceil(context.measureText(label).width) + 8;
+    var labelX = Math.max(geometry.left, Math.min(geometry.width - geometry.right - labelWidth, x + 7));
+    var labelY = Math.max(12, Math.min(geometry.height - 4, y + offset));
+    context.fillStyle = "rgba(5,8,13,.84)";
+    context.fillRect(labelX - 3, labelY - 10, labelWidth, 14);
+    context.fillStyle = "#fff";
+    context.fillText(label, labelX + 1, labelY);
+    context.restore();
+  }
+
   function drawLapChartBase(context, data, width, height) {
     renderLapLegend(data);
     var range = state.manifest.range;
@@ -1302,7 +1525,7 @@
       context.fillStyle = "#6E7E98";
       context.font = "11px Arial";
       context.fillText("Нет подтверждённых чистых кругов в выбранном сравнении", left, height / 2);
-      return { left: left, right: right, range: range };
+      return { left: left, right: right, range: range, width: width, height: height, xAt: xAt, yAt: null, own: own, benchmark: benchmark, aggregate: aggregate };
     }
     var min = Math.min.apply(Math, values);
     var max = Math.max.apply(Math, values);
@@ -1366,13 +1589,15 @@
     if (aggregate) drawBand(benchmark);
     drawLapSeries(own, "#F0143D");
     if (state.comparisonSelection !== "ours") drawLapSeries(benchmark, aggregate ? "#526276" : "#007B91", aggregate ? [4, 3] : []);
-    return { left: left, right: right, range: range };
+    return { left: left, right: right, range: range, width: width, height: height, xAt: xAt, yAt: yAt, own: own, benchmark: benchmark, aggregate: aggregate };
   }
 
   function drawLapChart() {
     var data = comparisonVisualData();
     if (!data || !state.manifest || !data.lap_series) {
       elements.lapPanel.hidden = true;
+      elements.lapAxis.hidden = true;
+      elements.lapReadout.hidden = true;
       state.lapBase = null;
       state.lapBaseKey = "";
       return;
@@ -1396,14 +1621,24 @@
       state.lapLastPlayheadX = null;
     }
     var geometry = state.lapGeometry;
+    renderTimelineAxis(elements.lapAxis, geometry);
+    renderLapReadout(data, geometry);
     var total = Math.max(1, geometry.range.last_at_us - geometry.range.first_at_us);
     var playhead = geometry.left + (state.atUs - geometry.range.first_at_us) / total * Math.max(1, surface.width - geometry.left - geometry.right);
     var playheadPixel = Math.round(playhead);
-    if (state.lapLastPlayheadX === playheadPixel) return;
+    var focusedOwn = latestLapPoint(geometry.own, state.atUs);
+    var focusedBenchmark = latestLapPoint(geometry.benchmark, state.atUs);
+    var visualKey = [playheadPixel, focusedOwn && focusedOwn.atUs, focusedBenchmark && focusedBenchmark.atUs].join(":");
+    if (state.lapLastPlayheadX === visualKey) return;
     surface.context.clearRect(0, 0, surface.width, surface.height);
     surface.context.drawImage(state.lapBase, 0, 0, surface.width, surface.height);
     drawTimelinePlayhead(surface.context, playhead, surface.height);
-    state.lapLastPlayheadX = playheadPixel;
+    drawFocusedLapPoint(surface.context, focusedOwn, geometry, "#F0143D", "#", -8);
+    if (state.comparisonSelection !== "ours") {
+      drawFocusedLapPoint(surface.context, focusedBenchmark, geometry,
+        geometry.aggregate ? "#526276" : "#007B91", geometry.aggregate ? "мед. " : "#", 18);
+    }
+    state.lapLastPlayheadX = visualKey;
   }
 
   function drawComparisonVisuals() {
@@ -1604,6 +1839,7 @@
       state.chartBase = base;
       state.chartBaseKey = baseKey;
     }
+    renderTimelineAxis(elements.chartAxis, { left: 42, right: 10, range: range, width: width });
     var context = canvas.getContext("2d");
     context.setTransform(ratio, 0, 0, ratio, 0, 0);
     context.clearRect(0, 0, width, height);
@@ -1858,6 +2094,20 @@
     var rect = elements.chart.getBoundingClientRect();
     var ratio = Math.max(0, Math.min(1, (event.clientX - rect.left - 42) / Math.max(1, rect.width - 52)));
     stopPlayback(); setAt(state.manifest.range.first_at_us + ratio * (state.manifest.range.last_at_us - state.manifest.range.first_at_us), true);
+  });
+  elements.lapChart.addEventListener("click", function (event) {
+    if (!state.manifest || !state.lapGeometry) return;
+    var geometry = state.lapGeometry;
+    var rect = elements.lapChart.getBoundingClientRect();
+    var x = event.clientX - rect.left;
+    var candidates = geometry.own.concat(state.comparisonSelection === "ours" ? [] : geometry.benchmark);
+    var nearest = null;
+    candidates.forEach(function (point) {
+      var distance = Math.abs(geometry.xAt(point.atUs) - x);
+      if (distance <= 24 && (!nearest || distance < nearest.distance)) nearest = { point: point, distance: distance };
+    });
+    if (!nearest) return;
+    stopPlayback(); setAt(nearest.point.atUs, true);
   });
   elements.close.addEventListener("click", closeTimingModal);
   elements.modal.addEventListener("click", function (event) { if (event.target === elements.modal) closeTimingModal(); });

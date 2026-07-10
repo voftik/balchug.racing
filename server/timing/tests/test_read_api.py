@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from timing.db import connect, migrate
+from timing.normalization import TIME_SERVICE_EPOCH_UNIX_US
 from timing.read_api import (
     ArchiveProjectionMissingError,
     MetricScopeRequest,
@@ -427,6 +428,33 @@ class TimingReadModelTests(unittest.TestCase):
         self.assertEqual(selected["points"][0]["benchmark_pace_5_ms"], None)
         self.assertEqual(selected["points"][2]["benchmark_pace_5_ms"], 109_200)
         self.assertEqual([lap["participant_id"] for lap in selected["lap_series"]["benchmark"]], ["nr-29"])
+        # A legacy source row can carry is_clean=1 even though its complete
+        # interval spans a persisted pit. The archive reader must correct that
+        # fact before it can influence an engineer-facing chart.
+        self.connection.execute(
+            """
+            INSERT INTO pit_stops(
+              id,source_heat_id,participant_id,stop_number,entered_at_us,exited_at_us,entered_lap,
+              exited_lap,pit_lane_ms,completed,entered_source_key,exited_source_key,created_at_us,updated_at_us
+            ) VALUES ('pit-29-cross',?,'nr-29',1,5500000,5700000,1,1,200000,1,'pit:29:in','pit:29:out',5500000,5700000)
+            """,
+            (self.heat_id,),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO laps(
+              id,source_heat_id,participant_id,lap_number,completed_at_us,duration_ms,sectors_json,
+              flag,is_in_lap,is_out_lap,crosses_pit,is_clean,source_key,created_at_us
+            ) VALUES ('lap-29-cross',?,'nr-29',2,7000000,110000,'[]','GREEN',0,0,0,1,'lap:29:cross',7000000)
+            """,
+            (self.heat_id,),
+        )
+        self.connection.commit()
+        selected_after_pit = self.model.archive_comparison("session-1", mode="participant", participant_id="nr-29")
+        crossing = next(lap for lap in selected_after_pit["lap_series"]["benchmark"] if lap["lap_number"] == 2)
+        self.assertTrue(crossing["source_is_clean"])
+        self.assertTrue(crossing["crosses_pit"])
+        self.assertFalse(crossing["is_clean"])
         retired = self.model.archive_comparison("session-1", mode="participant", participant_id="nr-77")
         self.assertEqual(retired["comparison"]["participant_id"], "nr-77")
         self.assertEqual(retired["points"][0]["benchmark_pace_5_ms"], None)
@@ -448,6 +476,63 @@ class TimingReadModelTests(unittest.TestCase):
             bounded = _bounded_archive_lap_rows(laps)
         self.assertEqual([lap["lap_number"] for lap in bounded], [1, 3, 6])
         self.assertTrue(all(lap["break_before"] for lap in bounded))
+
+    def test_archive_manifest_exposes_timeservice_clock_separately_from_seek_time(self):
+        self.connection.execute("UPDATE analysis_sessions SET lifecycle = 'stopped' WHERE id = 'session-1'")
+        for observed_at_us in (2_000_000, 7_000_000):
+            self._add_playback_snapshot(
+                observed_at_us,
+                {
+                    "schema_version": "timing-archive.v1",
+                    "observed_at_us": observed_at_us,
+                    "computed": {"session": {"ours_participant_id": "ours"}},
+                },
+            )
+        self.connection.execute(
+            """
+            INSERT INTO ingest_runs(id,analysis_session_id,reducer_version,started_at_us)
+            VALUES ('clock-run','session-1','test',1000000)
+            """
+        )
+        self.connection.execute(
+            """
+            INSERT INTO ingest_connections(id,ingest_run_id,ordinal,connected_at_us)
+            VALUES ('clock-connection','clock-run',0,1000000)
+            """
+        )
+        provider_first = 10_000_000
+        provider_last = 15_000_000
+        offset = 2_000_000 - (TIME_SERVICE_EPOCH_UNIX_US + provider_first)
+        self.connection.execute(
+            """
+            INSERT INTO connection_clock_calibrations(
+              ingest_connection_id,source_heat_id,calibration_key,provider_timestamp_kind,offset_us,sample_count,
+              median_abs_deviation_us,valid_from_provider_us,valid_to_provider_us,valid_from_observed_at_us,
+              valid_to_observed_at_us,source_message_id,source_key,created_at_us
+            ) VALUES ('clock-connection',?,'clock-1','ts_time',?,1,NULL,?,NULL,2000000,NULL,NULL,'clock:1',2000000)
+            """,
+            (self.heat_id, offset, provider_first),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO connection_clock_samples(
+              ingest_connection_id,source_heat_id,provider_timestamp_raw,provider_timestamp_us,provider_timestamp_kind,
+              received_at_us,source_message_id,source_key,source_event_key,created_at_us
+            ) VALUES
+              ('clock-connection',?,'10000000',10000000,'ts_time',2000000,NULL,'clock:1','clock:1',2000000),
+              ('clock-connection',?,'15000000',15000000,'ts_time',7000000,NULL,'clock:2','clock:2',7000000)
+            """,
+            (self.heat_id, self.heat_id),
+        )
+        self.connection.commit()
+
+        manifest = self.model.archive_manifest("session-1")
+        axes = manifest["time_axes"]
+        self.assertEqual(axes["playback"]["id"], "capture_received")
+        self.assertEqual(axes["playback"]["origin_received_at_us"], 2_000_000)
+        self.assertEqual(axes["source"]["id"], "timeservice")
+        self.assertEqual([anchor["provider_ts_time_us"] for anchor in axes["source"]["anchors"]], [provider_first, provider_last])
+        self.assertEqual(axes["source"]["anchors"][0]["calibrated_utc_at_us"], 2_000_000)
 
     def test_archive_requires_a_stopped_session_with_a_projection(self):
         with self.assertRaises(ReadValidationError):

@@ -1274,6 +1274,8 @@ class TimingNormalizer:
             """,
             (self.heat_id, participant_id),
         ).fetchone()
+        had_opened_pit = opened is not None
+        pit_facts_changed = False
         # The first source row is a baseline, not an observed transition. A
         # capture may begin while a crew is already in pit lane, with a pit
         # count inherited from time before the recording window.
@@ -1311,6 +1313,7 @@ class TimingNormalizer:
                 ),
             )
             if cursor.rowcount:
+                pit_facts_changed = True
                 opened = connection.execute(
                     """
                     SELECT id,stop_number,entered_at_us,entered_lap
@@ -1318,12 +1321,15 @@ class TimingNormalizer:
                     """,
                     (self.heat_id, participant_id, stop_number),
                 ).fetchone()
-        exits_pit = was_in_pit and not now_in_pit
+        # A count-based pit can be opened on a delayed grid update.  On the
+        # next non-pit state it must close just like a state-transition pit;
+        # otherwise an inherited record would falsely span the whole heat.
+        exits_pit = (was_in_pit or had_opened_pit) and not now_in_pit
         if exits_pit and opened is not None:
             duration_ms = self._pit_duration_ms(pit_time_raw)
             if duration_ms is None:
                 duration_ms = max(0, (context.received_at_us - int(opened["entered_at_us"])) // 1_000)
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE pit_stops
                 SET exited_at_us = ?, exited_lap = ?, pit_lane_ms = ?, completed = 1,
@@ -1340,9 +1346,12 @@ class TimingNormalizer:
                     opened["id"],
                 ),
             )
+            pit_facts_changed = bool(cursor.rowcount) or pit_facts_changed
             self._complete_tire_stint(connection, context, participant_id, lap_number)
         else:
             self._ensure_tire_stint(connection, context, participant_id, lap_number)
+        if pit_facts_changed:
+            self._invalidate_clean_laps_for_pit(connection, participant_id)
 
     def _ensure_tire_stint(
         self,
@@ -1721,6 +1730,19 @@ class TimingNormalizer:
         ).fetchone()
         if non_green is not None:
             return False
+        pit_overlap = connection.execute(
+            """
+            SELECT 1 FROM pit_stops
+            WHERE source_heat_id = ? AND participant_id = ?
+              AND completed = 1
+              AND entered_at_us < ?
+              AND (exited_at_us IS NULL OR exited_at_us > ?)
+            LIMIT 1
+            """,
+            (self.heat_id, participant_id, completed_at_us, started_at_us),
+        ).fetchone()
+        if pit_overlap is not None:
+            return False
         gap = connection.execute(
             """
             SELECT 1 FROM ingest_gaps
@@ -1731,6 +1753,35 @@ class TimingNormalizer:
             (self.analysis_session_id, completed_at_us, started_at_us),
         ).fetchone()
         return gap is None
+
+    def _invalidate_clean_laps_for_pit(self, connection: sqlite3.Connection, participant_id: str) -> None:
+        """Remove a clean mark when a later pit fact intersects its full interval."""
+
+        connection.execute(
+            """
+            WITH lap_intervals AS (
+              SELECT id,completed_at_us,
+                     LAG(completed_at_us) OVER (
+                       PARTITION BY participant_id ORDER BY lap_number
+                     ) AS lap_started_at_us
+              FROM laps
+              WHERE source_heat_id = ? AND participant_id = ? AND completed_at_us IS NOT NULL
+            )
+            UPDATE laps
+            SET is_clean = 0, crosses_pit = 1
+            WHERE id IN (
+              SELECT lap_intervals.id
+              FROM lap_intervals
+              JOIN pit_stops AS pit
+                ON pit.source_heat_id = ? AND pit.participant_id = ?
+               AND pit.completed = 1
+               AND pit.entered_at_us < lap_intervals.completed_at_us
+               AND (pit.exited_at_us IS NULL OR pit.exited_at_us > lap_intervals.lap_started_at_us)
+              WHERE lap_intervals.lap_started_at_us IS NOT NULL
+            )
+            """,
+            (self.heat_id, participant_id, self.heat_id, participant_id),
+        )
 
     def _current_flag_kind(self, connection: sqlite3.Connection) -> str | None:
         row = connection.execute(
