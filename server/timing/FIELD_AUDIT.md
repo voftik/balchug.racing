@@ -61,10 +61,14 @@ until their per-column semantics are decoded; they are not universally integers.
   `ON_TRACK` when the TsTime is valid;
 - a new or unrecognized token -> `UNKNOWN`, never a guessed pit or zero time.
 
-Time Service `TsTime` is integer microseconds since `2000-01-01T00:00:00Z`.
-The normalizer stores its raw form and converts only validated values to Unix
-UTC microseconds for `*_at_us` fields. `E<TsTime>` is retained separately as a
-state timer target so it cannot be confused with `LAST`, `BEST` or `L-PIT`.
+Time Service `TsTime` is integer microseconds from a `2000-01-01` epoch, but
+the provider clock is not automatically UTC: the current feed is offset by
+about three hours from receive time. The normalizer stores raw TsTime and
+calibrates provider-clock-to-UTC per connection from `s_i`/`s_t` plus frame
+receive time (median offset). A `*_at_us` field stays `NULL` until calibrated;
+the system never presents epoch arithmetic as a guessed UTC timestamp.
+`E<TsTime>` is retained separately as a state timer target so it cannot be
+confused with `LAST`, `BEST` or `L-PIT`.
 
 Pit entry/exit is not inferred from one text cell alone. The state transition is
 reconciled with `t_p.lastPassingIsInPit` and the source `PIT` count, then
@@ -89,6 +93,25 @@ STATE observation available for replay.
 Known current flag codes: `-1/0` not started, `1` ready, `2` red, `3`
 safety-car/yellow, `4` Code 60, `5` finish, `6` green, `7` FCY. The normalizer
 stores both the code and canonical flag period.
+
+### Flag time and reconciliation
+
+`h_i/h_h.f` is the immediate current-state signal. A changed code opens or
+closes a provisional period at the precise frame receive time and records its
+source key. The provider can send a bare `{f: 2}` patch, so that receive time is
+not falsely represented as a source timestamp.
+
+`a_u.i` is the authoritative caution-history reconciliation: each record has a
+flag kind `k`, raw provider start `f`, raw provider end `t`, clock-stopped `s`
+and remark `r`. After provider-clock calibration, its start/end replace the
+provisional observed boundaries while both raw values and receive provenance are
+retained. `9223372036854775807` means that the period is still open.
+
+Current capture example: the transition to `f=2` arrived at
+`16:20:48.364Z`; caution history records the Red Flag start as raw
+`837026446926000`, calibrated to `16:20:46.926Z`. Repeated `h_h` or `a_u.i`
+updates for the same source period update it in place and never create a second
+RED event.
 
 ## Statistics tab contract
 
