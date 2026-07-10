@@ -4,7 +4,6 @@
   var $ = function (id) { return document.getElementById(id); };
   var grid = $("grid"), countEl = $("count"), moreBtn = $("more");
   var modal = $("modal"), info = $("info"), player = $("player");
-  var timingArchive = $("timingArchive"), timingSelect = $("timingSession");
   var state = {
     offset: 0,
     limit: 48,
@@ -14,9 +13,7 @@
     items: Object.create(null),
     currentItem: null,
     timingEntries: [],
-    timingLoaded: false,
-    timingSelectionEpoch: 0,
-    timingSelectionTimer: 0
+    timingLoaded: false
   };
 
   // ---- форматтеры ----
@@ -92,8 +89,20 @@
       track: track,
       date: date,
       sourceName: String(session.source_name || session.source_slug || "Трасса"),
-      heatName: String(heat.external_name || ("Heat " + generation))
+      heatName: String(heat.external_name || ("Heat " + generation)),
+      firstAtUs: firstNumber([heat.first_at_us, item && item.first_at_us]),
+      lastAtUs: firstNumber([heat.last_at_us, item && item.last_at_us]),
+      pointCount: typeof heat.point_count === "number" && isFinite(heat.point_count) ? heat.point_count : 0
     };
+  }
+  function timingDurationSeconds(entry) {
+    if (!entry || typeof entry.firstAtUs !== "number" || typeof entry.lastAtUs !== "number") return 0;
+    return Math.max(0, Math.round((entry.lastAtUs - entry.firstAtUs) / 1000000));
+  }
+  function compareTimingCoverage(left, right) {
+    var duration = timingDurationSeconds(right) - timingDurationSeconds(left);
+    if (duration) return duration;
+    return (right.pointCount || 0) - (left.pointCount || 0);
   }
   function timingEntriesForItem(item) {
     if (!item || !item.date) return [];
@@ -102,77 +111,24 @@
     if (!itemTrack || !itemMode) return [];
     return state.timingEntries.filter(function (entry) {
       return entry.date === item.date && entry.track === itemTrack && entry.mode === itemMode;
-    });
+    }).sort(compareTimingCoverage);
   }
   function timingEntryTitle(entry) {
-    return modeLabel(entry.mode) + " · " + entry.heatName;
+    var duration = timingDurationSeconds(entry);
+    return modeLabel(entry.mode) + " · " + entry.heatName + (duration ? " · " + fmtDur(duration) : "");
   }
-  function selectedTimingEntry() {
-    var selected = timingSelect && timingSelect.value;
-    return state.timingEntries.find(function (entry) { return timingSelection(entry) === selected; }) || null;
-  }
-  function videoItemsForTimingEntry(entry) {
-    if (!entry) return [];
-    return Object.keys(state.items).map(function (id) { return state.items[id]; }).filter(function (item) {
-      return timingEntriesForItem(item).some(function (candidate) {
-        return timingSelection(candidate) === timingSelection(entry);
-      });
-    });
-  }
-  function renderTimingVideoLinks() {
-    var slot = $("timingVideoRelation");
-    if (!slot) return;
-    slot.replaceChildren();
-    var entry = selectedTimingEntry();
-    var videos = videoItemsForTimingEntry(entry);
-    if (!entry || !videos.length) {
-      slot.hidden = true;
-      return;
-    }
-    slot.hidden = false;
-    var label = document.createElement("span");
-    label.className = "ta-video-label";
-    label.textContent = "Видео совпадающего контекста";
-    var note = document.createElement("span");
-    note.className = "ta-video-note";
-    note.textContent = "Дата, трасса, тип · временные шкалы независимы";
-    var links = document.createElement("div");
-    links.className = "ta-video-links";
-    videos.forEach(function (item) {
-      var button = document.createElement("button");
-      button.type = "button";
-      button.className = "ta-video-link";
-      button.textContent = item.title || "Видео";
-      button.title = "Открыть видео с совпадающим контекстом. Временные шкалы независимы; прямая связь не подтверждена.";
-      button.addEventListener("click", function () { openItem(item.id); });
-      links.appendChild(button);
-    });
-    slot.appendChild(label);
-    slot.appendChild(note);
-    slot.appendChild(links);
-  }
-  function chooseTimingEntry(entry) {
+  function chooseTimingEntry(entry, trigger) {
     var selected = timingSelection(entry);
-    state.timingSelectionEpoch += 1;
-    var epoch = state.timingSelectionEpoch;
-    window.clearTimeout(state.timingSelectionTimer);
-    try { localStorage.setItem("balchug_timing_archive_selection", selected); } catch (error) {}
-    if (timingArchive && timingArchive.scrollIntoView) {
-      timingArchive.scrollIntoView({ behavior: "smooth", block: "start" });
+    var focusReturn = trigger || null;
+    if (modal.classList.contains("open")) {
+      var currentCard = state.currentItem && state.cards[state.currentItem.id];
+      var cardTrigger = currentCard && currentCard.querySelector(".timing-card-link");
+      closeModal();
+      if (cardTrigger) focusReturn = cardTrigger;
     }
-    var attempts = 0;
-    function applySelection() {
-      if (epoch !== state.timingSelectionEpoch) return;
-      attempts += 1;
-      if (!timingSelect || !timingSelect.querySelector('option[value="' + selected + '"]')) {
-        if (attempts < 30) state.timingSelectionTimer = window.setTimeout(applySelection, 100);
-        return;
-      }
-      state.timingSelectionTimer = 0;
-      timingSelect.value = selected;
-      timingSelect.dispatchEvent(new Event("change", { bubbles: true }));
-    }
-    applySelection();
+    window.dispatchEvent(new CustomEvent("balchug:open-timing-archive", {
+      detail: { selection: selected, trigger: focusReturn }
+    }));
   }
   function timingButton(entry, className) {
     var button = document.createElement("button");
@@ -183,7 +139,7 @@
     button.setAttribute("aria-label", "Открыть телеметрию: " + timingEntryTitle(entry) + ". Временная шкала видео независима.");
     button.addEventListener("click", function (event) {
       event.stopPropagation();
-      chooseTimingEntry(entry);
+      chooseTimingEntry(entry, button);
     });
     return button;
   }
@@ -202,7 +158,7 @@
     label.textContent = "Телеметрия совпадающего контекста";
     label.title = "Совпали дата, трасса и тип. Временные шкалы записей независимы.";
     slot.appendChild(label);
-    entries.forEach(function (entry) { slot.appendChild(timingButton(entry, "timing-card-link")); });
+    slot.appendChild(timingButton(entries[0], "timing-card-link"));
   }
   function renderModalTimingLinks(item) {
     var slot = $("timingRelation");
@@ -222,7 +178,7 @@
     note.textContent = "Совпали дата, трасса и тип. Временные шкалы записей независимы; это контекстная, а не временная связь.";
     var links = document.createElement("div");
     links.className = "timing-relation-links";
-    entries.forEach(function (entry) { links.appendChild(timingButton(entry, "timing-relation-link")); });
+    links.appendChild(timingButton(entries[0], "timing-relation-link"));
     slot.appendChild(heading);
     slot.appendChild(note);
     slot.appendChild(links);
@@ -230,7 +186,6 @@
   function refreshTimingLinks() {
     Object.keys(state.cards).forEach(function (id) { renderCardTimingLinks(state.items[id], state.cards[id]); });
     if (state.currentItem) renderModalTimingLinks(state.currentItem);
-    renderTimingVideoLinks();
   }
   function loadTimingEntries() {
     fetch("/api/timing/sessions/archive?limit=50").then(function (response) {
@@ -244,7 +199,7 @@
           if (entry) entries.push(entry);
         });
       });
-      state.timingEntries = entries;
+      state.timingEntries = entries.sort(compareTimingCoverage);
       state.timingLoaded = true;
       refreshTimingLinks();
     }).catch(function () {
@@ -279,13 +234,11 @@
       state.cards = Object.create(null);
       state.items = Object.create(null);
       grid.innerHTML = "";
-      if (state.timingLoaded) renderTimingVideoLinks();
     }
     countEl.textContent = "Загрузка…";
     fetch(API + "/catalog?" + params()).then(function (r) { return r.json(); }).then(function (d) {
       state.total = d.total;
       d.items.forEach(addCard);
-      if (state.timingLoaded) renderTimingVideoLinks();
       state.offset += d.items.length;
       countEl.textContent = "Найдено: " + d.total;
       moreBtn.style.display = state.offset < d.total ? "" : "none";
@@ -483,10 +436,6 @@
   moreBtn.addEventListener("click", function () { load(false); });
 
   if (token()) document.body.classList.add("admin");   // восстановить режим Бориса
-  if (timingSelect) {
-    timingSelect.addEventListener("change", function () { window.setTimeout(renderTimingVideoLinks, 0); });
-    new MutationObserver(function () { window.setTimeout(renderTimingVideoLinks, 0); }).observe(timingSelect, { childList: true });
-  }
   load(true);
   loadTimingEntries();
   if (location.hash === "#boris") openBoris();

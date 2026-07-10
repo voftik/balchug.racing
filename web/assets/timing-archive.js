@@ -4,11 +4,17 @@
   var API = "/api/timing";
   var $ = function (id) { return document.getElementById(id); };
   var root = $("timingArchive");
-  if (!root) return;
+  var modal = $("timingModal");
+  if (!root || !modal) return;
 
   var elements = {
+    modal: modal,
+    close: $("timingClose"),
     select: $("timingSession"),
     empty: $("timingArchiveEmpty"),
+    coverage: $("timingCoverage"),
+    coverageTitle: $("timingCoverageTitle"),
+    coverageText: $("timingCoverageText"),
     body: $("timingArchiveBody"),
     flag: $("timingFlag"),
     observed: $("timingObserved"),
@@ -56,7 +62,14 @@
     chartBase: null,
     chartBaseKey: "",
     chartRangeText: "",
-    observedText: ""
+    observedText: "",
+    entriesLoaded: false,
+    entriesLoading: false,
+    pendingSelection: null,
+    modalOpen: false,
+    focusReturn: null,
+    bodyOverflow: null,
+    coverage: null
   };
 
   function asObject(value) { return value && typeof value === "object" ? value : {}; }
@@ -125,6 +138,82 @@
     }
   }
 
+  function durationSeconds(firstAtUs, lastAtUs) {
+    if (typeof firstAtUs !== "number" || typeof lastAtUs !== "number") return 0;
+    return Math.max(0, Math.round((lastAtUs - firstAtUs) / 1000000));
+  }
+
+  function numericValue(value) {
+    return typeof value === "number" && isFinite(value) ? value : null;
+  }
+
+  function coverageDetails(manifest) {
+    var range = asObject(manifest.range);
+    var heat = asObject(manifest.heat);
+    var coverage = asObject(heat.coverage);
+    var firstAtUs = numericValue(range.first_at_us);
+    var lastAtUs = numericValue(range.last_at_us);
+    var firstSnapshot = asObject((manifest.keyframes || [])[0]);
+    var firstPayload = asObject(firstSnapshot.snapshot);
+    var firstComputed = asObject(asObject(firstPayload.computed).session);
+    var firstFlag = asObject(firstPayload.measured).track_flag;
+    var carriedFinishAtUs = null;
+    var carryFinish = (manifest.markers && manifest.markers.flags || []).some(function (flag) {
+      var carried = flag && flag.flag === "FINISH" && (flag.carried_into_range || (numericValue(flag.started_at_us) !== null && firstAtUs !== null && flag.started_at_us < firstAtUs));
+      if (carried && numericValue(flag.started_at_us) !== null) carriedFinishAtUs = flag.started_at_us;
+      return carried;
+    });
+    var kind = coverage.kind;
+    if (kind !== "replay" && kind !== "partial_capture" && kind !== "terminal_snapshot") {
+      if (carryFinish || (firstFlag && firstFlag.flag === "FINISH" && firstComputed.channel_status === "OFFLINE")) kind = "terminal_snapshot";
+      else if (durationSeconds(firstAtUs, lastAtUs) < 300) kind = "partial_capture";
+      else kind = "replay";
+    }
+    return {
+      kind: kind,
+      sourceStartedAtUs: numericValue(coverage.source_started_at_us),
+      captureStartedAtUs: numericValue(coverage.capture_started_at_us) || firstAtUs,
+      finishAtUs: numericValue(coverage.finish_at_us) || carriedFinishAtUs,
+      missingPrefixUs: numericValue(coverage.missing_prefix_us),
+      firstAtUs: firstAtUs,
+      lastAtUs: lastAtUs,
+      durationSeconds: durationSeconds(firstAtUs, lastAtUs),
+      carryFinish: carryFinish
+    };
+  }
+
+  function renderCoverage(manifest) {
+    var coverage = coverageDetails(manifest);
+    state.coverage = coverage;
+    root.classList.toggle("is-terminal-snapshot", coverage.kind === "terminal_snapshot");
+    if (coverage.kind === "replay") {
+      elements.coverage.hidden = true;
+      elements.coverage.className = "ta-coverage";
+      return;
+    }
+    var captureRange = formatAbsolute(coverage.captureStartedAtUs) + "–" + formatAbsolute(coverage.lastAtUs) + " (" + formatElapsed(coverage.durationSeconds) + ")";
+    var text;
+    if (coverage.kind === "terminal_snapshot") {
+      text = "Сохранён только финальный срез " + captureRange + ".";
+      if (coverage.sourceStartedAtUs !== null) text += " Сессия началась в " + formatAbsolute(coverage.sourceStartedAtUs) + ".";
+      if (coverage.finishAtUs !== null) text += " Финиш был в " + formatAbsolute(coverage.finishAtUs) + ".";
+      text += " Полная запись этой сессии не велась.";
+      elements.coverageTitle.textContent = "Финальный срез";
+      elements.coverage.className = "ta-coverage terminal";
+    } else {
+      text = "Сохранена часть телеметрии: " + captureRange + ". Воспроизведение доступно только для этого интервала.";
+      if (coverage.sourceStartedAtUs !== null && coverage.captureStartedAtUs !== null && coverage.captureStartedAtUs > coverage.sourceStartedAtUs) {
+        text += " Запись началась после старта сессии.";
+      }
+      if (coverage.finishAtUs !== null) text += " Финиш сессии: " + formatAbsolute(coverage.finishAtUs) + ".";
+      if (coverage.missingPrefixUs !== null && coverage.missingPrefixUs > 0) text += " До записи пропущено " + formatElapsed(coverage.missingPrefixUs / 1000000) + ".";
+      elements.coverageTitle.textContent = "Частичная запись";
+      elements.coverage.className = "ta-coverage partial";
+    }
+    elements.coverageText.textContent = text;
+    elements.coverage.hidden = false;
+  }
+
   function modeLabel(mode) {
     return { practice: "Практика", qualifying: "Квалификация", race: "Гонка" }[mode] || valueOrDash(mode);
   }
@@ -186,6 +275,20 @@
 
   function selectEntryId(entry) { return entry.session.id + ":" + entry.heat.generation; }
 
+  function entryDuration(entry) {
+    return durationSeconds(entry.heat && entry.heat.first_at_us, entry.heat && entry.heat.last_at_us);
+  }
+
+  function entryCoverageKind(entry) {
+    return asObject(entry.heat && entry.heat.coverage).kind || "";
+  }
+
+  function compareEntryCoverage(left, right) {
+    var duration = entryDuration(right) - entryDuration(left);
+    if (duration) return duration;
+    return (Number(right.heat && right.heat.point_count) || 0) - (Number(left.heat && left.heat.point_count) || 0);
+  }
+
   function populateSessions(items) {
     state.entries = [];
     elements.select.replaceChildren();
@@ -194,6 +297,7 @@
         state.entries.push({ session: item.session, heat: heat });
       });
     });
+    state.entries.sort(compareEntryCoverage);
     if (!state.entries.length) {
       elements.select.disabled = true;
       setEmpty("Для архива пока нет сессий с сохранённой телеметрией.");
@@ -203,17 +307,47 @@
       var option = document.createElement("option");
       option.value = selectEntryId(entry);
       var duration = Math.max(0, Math.round((entry.heat.last_at_us - entry.heat.first_at_us) / 1000000));
+      var prefix = entryCoverageKind(entry) === "terminal_snapshot" ? "Финальный срез · " : "";
       option.textContent = formatEntryDate(entry.heat.first_at_us, entry.session.timezone_name) + " · " +
         (entry.session.source_name || entry.session.source_slug || "Трасса") + " · " +
-        modeLabel(entry.session.mode) + " · " + (entry.heat.external_name || ("Heat " + entry.heat.generation)) + " · " + formatElapsed(duration);
+        prefix + modeLabel(entry.session.mode) + " · " + (entry.heat.external_name || ("Heat " + entry.heat.generation)) + " · " + formatElapsed(duration);
       elements.select.appendChild(option);
     });
     elements.select.disabled = false;
     var saved = null;
     try { saved = localStorage.getItem(storeKey()); } catch (error) {}
-    var selected = state.entries.some(function (entry) { return selectEntryId(entry) === saved; }) ? saved : selectEntryId(state.entries[0]);
+    var requested = state.pendingSelection;
+    var selected = state.entries.some(function (entry) { return selectEntryId(entry) === requested; }) ? requested :
+      (state.entries.some(function (entry) { return selectEntryId(entry) === saved; }) ? saved : selectEntryId(state.entries[0]));
+    state.pendingSelection = null;
     elements.select.value = selected;
-    loadSelectedEntry();
+    if (state.modalOpen) loadSelectedEntry();
+  }
+
+  function ensureSessionsLoaded() {
+    if (state.entriesLoaded) {
+      var requested = state.pendingSelection;
+      if (requested && state.entries.some(function (entry) { return selectEntryId(entry) === requested; })) {
+        elements.select.value = requested;
+      }
+      state.pendingSelection = null;
+      if (state.modalOpen && state.entries.length) loadSelectedEntry();
+      return;
+    }
+    if (state.entriesLoading) return;
+    state.entriesLoading = true;
+    controlsDisabled(true);
+    setEmpty("Загрузка сохранённой телеметрии…");
+    fetchJson(API + "/sessions/archive?limit=50").then(function (payload) {
+      state.entriesLoaded = true;
+      populateSessions(payload.items || []);
+    }).catch(function (error) {
+      state.entriesLoaded = true;
+      elements.select.disabled = true;
+      setEmpty("Не удалось загрузить телеметрический архив: " + error.message);
+    }).then(function () {
+      state.entriesLoading = false;
+    });
   }
 
   function currentEntry() {
@@ -251,6 +385,10 @@
     state.chartBaseKey = "";
     state.chartRangeText = "";
     state.observedText = "";
+    state.coverage = null;
+    root.classList.remove("is-terminal-snapshot");
+    elements.coverage.hidden = true;
+    elements.coverage.className = "ta-coverage";
     controlsDisabled(true);
     setEmpty("Загрузка телеметрической сессии…");
     try { localStorage.setItem(storeKey(), selectEntryId(entry)); } catch (error) {}
@@ -265,9 +403,10 @@
       elements.range.step = "0.1";
       elements.body.hidden = false;
       elements.empty.hidden = true;
-      controlsDisabled(false);
+      renderCoverage(manifest);
+      controlsDisabled(state.coverage && state.coverage.kind === "terminal_snapshot");
       buildEvents();
-      setAt(state.atUs, true);
+      setAt(state.atUs, !(state.coverage && state.coverage.kind === "terminal_snapshot"));
     }).catch(function (error) {
       if ((error && error.name === "AbortError") || epoch !== state.selectionEpoch) return;
       setEmpty("Архивная телеметрия недоступна: " + error.message);
@@ -298,9 +437,11 @@
     elements.range.value = String((state.atUs - range.first_at_us) / 1000000);
     elements.time.value = formatElapsed((state.atUs - range.first_at_us) / 1000000);
     renderConfirmedSnapshot();
-    drawChart();
-    renderEvents();
-    if (requestExact) scheduleExactSnapshot();
+    if (!(state.coverage && state.coverage.kind === "terminal_snapshot")) {
+      drawChart();
+      renderEvents();
+      if (requestExact) scheduleExactSnapshot();
+    }
   }
 
   function scheduleExactSnapshot() {
@@ -596,8 +737,9 @@
   function buildEvents() {
     if (!state.manifest) return;
     var events = [];
+    var range = state.manifest.range;
     (state.manifest.markers.flags || []).forEach(function (flag, index) {
-      if (typeof flag.started_at_us !== "number") return;
+      if (typeof flag.started_at_us !== "number" || flag.carried_into_range || flag.started_at_us < range.first_at_us || flag.started_at_us > range.last_at_us) return;
       events.push({
         id: "flag:" + flag.started_at_us + ":" + index,
         kind: "flag",
@@ -749,6 +891,49 @@
     setAt(target, true);
   }
 
+  function openTimingModal(detail) {
+    detail = asObject(detail);
+    if (typeof detail.selection === "string" && detail.selection) state.pendingSelection = detail.selection;
+    if (!state.modalOpen) {
+      state.focusReturn = detail.trigger && typeof detail.trigger.focus === "function" ? detail.trigger : document.activeElement;
+      state.bodyOverflow = document.body.style.overflow;
+      state.modalOpen = true;
+      elements.modal.classList.add("open");
+      elements.modal.setAttribute("aria-hidden", "false");
+      document.body.style.overflow = "hidden";
+      window.requestAnimationFrame(function () { elements.close.focus(); });
+    }
+    ensureSessionsLoaded();
+  }
+
+  function closeTimingModal() {
+    if (!state.modalOpen) return;
+    stopPlayback();
+    state.modalOpen = false;
+    elements.modal.classList.remove("open");
+    elements.modal.setAttribute("aria-hidden", "true");
+    document.body.style.overflow = state.bodyOverflow === null ? "" : state.bodyOverflow;
+    state.bodyOverflow = null;
+    var focusReturn = state.focusReturn;
+    state.focusReturn = null;
+    if (focusReturn && document.contains(focusReturn)) window.requestAnimationFrame(function () { focusReturn.focus(); });
+  }
+
+  function trapTimingFocus(event) {
+    if (event.key !== "Tab" || !state.modalOpen) return;
+    var nodes = elements.modal.querySelectorAll("button:not([disabled]),select:not([disabled]),input:not([disabled]),[href]");
+    if (!nodes.length) return;
+    var first = nodes[0];
+    var last = nodes[nodes.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
   elements.select.addEventListener("change", loadSelectedEntry);
   elements.play.addEventListener("click", togglePlayback);
   elements.stepBack.addEventListener("click", function () { step(-1); });
@@ -776,13 +961,14 @@
     var ratio = Math.max(0, Math.min(1, (event.clientX - rect.left - 42) / Math.max(1, rect.width - 52)));
     stopPlayback(); setAt(state.manifest.range.first_at_us + ratio * (state.manifest.range.last_at_us - state.manifest.range.first_at_us), true);
   });
-  window.addEventListener("resize", function () { window.requestAnimationFrame(drawChart); });
+  elements.close.addEventListener("click", closeTimingModal);
+  elements.modal.addEventListener("click", function (event) { if (event.target === elements.modal) closeTimingModal(); });
+  elements.modal.addEventListener("keydown", trapTimingFocus);
+  document.addEventListener("keydown", function (event) { if (event.key === "Escape" && state.modalOpen) closeTimingModal(); });
+  window.addEventListener("balchug:open-timing-archive", function (event) { openTimingModal(event.detail); });
+  window.addEventListener("resize", function () {
+    if (state.modalOpen) window.requestAnimationFrame(drawChart);
+  });
 
   controlsDisabled(true);
-  fetchJson(API + "/sessions/archive?limit=50").then(function (payload) {
-    populateSessions(payload.items || []);
-  }).catch(function (error) {
-    elements.select.disabled = true;
-    setEmpty("Не удалось загрузить телеметрический архив: " + error.message);
-  });
 })();

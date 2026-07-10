@@ -477,6 +477,28 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual([tuple(stint) for stint in stints], [(1, 5, 6, 1), (2, 6, None, 0)])
 
+    def test_initial_in_pit_row_is_a_baseline_not_a_historical_pit_stop(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 20_000_000
+        self.apply(
+            [
+                ["s_i", 20_000_000],
+                [
+                    "r_i",
+                    {
+                        "l": {"h": [{"n": "NR"}, {"n": "STATE"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "LAPS"}, {"n": "PIT"}]},
+                        "r": [[0, 0, "21"], [0, 1, "SIn Pit"], [0, 2, "BALCHUG Racing"], [0, 3, "CN PRO"], [0, 4, "5"], [0, 5, "3"]],
+                    },
+                ],
+            ],
+            received_at_us=received,
+        )
+
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM pit_stops").fetchone()[0], 0)
+        stint = self.connection.execute(
+            "SELECT stint_number,started_lap,completed_laps FROM tire_stints"
+        ).fetchone()
+        self.assertEqual(tuple(stint), (1, 5, 0))
+
     def test_new_heat_timestamp_creates_a_new_source_heat_but_reconnect_does_not(self):
         received = TIME_SERVICE_EPOCH_UNIX_US + 30_000_000
         self.apply([["h_i", {"n": "Heat 1", "s": 30_000_000, "f": 6}], ["s_i", 30_000_000]], received_at_us=received)

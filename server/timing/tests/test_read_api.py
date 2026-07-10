@@ -334,6 +334,76 @@ class TimingReadModelTests(unittest.TestCase):
         with self.assertRaises(ArchiveProjectionMissingError):
             self.model.archive_manifest("session-1")
 
+    def test_archive_window_ends_at_finish_and_marks_carried_flag(self):
+        self.connection.execute("UPDATE analysis_sessions SET lifecycle = 'stopped' WHERE id = 'session-1'")
+        for observed_at_us in (2_000_000, 5_000_000, 7_000_000, 9_000_000):
+            self._add_playback_snapshot(
+                observed_at_us,
+                {
+                    "schema_version": "timing-archive.v1",
+                    "observed_at_us": observed_at_us,
+                    "measured": {"track_flag": {"flag": "GREEN"}},
+                    "computed": {"session": {"position_overall": 1}},
+                },
+            )
+        self.connection.executemany(
+            """
+            INSERT INTO track_flag_periods(
+              source_heat_id,flag,started_at_us,ended_at_us,source_key,created_at_us
+            ) VALUES (?,?,?,?,?,?)
+            """,
+            (
+                (self.heat_id, "RED", 1_000_000, 3_000_000, "flag:red", 1_000_000),
+                (self.heat_id, "FINISH", 6_000_000, None, "flag:finish", 6_000_000),
+            ),
+        )
+        self.connection.commit()
+
+        manifest = self.model.archive_manifest("session-1")
+        self.assertEqual(manifest["range"], {
+            "first_at_us": 2_000_000,
+            "last_at_us": 7_000_000,
+            "source_point_count": 3,
+            "downsampled": False,
+        })
+        self.assertEqual([point["observed_at_us"] for point in manifest["keyframes"]], [2_000_000, 5_000_000, 7_000_000])
+        self.assertEqual(manifest["heat"]["coverage"]["kind"], "partial_capture")
+        self.assertEqual(manifest["heat"]["coverage"]["missing_prefix_us"], 1_000_000)
+        self.assertEqual(manifest["heat"]["coverage"]["finish_at_us"], 6_000_000)
+        self.assertEqual(manifest["heat"]["coverage"]["omitted_tail_point_count"], 1)
+        red = next(flag for flag in manifest["markers"]["flags"] if flag["flag"] == "RED")
+        self.assertTrue(red["carried_into_range"])
+        self.assertEqual(red["started_at_us"], 2_000_000)
+
+        self.assertEqual(self.model.archive_snapshot("session-1", at_us=7_000_000)["playback"]["effective_at_us"], 7_000_000)
+        with self.assertRaises(ReadValidationError):
+            self.model.archive_snapshot("session-1", at_us=9_000_000)
+
+    def test_superseded_archive_is_hidden_from_list_but_remains_directly_readable(self):
+        self.connection.execute("UPDATE analysis_sessions SET lifecycle = 'stopped' WHERE id = 'session-1'")
+        self._add_playback_snapshot(
+            2_000_000,
+            {
+                "schema_version": "timing-archive.v1",
+                "observed_at_us": 2_000_000,
+                "measured": {"track_flag": {"flag": "GREEN"}},
+                "computed": {"session": {"position_overall": 1}},
+            },
+        )
+        self.connection.execute(
+            """
+            INSERT INTO archive_session_replacements(
+              superseded_session_id,canonical_session_id,recording_sha256,frame_count,
+              capture_first_at_us,capture_last_at_us,reason,created_at_us
+            ) VALUES ('session-1','pending-1',?,2,1000000,2000000,'recovered_raw_capture',3000000)
+            """,
+            ("a" * 64,),
+        )
+        self.connection.commit()
+
+        self.assertEqual(self.model.archived_sessions()["items"], [])
+        self.assertEqual(self.model.archive_manifest("session-1")["range"]["first_at_us"], 2_000_000)
+
 
 if __name__ == "__main__":
     unittest.main()

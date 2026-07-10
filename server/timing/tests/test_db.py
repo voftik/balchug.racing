@@ -65,7 +65,7 @@ class TimingDatabaseTests(unittest.TestCase):
     def test_migration_is_repeatable_and_enables_wal(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "timing.db"
-            self.assertEqual(migrate(path), ["0001", "0002", "0003", "0004", "0005", "0006"])
+            self.assertEqual(migrate(path), ["0001", "0002", "0003", "0004", "0005", "0006", "0007"])
             self.assertEqual(migrate(path), [])
             connection = connect(path)
             try:
@@ -354,7 +354,7 @@ class TimingDatabaseTests(unittest.TestCase):
             finally:
                 connection.close()
 
-            self.assertEqual(migrate(path), ["0003", "0004", "0005", "0006"])
+            self.assertEqual(migrate(path), ["0003", "0004", "0005", "0006", "0007"])
             connection = connect(path)
             try:
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM participants").fetchone()[0], 1)

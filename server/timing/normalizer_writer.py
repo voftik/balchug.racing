@@ -1274,7 +1274,11 @@ class TimingNormalizer:
             """,
             (self.heat_id, participant_id),
         ).fetchone()
-        if (was_in_pit is False and now_in_pit) or (count_increased and opened is None):
+        # The first source row is a baseline, not an observed transition. A
+        # capture may begin while a crew is already in pit lane, with a pit
+        # count inherited from time before the recording window.
+        entered_from_state_transition = previous is not None and was_in_pit is False and now_in_pit
+        if entered_from_state_transition or (count_increased and opened is None):
             max_stop = int(
                 connection.execute(
                     "SELECT COALESCE(MAX(stop_number), 0) FROM pit_stops WHERE source_heat_id = ? AND participant_id = ?",

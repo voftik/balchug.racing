@@ -40,6 +40,7 @@ MAX_ARCHIVE_SESSIONS = 100
 # contain more than 500 own laps, so retain the entire plausible engineer
 # timeline while keeping the public manifest bounded.
 MAX_ARCHIVE_MARKERS = 2_000
+ARCHIVE_FINALIZATION_WINDOW_US = 60 * US_PER_SECOND
 
 SCOPE_KINDS = frozenset(("participant", "class", "session"))
 FreshnessStatus = Literal["LIVE", "STALE", "OFFLINE"]
@@ -1126,24 +1127,131 @@ def _require_archived_session(connection: sqlite3.Connection, session_id: str) -
     return session
 
 
-def _archive_heat_rows(connection: sqlite3.Connection, session_id: str) -> list[sqlite3.Row]:
-    return list(
+def _archive_window(
+    connection: sqlite3.Connection,
+    *,
+    heat_id: int,
+    capture_started_at_us: int,
+    transport_tail_end_at_us: int,
+    source_started_at_us: int | None,
+) -> dict[str, int | str | None]:
+    """Select the replayable interval without treating heartbeat tail as racing.
+
+    Providers can continue sending transport keepalives long after a terminal
+    flag. We retain one promptly observed terminal snapshot, then end the
+    playback axis there. A capture that starts after FINISH collapses to one
+    final snapshot instead of masquerading as a short race replay.
+    """
+
+    terminal = connection.execute(
+        """
+        SELECT MIN(COALESCE(calibrated_started_at_us,observed_started_at_us,started_at_us)) AS at_us
+        FROM track_flag_periods
+        WHERE source_heat_id = ? AND flag = 'FINISH'
+          AND COALESCE(calibrated_started_at_us,observed_started_at_us,started_at_us) <= ?
+        """,
+        (heat_id, transport_tail_end_at_us),
+    ).fetchone()["at_us"]
+    finish_at_us = int(terminal) if terminal is not None else None
+    view_ended_at_us = transport_tail_end_at_us
+    if finish_at_us is not None:
+        final = connection.execute(
+            """
+            SELECT observed_at_us
+            FROM playback_snapshots
+            WHERE source_heat_id = ? AND observed_at_us >= ?
+            ORDER BY observed_at_us,observed_second
+            LIMIT 1
+            """,
+            (heat_id, finish_at_us),
+        ).fetchone()
+        if final is not None and int(final["observed_at_us"]) - finish_at_us <= ARCHIVE_FINALIZATION_WINDOW_US:
+            view_ended_at_us = int(final["observed_at_us"])
+        elif finish_at_us < capture_started_at_us:
+            view_ended_at_us = capture_started_at_us
+        else:
+            previous = connection.execute(
+                """
+                SELECT observed_at_us
+                FROM playback_snapshots
+                WHERE source_heat_id = ? AND observed_at_us <= ?
+                ORDER BY observed_at_us DESC,observed_second DESC
+                LIMIT 1
+                """,
+                (heat_id, finish_at_us),
+            ).fetchone()
+            if previous is not None:
+                view_ended_at_us = int(previous["observed_at_us"])
+
+    point_count = int(
         connection.execute(
             """
-            SELECT h.id,h.analysis_session_id,h.generation,h.external_name,h.provider_started_at_us,
-                   h.provider_finished_at_us,h.created_at_us,
-                   MIN(p.observed_at_us) AS first_at_us,MAX(p.observed_at_us) AS last_at_us,
-                   COUNT(*) AS point_count,MIN(p.projection_version) AS projection_version,
-                   MAX(p.metric_version) AS metric_version
-            FROM source_heats h
-            JOIN playback_snapshots p ON p.source_heat_id = h.id
-            WHERE h.analysis_session_id = ?
-            GROUP BY h.id
-            ORDER BY h.generation,h.id
+            SELECT COUNT(*) FROM playback_snapshots
+            WHERE source_heat_id = ? AND observed_at_us >= ? AND observed_at_us <= ?
             """,
-            (session_id,),
-        ).fetchall()
+            (heat_id, capture_started_at_us, view_ended_at_us),
+        ).fetchone()[0]
     )
+    omitted_tail_point_count = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM playback_snapshots WHERE source_heat_id = ? AND observed_at_us > ?",
+            (heat_id, view_ended_at_us),
+        ).fetchone()[0]
+    )
+    missing_prefix_us = (
+        max(0, capture_started_at_us - int(source_started_at_us))
+        if source_started_at_us is not None
+        else None
+    )
+    coverage_kind = "replay"
+    if finish_at_us is not None and capture_started_at_us > finish_at_us:
+        coverage_kind = "terminal_snapshot"
+    elif missing_prefix_us:
+        coverage_kind = "partial_capture"
+    return {
+        "first_at_us": capture_started_at_us,
+        "last_at_us": view_ended_at_us,
+        "point_count": point_count,
+        "capture_started_at_us": capture_started_at_us,
+        "transport_tail_end_at_us": transport_tail_end_at_us,
+        "finish_at_us": finish_at_us,
+        "missing_prefix_us": missing_prefix_us,
+        "omitted_tail_point_count": omitted_tail_point_count,
+        "coverage_kind": coverage_kind,
+    }
+
+
+def _archive_heat_rows(connection: sqlite3.Connection, session_id: str) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT h.id,h.analysis_session_id,h.generation,h.external_name,h.provider_started_at_us,
+               h.provider_finished_at_us,h.created_at_us,
+               MIN(p.observed_at_us) AS raw_first_at_us,MAX(p.observed_at_us) AS raw_last_at_us,
+               COUNT(*) AS raw_point_count,MIN(p.projection_version) AS projection_version,
+               MAX(p.metric_version) AS metric_version
+        FROM source_heats h
+        JOIN playback_snapshots p ON p.source_heat_id = h.id
+        WHERE h.analysis_session_id = ?
+        GROUP BY h.id
+        ORDER BY h.generation,h.id
+        """,
+        (session_id,),
+    ).fetchall()
+    heats: list[dict[str, Any]] = []
+    for row in rows:
+        heat = dict(row)
+        heat.update(
+            _archive_window(
+                connection,
+                heat_id=int(row["id"]),
+                capture_started_at_us=int(row["raw_first_at_us"]),
+                transport_tail_end_at_us=int(row["raw_last_at_us"]),
+                source_started_at_us=row["provider_started_at_us"],
+            )
+        )
+        heat["raw_point_count"] = int(row["raw_point_count"])
+        heats.append(heat)
+    return heats
 
 
 def _select_archive_heat(
@@ -1151,7 +1259,7 @@ def _select_archive_heat(
     *,
     session_id: str,
     generation: int | None,
-) -> tuple[sqlite3.Row, list[sqlite3.Row]]:
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     if generation is not None and (type(generation) is not int or generation < 1):
         raise ReadValidationError("generation must be a positive integer")
     heats = _archive_heat_rows(connection, session_id)
@@ -1201,16 +1309,18 @@ def _archive_point_rows(
     connection: sqlite3.Connection,
     *,
     heat_id: int,
+    first_at_us: int,
+    last_at_us: int,
     max_points: int,
 ) -> tuple[list[sqlite3.Row], int]:
     metadata = connection.execute(
         """
         SELECT observed_second,observed_at_us,is_event_boundary
         FROM playback_snapshots
-        WHERE source_heat_id = ?
+        WHERE source_heat_id = ? AND observed_at_us >= ? AND observed_at_us <= ?
         ORDER BY observed_at_us,observed_second
         """,
-        (heat_id,),
+        (heat_id, first_at_us, last_at_us),
     ).fetchall()
     count = len(metadata)
     if count <= max_points:
@@ -1232,10 +1342,11 @@ def _archive_point_rows(
         SELECT observed_second,observed_at_us,source_frame_id,source_message_id,source_key,
                projection_version,metric_version,is_event_boundary,payload_codec,payload,payload_sha256
         FROM playback_snapshots
-        WHERE source_heat_id = ? AND observed_second IN ({placeholders})
+        WHERE source_heat_id = ? AND observed_at_us >= ? AND observed_at_us <= ?
+          AND observed_second IN ({placeholders})
         ORDER BY observed_at_us,observed_second
         """,
-        (heat_id, *selected_seconds),
+        (heat_id, first_at_us, last_at_us, *selected_seconds),
     ).fetchall()
     return list(rows), count
 
@@ -1297,21 +1408,27 @@ def _archive_markers(
         """,
         (heat_id, first_at_us, last_at_us, MAX_ARCHIVE_MARKERS),
     ).fetchall()
-    return {
-        "flags": [
+    flags = []
+    for row in flag_rows:
+        started_at_us = authoritative(
+            row["calibrated_started_at_us"], row["observed_started_at_us"], row["started_at_us"]
+        )
+        ended_at_us = authoritative(
+            row["calibrated_ended_at_us"], row["observed_ended_at_us"], row["ended_at_us"]
+        )
+        carried_into_range = started_at_us is not None and int(started_at_us) < first_at_us
+        flags.append(
             {
                 "flag": row["flag"],
                 "provider_code": row["provider_code"],
                 "provider_label": row["provider_label"],
-                "started_at_us": authoritative(
-                    row["calibrated_started_at_us"], row["observed_started_at_us"], row["started_at_us"]
-                ),
-                "ended_at_us": authoritative(
-                    row["calibrated_ended_at_us"], row["observed_ended_at_us"], row["ended_at_us"]
-                ),
+                "started_at_us": max(first_at_us, int(started_at_us)) if started_at_us is not None else first_at_us,
+                "ended_at_us": min(last_at_us, int(ended_at_us)) if ended_at_us is not None else None,
+                "carried_into_range": carried_into_range,
             }
-            for row in flag_rows
-        ],
+        )
+    return {
+        "flags": flags,
         "pits": [
             {
                 "participant_id": row["participant_id"],
@@ -1341,7 +1458,7 @@ def _archive_markers(
     }
 
 
-def _archive_heat_summary(row: sqlite3.Row) -> dict[str, Any]:
+def _archive_heat_summary(row: Mapping[str, Any]) -> dict[str, Any]:
     return {
         **_heat_payload(row),
         "first_at_us": int(row["first_at_us"]),
@@ -1349,6 +1466,16 @@ def _archive_heat_summary(row: sqlite3.Row) -> dict[str, Any]:
         "point_count": int(row["point_count"]),
         "projection_version": int(row["projection_version"]),
         "metric_version": int(row["metric_version"]),
+        "coverage": {
+            "kind": row["coverage_kind"],
+            "source_started_at_us": row["provider_started_at_us"],
+            "capture_started_at_us": int(row["capture_started_at_us"]),
+            "finish_at_us": row["finish_at_us"],
+            "transport_tail_end_at_us": int(row["transport_tail_end_at_us"]),
+            "missing_prefix_us": row["missing_prefix_us"],
+            "omitted_tail_point_count": int(row["omitted_tail_point_count"]),
+            "raw_point_count": int(row["raw_point_count"]),
+        },
     }
 
 
@@ -1375,6 +1502,11 @@ def read_archived_sessions(
             JOIN source_heats h ON h.analysis_session_id = s.id
             JOIN playback_snapshots p ON p.source_heat_id = h.id
             WHERE s.lifecycle IN ('stopped','aborted')
+              AND NOT EXISTS (
+                SELECT 1
+                FROM archive_session_replacements replacement
+                WHERE replacement.superseded_session_id = s.id
+              )
             GROUP BY s.id
             ORDER BY last_at_us DESC,s.created_at_us DESC
             LIMIT ?
@@ -1384,13 +1516,16 @@ def read_archived_sessions(
         items: list[dict[str, Any]] = []
         for row in rows:
             heats = [_archive_heat_summary(heat) for heat in _archive_heat_rows(connection, row["id"])]
+            first_at_us = min(int(heat["first_at_us"]) for heat in heats)
+            last_at_us = max(int(heat["last_at_us"]) for heat in heats)
+            point_count = sum(int(heat["point_count"]) for heat in heats)
             items.append(
                 {
                     "session": _session_payload(row),
-                    "first_at_us": int(row["first_at_us"]),
-                    "last_at_us": int(row["last_at_us"]),
+                    "first_at_us": first_at_us,
+                    "last_at_us": last_at_us,
                     "heat_count": int(row["heat_count"]),
-                    "point_count": int(row["point_count"]),
+                    "point_count": point_count,
                     "heats": heats,
                 }
             )
@@ -1418,6 +1553,8 @@ def read_archive_manifest(
         point_rows, source_point_count = _archive_point_rows(
             connection,
             heat_id=int(heat["id"]),
+            first_at_us=int(heat["first_at_us"]),
+            last_at_us=int(heat["last_at_us"]),
             max_points=max_points,
         )
         first_at_us = int(heat["first_at_us"])
@@ -1493,11 +1630,11 @@ def read_archive_snapshot(
             """
             SELECT observed_at_us
             FROM playback_snapshots
-            WHERE source_heat_id = ? AND observed_at_us > ?
+            WHERE source_heat_id = ? AND observed_at_us > ? AND observed_at_us <= ?
             ORDER BY observed_at_us,observed_second
             LIMIT 1
             """,
-            (int(heat["id"]), requested_at_us),
+            (int(heat["id"]), requested_at_us, last_at_us),
         ).fetchone()
         return {
             "schema_version": ARCHIVE_SCHEMA_VERSION,
