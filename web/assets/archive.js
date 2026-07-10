@@ -155,7 +155,7 @@
     slot.hidden = false;
     var label = document.createElement("span");
     label.className = "timing-card-label";
-    label.textContent = "Телеметрия совпадающего контекста";
+    label.textContent = "Телеметрия трассы";
     label.title = "Совпали дата, трасса и тип. Временные шкалы записей независимы.";
     slot.appendChild(label);
     slot.appendChild(timingButton(entries[0], "timing-card-link"));
@@ -172,7 +172,7 @@
     slot.hidden = false;
     var heading = document.createElement("div");
     heading.className = "timing-relation-title";
-    heading.textContent = "Телеметрия совпадающего контекста";
+    heading.textContent = "Телеметрия трассы";
     var note = document.createElement("p");
     note.className = "timing-relation-note";
     note.textContent = "Совпали дата, трасса и тип. Временные шкалы записей независимы; это контекстная, а не временная связь.";

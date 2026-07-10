@@ -42,10 +42,13 @@
     color:var(--navy);line-height:1.25;}
   .rec .meta{font-size:11.5px;color:var(--muted);display:flex;flex-wrap:wrap;gap:4px 10px;}
   .rec .meta b{color:var(--navy);font-weight:600;}
-  .timing-card-relation{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-top:2px;padding-top:8px;border-top:1px dashed var(--line);}
-  .timing-card-label{font-family:var(--display);font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);}
-  .timing-card-link{min-width:0;border:0;background:transparent;padding:0;color:var(--navy);font:10px var(--display);text-align:left;text-decoration:underline;text-decoration-color:#b8c3d2;text-underline-offset:3px;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-  .timing-card-link:hover,.timing-card-link:focus-visible{color:var(--red);text-decoration-color:currentColor;outline:0;}
+  .timing-card-relation{display:flex;align-items:center;flex-wrap:wrap;gap:7px;margin-top:2px;padding-top:9px;border-top:1px dashed var(--line);}
+  .timing-card-label{flex:0 0 100%;font-family:var(--display);font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);}
+  .timing-card-link,.timing-relation-link{display:inline-flex;align-items:center;justify-content:center;min-height:40px;
+    border:1px solid var(--red);border-radius:6px;background:var(--red);padding:9px 12px;color:#fff;font:11px/1.25 var(--display);
+    text-align:center;text-transform:uppercase;letter-spacing:.04em;cursor:pointer;box-shadow:0 8px 16px -11px rgba(240,20,61,.9);transition:.15s;}
+  .timing-card-link{flex:1 1 100%;width:100%;}
+  .timing-card-link:hover,.timing-card-link:focus-visible,.timing-relation-link:hover,.timing-relation-link:focus-visible{background:var(--navy);border-color:var(--navy);color:#fff;outline:2px solid var(--red);outline-offset:2px;}
 
   /* Индикация включённого режима на обоих триггерах Бориса. */
   body.admin .boris-btn{background:var(--ok);border-color:var(--ok);color:#06121f;}
@@ -92,8 +95,6 @@
   .timing-relation-title{font-family:var(--display);font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--navy);}
   .timing-relation-note{margin:5px 0 9px;font-size:12px;line-height:1.45;color:var(--muted);}
   .timing-relation-links{display:flex;flex-wrap:wrap;gap:7px;}
-  .timing-relation-link{border:1px solid #cbd5e2;border-radius:6px;background:#fff;padding:7px 9px;color:var(--navy);font:10px var(--display);cursor:pointer;}
-  .timing-relation-link:hover,.timing-relation-link:focus-visible{border-color:var(--red);color:var(--red);outline:0;}
   /* админ-правка */
   .admin-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:14px;padding-top:12px;border-top:1px dashed var(--line);}
   .admin-row input{font-size:12.5px;border:1px solid var(--line);border-radius:7px;padding:7px 9px;}
@@ -297,7 +298,7 @@
   </footer>
 
   <script src="/assets/hls.min.js"></script>
-  <script src="/assets/archive.js?v=20260711-archive-timing-modal"></script>
+  <script src="/assets/archive.js?v=20260711-timing-card-cta"></script>
   <script src="/assets/timing-archive.js?v=20260711-archive-timing-modal"></script>
 </body>
 </html>
