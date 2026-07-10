@@ -39,6 +39,12 @@ ssh "$HOST" 'bash -s' <<'REMOTE'
 set -euo pipefail
 KEY="$(tr -d '[:space:]' < /etc/balchug/stream.key)"
 
+# Keep every deployed Python service on the dependencies declared by this
+# revision before migrations or systemd restarts load new modules.
+test -x /opt/balchug_racing/venv/bin/pip
+/opt/balchug_racing/venv/bin/pip install --disable-pip-version-check --quiet \
+  -r /opt/balchug_racing/requirements.txt
+
 # веб-файлы + рендер stream key в плеере
 # cp не удаляет устаревшие каталоги: очищаем снятые с публикации разделы явно,
 # не затрагивая HLS, stat.xsl и ACME-челленджи в web-root.
@@ -95,6 +101,10 @@ case "$LLM_PROXY" in
 esac
 
 systemctl restart balchug-api balchug-transcode
+if systemctl list-unit-files balchug-timing-api.service >/dev/null 2>&1; then
+  systemctl enable --now balchug-timing-api
+  systemctl restart balchug-timing-api
+fi
 if systemctl list-unit-files balchug-merger.service >/dev/null 2>&1; then
   systemctl enable --now balchug-merger >/dev/null 2>&1 || true
   systemctl restart balchug-merger || true

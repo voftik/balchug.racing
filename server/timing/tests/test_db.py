@@ -65,7 +65,7 @@ class TimingDatabaseTests(unittest.TestCase):
     def test_migration_is_repeatable_and_enables_wal(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "timing.db"
-            self.assertEqual(migrate(path), ["0001"])
+            self.assertEqual(migrate(path), ["0001", "0002"])
             self.assertEqual(migrate(path), [])
             connection = connect(path)
             try:

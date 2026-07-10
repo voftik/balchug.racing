@@ -87,3 +87,34 @@ for a 24-hour analysis session, then keep at least 10 GB free under
 `/var/lib/balchug` before race day. The seven-day raw-retention policy is only
 applied to stopped sessions after a checkpoint exists; normalized analytics and
 backups are not removed by that command.
+
+## Engineer session lifecycle
+
+The timing lifecycle API is a separate loopback service on port `8091`, exposed
+by nginx as `/api/timing/`. It owns session intent only; it never opens an
+upstream WebSocket inside an HTTP request. The ingest supervisor added later
+observes active rows in `timing.db`.
+
+Write calls require an `Authorization: Bearer` value matching `ENGINEER_TOKEN`
+in `/etc/balchug/secrets.env`, plus an `Idempotency-Key`. This is deliberately
+not the archive `ADMIN_TOKEN` and is never returned by `/api/boris`.
+
+```text
+POST /api/timing/sources/igora/sessions
+POST /api/timing/sessions/{id}/start
+POST /api/timing/sessions/{id}/stop
+POST /api/timing/sessions/{id}/abort
+GET  /api/timing/sources/igora/sessions/active
+```
+
+The create body is intentionally constrained:
+
+```json
+{"mode":"practice"}
+{"mode":"qualifying"}
+{"mode":"race","race_duration_s":14400,"required_pits":2}
+```
+
+Race duration accepts only 4, 6, 12 or 24 hours in seconds; required pits are
+2 through 8. Extra fields and all manual identity, class, tyre, fuel or driver
+configuration are rejected.

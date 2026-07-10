@@ -1,0 +1,21 @@
+[Unit]
+Description=Balchug Racing - Timing lifecycle API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/balchug/secrets.env
+Environment=PYTHONPATH=/opt/balchug_racing/server
+Environment=TIMING_DB=/var/lib/balchug/timing.db
+WorkingDirectory=/opt/balchug_racing/server
+ExecStart=/opt/balchug_racing/venv/bin/uvicorn timing.api:app --host 127.0.0.1 --port 8091 --workers 1
+Restart=on-failure
+RestartSec=3
+User=www-data
+Group=www-data
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

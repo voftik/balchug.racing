@@ -2,5 +2,6 @@
 boto3>=1.34
 aiohttp>=3.10,<4
 fastapi>=0.110
+httpx>=0.27,<1
 lzstring>=1.0.4,<2
 uvicorn>=0.29
