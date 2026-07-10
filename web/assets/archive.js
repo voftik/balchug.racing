@@ -50,7 +50,7 @@
   function modeKey(value) {
     var key = textKey(value);
     if (!key) return "";
-    if (key === "practice" || key.indexOf("practice") !== -1 || key.indexOf("практик") !== -1 || key.indexOf("open pit") !== -1 || key.indexOf("free") !== -1) return "practice";
+    if (key === "practice" || key.indexOf("practice") !== -1 || key.indexOf("практик") !== -1 || key.indexOf("тренировк") !== -1 || key.indexOf("open pit") !== -1 || key.indexOf("free") !== -1) return "practice";
     if (key === "qualifying" || key.indexOf("qualif") !== -1 || key.indexOf("квалиф") !== -1) return "qualifying";
     if (key === "race" || key.indexOf("race") !== -1 || key.indexOf("гонк") !== -1) return "race";
     return "";
