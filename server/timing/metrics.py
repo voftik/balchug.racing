@@ -154,7 +154,10 @@ class PaceMetrics:
 
 
 def calculate_pace_metrics(
-    laps: Sequence[LapSample], *, include_slow_lap_history: bool = True
+    laps: Sequence[LapSample],
+    *,
+    include_slow_lap_history: bool = True,
+    slow_lap_window: int | None = None,
 ) -> PaceMetrics:
     """Calculate Pace3/5/10, robust consistency, and clean-lap anomalies.
 
@@ -181,13 +184,20 @@ def calculate_pace_metrics(
     p10 = _percentile(last10, 0.10) if len(last10) == 10 else None
     p90 = _percentile(last10, 0.90) if len(last10) == 10 else None
     range10 = p90 - p10 if p10 is not None and p90 is not None else None
+    if slow_lap_window is not None and (type(slow_lap_window) is not int or slow_lap_window < 1):
+        raise ValueError("slow_lap_window must be a positive integer or None")
     if not include_slow_lap_history or len(clean) < 11:
         slow_lap_numbers: tuple[int, ...] | None = None
     else:
+        # Slow-lap alerts are operationally relevant near the live tail. Keep
+        # ten baseline laps before the configured evaluation window so the
+        # first retained candidate still has an unchanged robust threshold.
+        start_index = max(10, len(clean) - (slow_lap_window or len(clean)))
         anomalies: list[int] = []
-        for index, lap in enumerate(clean):
-            prior = [float(previous.duration_ms) for previous in clean[max(0, index - 10) : index]]
-            if len(prior) != 10 or lap.lap_number is None:
+        for index in range(start_index, len(clean)):
+            lap = clean[index]
+            prior = [float(previous.duration_ms) for previous in clean[index - 10 : index]]
+            if lap.lap_number is None:
                 continue
             prior_pace = _median(prior)
             prior_mad = mad_ms(prior)

@@ -62,6 +62,8 @@ CATCH_ALERT_LAPS = 5.0
 SCHEDULE_DEVIATION_ALERT_S = 900.0
 STINT_TREND_MAX_POINTS = 60
 """Bound robust degradation regression to the tactically current tyre window."""
+SLOW_LAP_MAX_CLEAN_LAPS = 120
+"""Retain current anomaly evidence without rescanning a 24-hour session."""
 
 
 @dataclass(frozen=True)
@@ -479,8 +481,12 @@ def _theil_sen_slope(points: Sequence[tuple[int, int]]) -> float | None:
     return ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2.0
 
 
-def _slow_lap_events(samples: Sequence[LapSample]) -> tuple[dict[str, int | float], ...]:
+def _slow_lap_events(
+    samples: Sequence[LapSample], *, max_recent_clean_laps: int = SLOW_LAP_MAX_CLEAN_LAPS
+) -> tuple[dict[str, int | float], ...]:
     clean = [sample for sample in samples if is_clean_lap(sample) and sample.duration_ms is not None]
+    if max_recent_clean_laps > 0 and len(clean) > max_recent_clean_laps + 10:
+        clean = clean[-(max_recent_clean_laps + 10) :]
     events: list[dict[str, int | float]] = []
     for index, sample in enumerate(clean):
         prior = [candidate.duration_ms for candidate in clean[max(0, index - 10) : index] if candidate.duration_ms is not None]
@@ -2160,7 +2166,10 @@ def evaluate_heat_metrics(
         for participant in heat.participants
     }
     pace_by_participant = {
-        participant.id: calculate_pace_metrics(lap_samples_by_participant[participant.id])
+        participant.id: calculate_pace_metrics(
+            lap_samples_by_participant[participant.id],
+            slow_lap_window=SLOW_LAP_MAX_CLEAN_LAPS,
+        )
         for participant in heat.participants
     }
     class_orders = {scope.key: _class_order(scope) for scope in heat.class_scopes}
