@@ -1,37 +1,58 @@
 {
-  "_comment": "Календарь гоночного сезона для авто-аннотации записей трансляций. Источники: rusendurance.com (REC 2026) и rskg.smpracing.ru/calendar (СМП РСКГ Эндуранс 2026). start_date включает тестовые/тренировочные дни перед официальной программой. Названия трасс (track) должны совпадать со справочником dictionaries.json / фильтрами каталога; track_display — русское название для заголовков.",
+  "_comment": "Календарь гоночного сезона для авто-аннотации записей трансляций. Источники: rusendurance.com, rskg.smpracing.ru/calendar, новости СМИ (zr.ru, auto.mail.ru) и анонсы команды. start_date включает тестовые/тренировочные дни перед официальной программой. Названия трасс (track) должны совпадать со справочником dictionaries.json / фильтрами каталога; track_display — русское название для заголовков. team_entry у события — состав и результат нашего экипажа (попадает в аннотации и поиск архива); заполнять после этапов.",
   "team": {
     "name": "BALCHUG Racing",
     "number": 21,
     "class": "CN Pro",
-    "car": "спортпрототип CN",
+    "car": "Ligier JS53 Evo2 (спортпрототип CN)",
     "series_main": "Russian Endurance Challenge (REC)",
-    "pilots": ["Кирилл Киракозов", "Михаил Лобода", "Роман Русинов"]
+    "pilots": ["Кирилл Киракозов", "Михаил Лобода"],
+    "smp_sprint": "В РСКГ Спринт (Спортпрототип CN, Shortcut 527) цвета команды защищают Борис Шульмейстер (№15) и Сергей Валуйских (№93)"
   },
   "events": [
     {
       "series": "REC", "season": 2026, "stage": "Этап 1", "name": "Гран-при Авто Mail",
       "track": "Moscow Raceway", "track_display": "Moscow Raceway",
       "start_date": "2026-05-28", "end_date": "2026-05-30", "race_date": "2026-05-30",
-      "format": "Гонка 4 часа"
+      "format": "Гонка 4 часа",
+      "team_entry": {
+        "pilots": ["Михаил Лобода", "Кирилл Киракозов"],
+        "result": "P3 в классе CN Pro (15 очков)",
+        "notes": "Дождевая гонка; победитель абсолюта — Vracing №90 (Audi R8 GT3)."
+      }
     },
     {
-      "series": "REC", "season": 2026, "stage": "Этап 2", "name": "",
+      "series": "REC", "season": 2026, "stage": "Этап 2", "name": "Гран-при Спортса",
       "track": "Moscow Raceway", "track_display": "Moscow Raceway",
       "start_date": "2026-06-25", "end_date": "2026-06-27", "race_date": "2026-06-27",
-      "format": "Гонка 4 часа"
+      "format": "Гонка 4 часа",
+      "team_entry": {
+        "pilots": ["Кирилл Киракозов", "Роман Русинов"],
+        "result": "P2 в классе CN Pro",
+        "notes": "Экипаж этапа: Кирилл Киракозов и Роман Русинов."
+      }
     },
     {
-      "series": "REC", "season": 2026, "stage": "Этап 3", "name": "",
+      "series": "REC", "season": 2026, "stage": "Этап 3", "name": "Гран-при Санкт-Петербурга",
       "track": "Igora Drive", "track_display": "Игора Драйв",
       "start_date": "2026-07-09", "end_date": "2026-07-11", "race_date": "2026-07-11",
-      "format": "Гонка 4 часа"
+      "format": "Гонка 4 часа (VTB REC Игора Драйв)",
+      "team_entry": {
+        "pilots": ["Кирилл Киракозов", "Михаил Лобода"],
+        "result": "",
+        "notes": "Заявленный состав сезона."
+      }
     },
     {
       "series": "REC", "season": 2026, "stage": "Этап 4", "name": "",
       "track": "Moscow Raceway", "track_display": "Moscow Raceway",
       "start_date": "2026-07-30", "end_date": "2026-08-01", "race_date": "2026-08-01",
-      "format": "Гонка 4 часа"
+      "format": "Гонка 4 часа",
+      "team_entry": {
+        "pilots": ["Кирилл Киракозов", "Михаил Лобода"],
+        "result": "",
+        "notes": "Заявленный состав сезона."
+      }
     },
     {
       "series": "REC", "season": 2026, "stage": "Этап 5", "name": "500 вёрст",

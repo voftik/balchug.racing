@@ -8,6 +8,7 @@ secrets.env
 # --- локальные артефакты агентов/IDE ---
 .claude/
 .omc/
+.playwright-cli/
 .DS_Store
 .idea/
 .vscode/

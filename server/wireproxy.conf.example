@@ -1,0 +1,29 @@
+# Шаблон /etc/wireproxy/wireproxy.conf — WireGuard-туннель (userspace) для
+# исходящих LLM-запросов аннотатора (OpenRouter блокирует IP российских ДЦ).
+#
+# Важно: это НЕ wg-quick. Маршрутизация сервера не меняется — RTMP/SSH/сайт
+# продолжают ходить напрямую. Через туннель идёт только трафик, отправленный
+# в локальный HTTP CONNECT прокси (секция [http] ниже), который аннотатор
+# использует через LLM_PROXY=http://127.0.0.1:25345 (см. secrets.env.example).
+#
+# Установка:
+#   1) бинарь: https://github.com/pufferffish/wireproxy (wireproxy_linux_amd64)
+#      → /usr/local/bin/wireproxy
+#   2) этот файл с реальными ключами → /etc/wireproxy/wireproxy.conf (chmod 600)
+#   3) юнит server/systemd/wireproxy.service → systemctl enable --now wireproxy
+#   4) проверка: curl -x http://127.0.0.1:25345 https://api.ipify.org
+
+[Interface]
+PrivateKey = <клиентский-приватный-ключ-wireguard>
+Address = <адрес-клиента, напр. 10.8.0.8/24>
+DNS = 1.1.1.1
+MTU = 1420
+
+[Peer]
+PublicKey = <публичный-ключ-сервера>
+PresharedKey = <preshared-key, если задан>
+AllowedIPs = 0.0.0.0/0
+Endpoint = <хост:порт wireguard-сервера>
+
+[http]
+BindAddress = 127.0.0.1:25345

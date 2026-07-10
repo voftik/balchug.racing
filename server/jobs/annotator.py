@@ -143,6 +143,11 @@ def _llm_prompt(ev, date_str, start_hms, duration_sec, stype_guess, parts):
             f"По календарю в этот день идёт событие: {ev['series']} {ev['season']}, {ev['stage']}"
             f"{(' «' + ev['name'] + '»') if ev.get('name') else ''}, трасса {ev['track_display']}, "
             f"формат: {ev.get('format', '')}, день гонки: {ev['race_date']}.")
+        te = ev.get("team_entry") or {}
+        if te.get("pilots"):
+            ctx.append("Наш экипаж №21 на этом этапе: " + ", ".join(te["pilots"]) + "."
+                       + ((" Результат этапа: " + te["result"] + ".") if te.get("result") else "")
+                       + ((" " + te["notes"]) if te.get("notes") else ""))
     else:
         ctx.append("В календаре сезона на эту дату события нет (вероятно, тесты или частная трансляция).")
     if parts and len(parts) > 1:
@@ -259,6 +264,29 @@ def annotate(date, start_hms, duration_sec, video_key, video_path=None, parts=No
             if summary:
                 ann["ai_annotation"] = {"session_summary": summary}
             ann["created_by"] = "BALCHUG Racing Stream Annotator (LLM-assisted)"
+
+    # Факты об этапе/экипаже из календаря — в структуру и в описание.
+    # Описание (session_summary) попадает в notes каталога → записи ищутся
+    # по фамилиям пилотов, названию Гран-при и результату.
+    if ev:
+        te = ev.get("team_entry") or {}
+        if te.get("pilots"):
+            ann["event_info"]["pilots"] = te["pilots"]
+        if te.get("result"):
+            ann["event_info"]["team_result"] = te["result"]
+        tail = []
+        if ev.get("name"):
+            tail.append(f"Этап: {ev['name']}.")
+        if te.get("pilots"):
+            tail.append("Пилоты №21: " + ", ".join(te["pilots"]) + ".")
+        if te.get("result"):
+            tail.append("Результат: " + te["result"] + ".")
+        if te.get("notes"):
+            tail.append(te["notes"])
+        if tail:
+            base = (ann.get("ai_annotation") or {}).get("session_summary", "")
+            ann.setdefault("ai_annotation", {})["session_summary"] = \
+                (base + ("\n" if base else "") + " ".join(tail)).strip()
     return ann
 
 

@@ -1,0 +1,18 @@
+[Unit]
+Description=wireproxy — userspace WireGuard HTTP proxy (LLM egress)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/wireproxy/wireproxy.conf
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/bin/wireproxy -n -c /etc/wireproxy/wireproxy.conf
+ExecStart=/usr/local/bin/wireproxy -c /etc/wireproxy/wireproxy.conf
+Restart=on-failure
+RestartSec=5
+User=root
+# Только локальный HTTP CONNECT прокси (127.0.0.1:25345);
+# системная маршрутизация не изменяется.
+
+[Install]
+WantedBy=multi-user.target

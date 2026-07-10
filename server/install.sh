@@ -23,7 +23,7 @@ log "1/8  Системные пакеты"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y build-essential libpcre3-dev zlib1g-dev libssl-dev \
-                   wget git curl ca-certificates certbot ffmpeg rsync
+                   wget git curl ca-certificates certbot ffmpeg gpac rsync
 
 # ---------------------------------------------------------------------------
 log "2/8  Исходники nginx ${NGINX_VERSION} + nginx-http-flv-module (${FLV_MODULE_REF})"
@@ -70,9 +70,10 @@ id -u www-data >/dev/null 2>&1 || useradd -r -s /usr/sbin/nologin www-data
 mkdir -p /var/log/nginx /var/cache/nginx "$WEBROOT/hls"
 # stat.xsl поставляется вместе с модулем
 cp -f "$BUILD_DIR/nginx-http-flv-module/stat.xsl" "$WEBROOT/stat.xsl"
-# Веб-файлы из зеркала проекта (плеер + страницы телеметрии/гонок + ассеты).
-# Копируем всё дерево web/ (index.html, telemetry/, smp-races/, smp-live/, assets/),
-# не трогая сгенерированные hls/ и stat.xsl.
+# Веб-файлы из зеркала проекта (плеер + страницы разделов + ассеты).
+# Копируем всё дерево web/, не трогая сгенерированные hls/ и stat.xsl.
+# cp не удаляет отсутствующие в исходниках каталоги.
+rm -rf "$WEBROOT/smp-live" "$WEBROOT/smp-races"
 cp -rf "$REPO_DIR"/web/. "$WEBROOT"/
 # Рендер stream key в плеере (ключ хранится вне репозитория)
 if [ -f /etc/balchug/stream.key ]; then
