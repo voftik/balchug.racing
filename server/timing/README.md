@@ -47,3 +47,43 @@ inventing data.
 
 Unknown handles are retained in raw recording and counted by the replay reducer;
 they do not crash recording.
+
+## Timing database
+
+`timing.db` is deliberately separate from the archive catalogue database. It
+uses WAL with one ingest writer and short-lived API readers:
+
+```bash
+PYTHONPATH=server python3 -m timing.migrate --db /var/lib/balchug/timing.db
+```
+
+Raw feed events are retained for seven days after a stopped session; normalized
+laps, pits, flags and metrics are retained for replay and analysis. SQLite's
+online backup API is used for backups, so a running ingest writer is not paused.
+
+Review retention without deleting anything, then apply the same policy only
+after inspecting its counts:
+
+```bash
+PYTHONPATH=server python3 -m timing.retention --db /var/lib/balchug/timing.db
+PYTHONPATH=server python3 -m timing.retention --db /var/lib/balchug/timing.db --apply
+```
+
+Create a consistent backup without stopping a writer. The copy is checked with
+SQLite `integrity_check` and `foreign_key_check` before it is published:
+
+```bash
+PYTHONPATH=server python3 -m timing.backup \
+  --db /var/lib/balchug/timing.db \
+  --output /var/lib/balchug/backups/timing-$(date -u +%Y%m%dT%H%M%SZ).db
+```
+
+## Capacity planning
+
+The active Igora Practice capture measured roughly 1.2 MB in 25 minutes, or
+about 70 MB of raw WebSocket data over 24 hours at that cadence. Race traffic
+is deliberately budgeted much higher: reserve 500 MB of raw data and 1 GB total
+for a 24-hour analysis session, then keep at least 10 GB free under
+`/var/lib/balchug` before race day. The seven-day raw-retention policy is only
+applied to stopped sessions after a checkpoint exists; normalized analytics and
+backups are not removed by that command.

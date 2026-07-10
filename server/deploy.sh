@@ -55,6 +55,14 @@ nginx -t && systemctl reload nginx
 cp -f /opt/balchug_racing/server/systemd/*.service /etc/systemd/system/
 systemctl daemon-reload
 
+# Миграции live timing выполняются до перезапуска прикладных сервисов. Это
+# отдельная БД, поэтому catalog.db и архивная часть остаются нетронутыми.
+install -d -o www-data -g www-data -m 0750 /var/lib/balchug
+runuser -u www-data -- env \
+  PYTHONPATH=/opt/balchug_racing/server \
+  TIMING_DB=/var/lib/balchug/timing.db \
+  /opt/balchug_racing/venv/bin/python -m timing.migrate
+
 # Локальный Wireproxy обязателен, когда аннотатор ходит к OpenRouter через него.
 # Не запускаем merger до успешной проверки конфигурации туннеля.
 LLM_PROXY="$(sed -n 's/^LLM_PROXY=//p' /etc/balchug/secrets.env | tail -n 1)"
