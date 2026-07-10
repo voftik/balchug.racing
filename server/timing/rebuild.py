@@ -33,6 +33,9 @@ class RebuildPlan:
     session_id: str
     lifecycle: str
     decoded_frames: int
+    pending_frames: int
+    failed_frames: int
+    ingest_gaps: int
     source_heats: int
     previous_stream_cursor: int
 
@@ -59,17 +62,42 @@ def _session_plan(connection: sqlite3.Connection, session_id: str) -> RebuildPla
         raise RebuildError(f"Analysis session not found: {session_id}")
     if session["lifecycle"] not in {"stopped", "aborted"}:
         raise RebuildError("Only a stopped or aborted analysis session may be rebuilt")
-    decoded_frames = int(
+    frame_counts = {
+        row["decode_state"]: int(row["count"])
+        for row in connection.execute(
+            """
+            SELECT decode_state,COUNT(*) AS count
+            FROM feed_frames
+            WHERE analysis_session_id = ?
+            GROUP BY decode_state
+            """,
+            (session_id,),
+        ).fetchall()
+    }
+    decoded_frames = frame_counts.get("decoded", 0)
+    pending_frames = frame_counts.get("pending", 0)
+    failed_frames = frame_counts.get("failed", 0)
+    if decoded_frames == 0:
+        raise RebuildError("Session has no decoded raw frames to replay")
+    if pending_frames or failed_frames:
+        raise RebuildError(
+            "Session has incomplete raw evidence "
+            f"(pending={pending_frames}, failed={failed_frames}); repair decoding before rebuild"
+        )
+    ingest_gaps = int(
         connection.execute(
             """
-            SELECT COUNT(*) FROM feed_frames
-            WHERE analysis_session_id = ? AND decode_state = 'decoded'
+            SELECT COUNT(*) FROM ingest_gaps
+            WHERE analysis_session_id = ?
             """,
             (session_id,),
         ).fetchone()[0]
     )
-    if decoded_frames == 0:
-        raise RebuildError("Session has no decoded raw frames to replay")
+    if ingest_gaps:
+        raise RebuildError(
+            "Session has "
+            f"{ingest_gaps} persisted ingest gap(s); temporal gap replay is not implemented"
+        )
     source_heats = int(
         connection.execute(
             "SELECT COUNT(*) FROM source_heats WHERE analysis_session_id = ?", (session_id,)
@@ -80,7 +108,16 @@ def _session_plan(connection: sqlite3.Connection, session_id: str) -> RebuildPla
             "SELECT COALESCE(MAX(id), 0) FROM stream_events WHERE analysis_session_id = ?", (session_id,)
         ).fetchone()[0]
     )
-    return RebuildPlan(session_id, session["lifecycle"], decoded_frames, source_heats, previous_stream_cursor)
+    return RebuildPlan(
+        session_id=session_id,
+        lifecycle=session["lifecycle"],
+        decoded_frames=decoded_frames,
+        pending_frames=pending_frames,
+        failed_frames=failed_frames,
+        ingest_gaps=ingest_gaps,
+        source_heats=source_heats,
+        previous_stream_cursor=previous_stream_cursor,
+    )
 
 
 def plan_rebuild(database: str | Path, session_id: str) -> RebuildPlan:
@@ -121,8 +158,24 @@ def _reset_derived_state(connection: sqlite3.Connection, plan: RebuildPlan) -> t
     if len(frames) != plan.decoded_frames:
         raise RebuildError("Decoded frame preflight changed before rebuild began")
 
+    first_message_row = connection.execute(
+        """
+        SELECT f.received_at_us
+        FROM feed_frames f
+        WHERE f.analysis_session_id = ? AND f.decode_state = 'decoded'
+          AND EXISTS (SELECT 1 FROM feed_messages m WHERE m.frame_id = f.id)
+        ORDER BY f.id
+        LIMIT 1
+        """,
+        (plan.session_id,),
+    ).fetchone()
+
     connection.execute("BEGIN IMMEDIATE")
     try:
+        # Re-read all preconditions under the writer lock. This closes the
+        # lifecycle TOCTOU window between a dry plan and destructive reset.
+        if _session_plan(connection, plan.session_id) != plan:
+            raise RebuildError("Rebuild preflight changed before destructive reset")
         # Keep a retention floor for old EventSource cursors. The corresponding
         # rows disappear below, so a connected panel will receive a reset
         # instead of applying a new generation to an old snapshot.
@@ -163,9 +216,32 @@ def _reset_derived_state(connection: sqlite3.Connection, plan: RebuildPlan) -> t
             """,
             (plan.session_id,),
         )
+        previous_max_heat_id = int(
+            connection.execute("SELECT COALESCE(MAX(id), 0) FROM source_heats").fetchone()[0]
+        )
         # All source-heat children are reconstructible normalized facts. Raw
         # frames/messages refer directly to the analysis session and survive.
         connection.execute("DELETE FROM source_heats WHERE analysis_session_id = ?", (plan.session_id,))
+        if first_message_row is not None:
+            remaining_max_heat_id = int(
+                connection.execute("SELECT COALESCE(MAX(id), 0) FROM source_heats").fetchone()[0]
+            )
+            # Deliberately allocate a fresh id rather than allowing SQLite to
+            # reuse the deleted one. Existing SSE clients then see a source-heat
+            # change and reset instead of merging rebuilt deltas into old state.
+            # Empty decoded envelopes have no normalized heat and must not
+            # create a phantom heat during an otherwise no-op replay.
+            connection.execute(
+                """
+                INSERT INTO source_heats(id,analysis_session_id,generation,created_at_us)
+                VALUES (?,?,1,?)
+                """,
+                (
+                    max(previous_max_heat_id, remaining_max_heat_id) + 1,
+                    plan.session_id,
+                    int(first_message_row["received_at_us"]),
+                ),
+            )
         connection.execute(
             """
             UPDATE analysis_sessions
@@ -189,32 +265,6 @@ def _reset_derived_state(connection: sqlite3.Connection, plan: RebuildPlan) -> t
     return frames
 
 
-def _reattach_gaps(connection: sqlite3.Connection, session_id: str) -> None:
-    """Restore a heat association for raw reconnect gaps after heat recreation."""
-
-    connection.execute("BEGIN IMMEDIATE")
-    try:
-        connection.execute(
-            """
-            UPDATE ingest_gaps
-            SET source_heat_id = (
-              SELECT h.id
-              FROM source_heats h
-              WHERE h.analysis_session_id = ingest_gaps.analysis_session_id
-                AND h.created_at_us <= ingest_gaps.started_at_us
-              ORDER BY h.generation DESC,h.id DESC
-              LIMIT 1
-            )
-            WHERE analysis_session_id = ? AND source_heat_id IS NULL
-            """,
-            (session_id,),
-        )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-
-
 def rebuild_session(database: str | Path, session_id: str) -> RebuildResult:
     """Reconstruct a stopped session's normalized state and tactical metrics."""
 
@@ -224,13 +274,16 @@ def rebuild_session(database: str | Path, session_id: str) -> RebuildResult:
         plan = _session_plan(connection, session_id)
         frames = _reset_derived_state(connection, plan)
         store = RawIngestStore(connection, analysis_session_id=session_id)
-        normalizer = TimingNormalizer(session_id)
+        # The persisted lifecycle stays stopped throughout this destructive
+        # recovery.  Metric evaluation must nevertheless model each raw frame
+        # as historical live timing; provider FINISH still makes that frame
+        # terminal through the normal metric engine.
+        normalizer = TimingNormalizer(session_id, replay_active=True)
         for frame, original_processed_at_us in frames:
             messages = store.decode_frame(frame)
             if messages:
                 normalizer(connection, frame, messages)
             store.mark_processed(frame, processed_at_us=original_processed_at_us)
-        _reattach_gaps(connection, session_id)
         integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
         foreign_key_error = connection.execute("PRAGMA foreign_key_check").fetchone()
         if integrity != "ok" or foreign_key_error is not None:

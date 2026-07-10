@@ -219,8 +219,11 @@ def _insert_ignore(connection: sqlite3.Connection, table: str, values: Mapping[s
 class TimingNormalizer:
     """Replay-safe reducer and writer for one engineer analysis session."""
 
-    def __init__(self, analysis_session_id: str):
+    def __init__(self, analysis_session_id: str, *, replay_active: bool = False):
+        if type(replay_active) is not bool:
+            raise NormalizerError("replay_active must be a boolean")
         self.analysis_session_id = analysis_session_id
+        self._replay_active = replay_active
         self.grid = ResultGrid()
         self.heat: dict[str, Any] = {}
         self.statistics: dict[str, Any] = {}
@@ -266,6 +269,7 @@ class TimingNormalizer:
             observed_at_us=frame.received_at_us,
             source_message_id=last.id,
             source_key=last.source_key,
+            replay_active=self._replay_active,
         )
 
     def _prime(self, connection: sqlite3.Connection) -> None:

@@ -7,6 +7,8 @@ points without copying unchanged derived state every second.
 
 from __future__ import annotations
 
+import gzip
+import hashlib
 import json
 import math
 import sqlite3
@@ -22,6 +24,12 @@ from .stream_events import StreamEventCandidate, StreamEventError, append_stream
 
 METRIC_SAMPLE_INTERVAL_US = 5_000_000
 """Normal chart cadence; event boundaries may be persisted between buckets."""
+
+PLAYBACK_SNAPSHOT_INTERVAL_US = METRIC_SAMPLE_INTERVAL_US
+"""Archive projection cadence; relevant domain boundaries are retained too."""
+
+PLAYBACK_PROJECTION_VERSION = 1
+PLAYBACK_PAYLOAD_CODEC = "gzip-json-v1"
 
 _SCOPE_KINDS = frozenset({"participant", "class", "session"})
 
@@ -305,6 +313,14 @@ class MetricRunnerStateCandidate:
 
 
 @dataclass(frozen=True)
+class PlaybackSnapshotCandidate:
+    """A compact, public archive state produced with one metric evaluation."""
+
+    payload: Mapping[str, Any]
+    event_boundary: bool = False
+
+
+@dataclass(frozen=True)
 class MetricMaterializationResult:
     """Outcome of writing sparse history and the current dashboard state.
 
@@ -321,6 +337,7 @@ class MetricMaterializationResult:
     current_skipped: tuple[MetricScope, ...] = ()
     runner_state_written: bool = False
     stream_events_written: int = 0
+    playback_snapshot_written: bool = False
 
     @property
     def written(self) -> tuple[MetricScope, ...]:
@@ -766,6 +783,17 @@ def _canonical_values_json(values: Mapping[str, Any]) -> str:
     return json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
+def _encoded_playback_payload(payload: Mapping[str, Any]) -> tuple[str, bytes, str]:
+    """Encode a portable archive keyframe without retaining provider raw data."""
+
+    encoded = _canonical_values_json(payload).encode("utf-8")
+    return (
+        PLAYBACK_PAYLOAD_CODEC,
+        gzip.compress(encoded, compresslevel=6, mtime=0),
+        hashlib.sha256(encoded).hexdigest(),
+    )
+
+
 def load_metric_history(
     connection: sqlite3.Connection,
     *,
@@ -900,6 +928,7 @@ def materialize_metric_samples(
     interval_us: int = METRIC_SAMPLE_INTERVAL_US,
     runner_state: MetricRunnerStateCandidate | None = None,
     stream_events: Sequence[StreamEventCandidate] = (),
+    playback_snapshot: PlaybackSnapshotCandidate | None = None,
 ) -> MetricMaterializationResult:
     """Materialize current state and sparse chart history from one metric tick.
 
@@ -932,6 +961,12 @@ def materialize_metric_samples(
             raise MetricStoreError("runner_state state_hash must be a non-empty string")
         if not isinstance(runner_state.boundary_state_json, str) or not runner_state.boundary_state_json:
             raise MetricStoreError("runner_state boundary_state_json must be a non-empty string")
+    if playback_snapshot is not None:
+        if not isinstance(playback_snapshot, PlaybackSnapshotCandidate):
+            raise MetricStoreError("playback_snapshot must be PlaybackSnapshotCandidate or None")
+        if runner_state is None:
+            raise MetricStoreError("playback snapshots require a durable metric runner state")
+        _encoded_playback_payload(playback_snapshot.payload)
     try:
         prepared_stream_events = tuple(stream_events)
     except TypeError as error:
@@ -967,6 +1002,7 @@ def materialize_metric_samples(
     current_skipped: list[MetricScope] = []
     runner_state_written = False
     stream_events_written = 0
+    playback_snapshot_written = False
     with _write_transaction(connection):
         heat = connection.execute(
             "SELECT analysis_session_id FROM source_heats WHERE id = ?", (source_heat_id,)
@@ -1264,6 +1300,98 @@ def materialize_metric_samples(
                 )
             except StreamEventError as error:
                 raise MetricStoreError(f"Invalid stream event: {error}") from error
+        if runner_state_written and playback_snapshot is not None:
+            payload_codec, payload, payload_sha256 = _encoded_playback_payload(playback_snapshot.payload)
+            exact = connection.execute(
+                """
+                SELECT observed_at_us,source_frame_id,source_key,metric_version,is_event_boundary,payload_sha256
+                FROM playback_snapshots
+                WHERE source_heat_id = ? AND observed_second = ?
+                """,
+                (source_heat_id, observed_second),
+            ).fetchone()
+            previous = connection.execute(
+                """
+                SELECT observed_at_us
+                FROM playback_snapshots
+                WHERE source_heat_id = ? AND observed_second < ?
+                ORDER BY observed_second DESC
+                LIMIT 1
+                """,
+                (source_heat_id, observed_second),
+            ).fetchone()
+            previous_bucket = (
+                int(previous["observed_at_us"]) // PLAYBACK_SNAPSHOT_INTERVAL_US if previous is not None else None
+            )
+            periodic = previous_bucket is None or observed_at_us // PLAYBACK_SNAPSHOT_INTERVAL_US > previous_bucket
+            if playback_snapshot.event_boundary or periodic:
+                incoming_rank = (observed_at_us, runner_state.source_frame_id, source_key)
+                exact_rank = (
+                    (
+                        int(exact["observed_at_us"]),
+                        int(exact["source_frame_id"]) if exact["source_frame_id"] is not None else -1,
+                        exact["source_key"],
+                    )
+                    if exact is not None
+                    else None
+                )
+                if exact is None:
+                    connection.execute(
+                        """
+                        INSERT INTO playback_snapshots(
+                          source_heat_id,observed_second,observed_at_us,source_frame_id,source_message_id,
+                          source_key,projection_version,metric_version,is_event_boundary,payload_codec,payload,
+                          payload_sha256,created_at_us,updated_at_us
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        """,
+                        (
+                            source_heat_id,
+                            observed_second,
+                            observed_at_us,
+                            runner_state.source_frame_id,
+                            source_message_id,
+                            source_key,
+                            PLAYBACK_PROJECTION_VERSION,
+                            metric_version,
+                            int(playback_snapshot.event_boundary),
+                            payload_codec,
+                            payload,
+                            payload_sha256,
+                            created_at_us,
+                            created_at_us,
+                        ),
+                    )
+                    playback_snapshot_written = True
+                elif incoming_rank > exact_rank or (
+                    incoming_rank == exact_rank and metric_version > int(exact["metric_version"])
+                ):
+                    connection.execute(
+                        """
+                        UPDATE playback_snapshots
+                        SET observed_at_us = ?, source_frame_id = ?, source_message_id = ?, source_key = ?,
+                            projection_version = ?, metric_version = ?,
+                            is_event_boundary = ?, payload_codec = ?, payload = ?, payload_sha256 = ?, updated_at_us = ?
+                        WHERE source_heat_id = ? AND observed_second = ?
+                        """,
+                        (
+                            observed_at_us,
+                            runner_state.source_frame_id,
+                            source_message_id,
+                            source_key,
+                            PLAYBACK_PROJECTION_VERSION,
+                            metric_version,
+                            int(playback_snapshot.event_boundary or bool(exact["is_event_boundary"])),
+                            payload_codec,
+                            payload,
+                            payload_sha256,
+                            created_at_us,
+                            source_heat_id,
+                            observed_second,
+                        ),
+                    )
+                    playback_snapshot_written = True
+                elif incoming_rank == exact_rank and payload_sha256 != exact["payload_sha256"]:
+                    raise MetricStoreError("Playback snapshot conflicts at an identical source rank")
     return MetricMaterializationResult(
         tuple(inserted),
         tuple(updated),
@@ -1273,4 +1401,5 @@ def materialize_metric_samples(
         tuple(current_skipped),
         runner_state_written,
         stream_events_written,
+        playback_snapshot_written,
     )

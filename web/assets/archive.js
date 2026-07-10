@@ -4,13 +4,249 @@
   var $ = function (id) { return document.getElementById(id); };
   var grid = $("grid"), countEl = $("count"), moreBtn = $("more");
   var modal = $("modal"), info = $("info"), player = $("player");
-  var state = { offset: 0, limit: 48, total: 0, hls: null };
+  var timingArchive = $("timingArchive"), timingSelect = $("timingSession");
+  var state = {
+    offset: 0,
+    limit: 48,
+    total: 0,
+    hls: null,
+    cards: Object.create(null),
+    items: Object.create(null),
+    currentItem: null,
+    timingEntries: [],
+    timingLoaded: false
+  };
 
   // ---- форматтеры ----
   function fmtDur(s) { if (!s) return null; s = Math.round(s); var m = Math.floor(s / 60), ss = s % 60; var h = Math.floor(m / 60); m = m % 60; return (h ? h + ":" + String(m).padStart(2, "0") : m) + ":" + String(ss).padStart(2, "0"); }
   function fmtSize(b) { if (!b) return ""; return b >= 1e9 ? (b / 1e9).toFixed(1) + " ГБ" : Math.round(b / 1e6) + " МБ"; }
   function fmtLap(s) { if (!s) return null; var m = Math.floor(s / 60), r = (s % 60).toFixed(2); return (m ? m + ":" + String(r).padStart(5, "0") : r + " с"); }
   function esc(t) { var d = document.createElement("div"); d.textContent = t == null ? "" : t; return d.innerHTML; }
+
+  // Archive video and live-timing captures intentionally have independent clocks.
+  // The association below is limited to their shared session context, never a
+  // video timestamp or a playhead offset.
+  function timingSelection(entry) { return entry.sessionId + ":" + entry.generation; }
+  function object(value) { return value && typeof value === "object" ? value : {}; }
+  function firstNumber(values) {
+    for (var i = 0; i < values.length; i++) {
+      var value = values[i];
+      if (typeof value === "number" && isFinite(value) && value > 0) return value;
+    }
+    return null;
+  }
+  function textKey(value) {
+    return String(value || "").toLowerCase().replace(/ё/g, "е").replace(/[^a-zа-я0-9]+/g, " ").trim();
+  }
+  function trackKey(value) {
+    var key = textKey(value);
+    if (!key) return "";
+    if (key.indexOf("igora") !== -1 || key.indexOf("игора") !== -1) return "igora";
+    if (key.indexOf("moscow") !== -1 || key.indexOf("моск") !== -1 || key.indexOf("mrw") !== -1) return "moscow";
+    return key;
+  }
+  function modeKey(value) {
+    var key = textKey(value);
+    if (!key) return "";
+    if (key === "practice" || key.indexOf("practice") !== -1 || key.indexOf("практик") !== -1 || key.indexOf("open pit") !== -1 || key.indexOf("free") !== -1) return "practice";
+    if (key === "qualifying" || key.indexOf("qualif") !== -1 || key.indexOf("квалиф") !== -1) return "qualifying";
+    if (key === "race" || key.indexOf("race") !== -1 || key.indexOf("гонк") !== -1) return "race";
+    return "";
+  }
+  function modeLabel(mode) {
+    return { practice: "Практика", qualifying: "Квалификация", race: "Гонка" }[mode] || "Сессия";
+  }
+  function calendarDate(atUs, timezone) {
+    if (typeof atUs !== "number" || !isFinite(atUs) || atUs <= 0) return "";
+    try {
+      var parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone: timezone || "Europe/Moscow", year: "numeric", month: "2-digit", day: "2-digit"
+      }).formatToParts(new Date(atUs / 1000));
+      var result = {};
+      parts.forEach(function (part) { result[part.type] = part.value; });
+      return result.year && result.month && result.day ? result.year + "-" + result.month + "-" + result.day : "";
+    } catch (error) {
+      return new Date(atUs / 1000).toISOString().slice(0, 10);
+    }
+  }
+  function timingEntry(item, heat) {
+    var session = object(item && item.session);
+    heat = object(heat);
+    var sessionId = typeof session.id === "string" ? session.id : "";
+    var generation = heat.generation;
+    if (!sessionId || typeof generation !== "number" || !isFinite(generation)) return null;
+    var startedAtUs = firstNumber([
+      heat.provider_started_at_us, session.started_at_us, heat.first_at_us,
+      item && item.first_at_us, session.created_at_us
+    ]);
+    var mode = modeKey(session.mode);
+    var track = trackKey(session.source_slug || session.source_name);
+    var date = calendarDate(startedAtUs, session.timezone_name);
+    if (!mode || !track || !date) return null;
+    return {
+      sessionId: sessionId,
+      generation: generation,
+      mode: mode,
+      track: track,
+      date: date,
+      sourceName: String(session.source_name || session.source_slug || "Трасса"),
+      heatName: String(heat.external_name || ("Heat " + generation))
+    };
+  }
+  function timingEntriesForItem(item) {
+    if (!item || !item.date) return [];
+    var itemTrack = trackKey(item.track);
+    var itemMode = modeKey(item.type);
+    if (!itemTrack || !itemMode) return [];
+    return state.timingEntries.filter(function (entry) {
+      return entry.date === item.date && entry.track === itemTrack && entry.mode === itemMode;
+    });
+  }
+  function timingEntryTitle(entry) {
+    return modeLabel(entry.mode) + " · " + entry.heatName;
+  }
+  function selectedTimingEntry() {
+    var selected = timingSelect && timingSelect.value;
+    return state.timingEntries.find(function (entry) { return timingSelection(entry) === selected; }) || null;
+  }
+  function videoItemsForTimingEntry(entry) {
+    if (!entry) return [];
+    return Object.keys(state.items).map(function (id) { return state.items[id]; }).filter(function (item) {
+      return timingEntriesForItem(item).some(function (candidate) {
+        return timingSelection(candidate) === timingSelection(entry);
+      });
+    });
+  }
+  function renderTimingVideoLinks() {
+    var slot = $("timingVideoRelation");
+    if (!slot) return;
+    slot.replaceChildren();
+    var entry = selectedTimingEntry();
+    var videos = videoItemsForTimingEntry(entry);
+    if (!entry || !videos.length) {
+      slot.hidden = true;
+      return;
+    }
+    slot.hidden = false;
+    var label = document.createElement("span");
+    label.className = "ta-video-label";
+    label.textContent = "Видео сессии";
+    var note = document.createElement("span");
+    note.className = "ta-video-note";
+    note.textContent = "Дата, трасса, тип · шкалы независимы";
+    var links = document.createElement("div");
+    links.className = "ta-video-links";
+    videos.forEach(function (item) {
+      var button = document.createElement("button");
+      button.type = "button";
+      button.className = "ta-video-link";
+      button.textContent = item.title || "Видео";
+      button.title = "Открыть видео сессии. Временная шкала видео независима от телеметрии.";
+      button.addEventListener("click", function () { openItem(item.id); });
+      links.appendChild(button);
+    });
+    slot.appendChild(label);
+    slot.appendChild(note);
+    slot.appendChild(links);
+  }
+  function chooseTimingEntry(entry) {
+    var selected = timingSelection(entry);
+    try { localStorage.setItem("balchug_timing_archive_selection", selected); } catch (error) {}
+    if (timingArchive && timingArchive.scrollIntoView) {
+      timingArchive.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+    var attempts = 0;
+    function applySelection() {
+      attempts += 1;
+      if (!timingSelect || !timingSelect.querySelector('option[value="' + selected + '"]')) {
+        if (attempts < 30) window.setTimeout(applySelection, 100);
+        return;
+      }
+      timingSelect.value = selected;
+      timingSelect.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+    applySelection();
+  }
+  function timingButton(entry, className) {
+    var button = document.createElement("button");
+    button.type = "button";
+    button.className = className;
+    button.textContent = timingEntryTitle(entry);
+    button.title = "Открыть сохранённую телеметрию. Временная шкала видео не синхронизируется с телеметрией.";
+    button.setAttribute("aria-label", "Открыть телеметрию: " + timingEntryTitle(entry) + ". Временная шкала видео независима.");
+    button.addEventListener("click", function (event) {
+      event.stopPropagation();
+      chooseTimingEntry(entry);
+    });
+    return button;
+  }
+  function renderCardTimingLinks(item, card) {
+    var slot = card && card.querySelector("[data-timing-links]");
+    if (!slot) return;
+    slot.replaceChildren();
+    var entries = timingEntriesForItem(item);
+    if (!entries.length) {
+      slot.hidden = true;
+      return;
+    }
+    slot.hidden = false;
+    var label = document.createElement("span");
+    label.className = "timing-card-label";
+    label.textContent = "Телеметрия сессии";
+    label.title = "Связь по дате, трассе и типу сессии; временные шкалы независимы.";
+    slot.appendChild(label);
+    entries.forEach(function (entry) { slot.appendChild(timingButton(entry, "timing-card-link")); });
+  }
+  function renderModalTimingLinks(item) {
+    var slot = $("timingRelation");
+    if (!slot) return;
+    slot.replaceChildren();
+    var entries = timingEntriesForItem(item);
+    if (!entries.length) {
+      slot.hidden = true;
+      return;
+    }
+    slot.hidden = false;
+    var heading = document.createElement("div");
+    heading.className = "timing-relation-title";
+    heading.textContent = "Сохранённая телеметрия сессии";
+    var note = document.createElement("p");
+    note.className = "timing-relation-note";
+    note.textContent = "Связь определена по дате, трассе и типу сессии. Временные шкалы видео и телеметрии независимы.";
+    var links = document.createElement("div");
+    links.className = "timing-relation-links";
+    entries.forEach(function (entry) { links.appendChild(timingButton(entry, "timing-relation-link")); });
+    slot.appendChild(heading);
+    slot.appendChild(note);
+    slot.appendChild(links);
+  }
+  function refreshTimingLinks() {
+    Object.keys(state.cards).forEach(function (id) { renderCardTimingLinks(state.items[id], state.cards[id]); });
+    if (state.currentItem) renderModalTimingLinks(state.currentItem);
+    renderTimingVideoLinks();
+  }
+  function loadTimingEntries() {
+    fetch("/api/timing/sessions/archive?limit=50").then(function (response) {
+      if (!response.ok) throw new Error("timing archive unavailable");
+      return response.json();
+    }).then(function (payload) {
+      var entries = [];
+      (payload && payload.items || []).forEach(function (item) {
+        (item && item.heats || []).forEach(function (heat) {
+          var entry = timingEntry(item, heat);
+          if (entry) entries.push(entry);
+        });
+      });
+      state.timingEntries = entries;
+      state.timingLoaded = true;
+      refreshTimingLinks();
+    }).catch(function () {
+      // The archive catalogue remains usable when the independent timing API is offline.
+      state.timingEntries = [];
+      state.timingLoaded = true;
+      refreshTimingLinks();
+    });
+  }
 
   function params() {
     var p = new URLSearchParams();
@@ -31,11 +267,18 @@
 
   // ---- загрузка каталога ----
   function load(reset) {
-    if (reset) { state.offset = 0; grid.innerHTML = ""; }
+    if (reset) {
+      state.offset = 0;
+      state.cards = Object.create(null);
+      state.items = Object.create(null);
+      grid.innerHTML = "";
+      if (state.timingLoaded) renderTimingVideoLinks();
+    }
     countEl.textContent = "Загрузка…";
     fetch(API + "/catalog?" + params()).then(function (r) { return r.json(); }).then(function (d) {
       state.total = d.total;
       d.items.forEach(addCard);
+      if (state.timingLoaded) renderTimingVideoLinks();
       state.offset += d.items.length;
       countEl.textContent = "Найдено: " + d.total;
       moreBtn.style.display = state.offset < d.total ? "" : "none";
@@ -45,6 +288,9 @@
 
   function addCard(it) {
     var el = document.createElement("div"); el.className = "rec";
+    el.dataset.itemId = it.id;
+    state.cards[it.id] = el;
+    state.items[it.id] = it;
     var badges = "";
     if (it.source === "live") badges += '<span class="bdg live">Live</span>';
     else badges += '<span class="bdg">Onboard</span>';
@@ -66,12 +312,14 @@
       '<div class="play">▶</div></div>' +
       '<div class="body"><div class="ttl">' + esc(it.title) + '</div>' +
       '<div class="meta">' + metaBits.join("") + '</div>' +
+      '<div class="timing-card-relation" data-timing-links hidden></div>' +
       '<div class="admin-actions"><button class="edit">Редактировать</button><button class="del">Удалить</button></div>' +
       '</div>';
     el.addEventListener("click", function () { openItem(it.id); });
     el.querySelector(".edit").addEventListener("click", function (e) { e.stopPropagation(); openItem(it.id); });
     el.querySelector(".del").addEventListener("click", function (e) { e.stopPropagation(); delItem(it, el); });
     grid.appendChild(el);
+    if (state.timingLoaded) renderCardTimingLinks(it, el);
   }
 
   // ---- удаление записи (админ) ----
@@ -112,8 +360,10 @@
       }
       // нет HLS — ставим в очередь на адаптивный транскод (для след. открытия)
       if (!it.hls) { fetch(API + "/enqueue_hls/" + it.id, { method: "POST" }).catch(function () {}); }
+      state.currentItem = it;
       info.innerHTML = renderInfo(it);
       bindAdmin(it);
+      renderModalTimingLinks(it);
       modal.classList.add("open"); document.body.style.overflow = "hidden";
     });
   }
@@ -139,6 +389,7 @@
     return '<h2>' + esc(it.title) + "</h2>" +
       '<div class="sub">' + esc(it.pilot) + (it.track ? " · " + esc(it.track) : "") + (it.date ? " · " + esc(it.date) : "") + "</div>" +
       '<div class="kv">' + kv.join("") + "</div>" + summary +
+      '<div class="timing-relation" id="timingRelation" hidden></div>' +
       '<div class="files">' + dl + "</div>" + files +
       '<div id="adminBox"></div>';
   }
@@ -211,6 +462,7 @@
   function closeModal() {
     modal.classList.remove("open"); document.body.style.overflow = "";
     if (state.hls) { try { state.hls.destroy(); } catch (e) {} state.hls = null; }
+    state.currentItem = null;
     player.pause(); player.removeAttribute("src"); player.load();
   }
   $("close").addEventListener("click", closeModal);
@@ -224,6 +476,11 @@
   moreBtn.addEventListener("click", function () { load(false); });
 
   if (token()) document.body.classList.add("admin");   // восстановить режим Бориса
+  if (timingSelect) {
+    timingSelect.addEventListener("change", function () { window.setTimeout(renderTimingVideoLinks, 0); });
+    new MutationObserver(function () { window.setTimeout(renderTimingVideoLinks, 0); }).observe(timingSelect, { childList: true });
+  }
   load(true);
+  loadTimingEntries();
   if (location.hash === "#boris") openBoris();
 })();

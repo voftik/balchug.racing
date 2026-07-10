@@ -65,7 +65,7 @@ class TimingDatabaseTests(unittest.TestCase):
     def test_migration_is_repeatable_and_enables_wal(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "timing.db"
-            self.assertEqual(migrate(path), ["0001", "0002", "0003", "0004", "0005"])
+            self.assertEqual(migrate(path), ["0001", "0002", "0003", "0004", "0005", "0006"])
             self.assertEqual(migrate(path), [])
             connection = connect(path)
             try:
@@ -83,6 +83,7 @@ class TimingDatabaseTests(unittest.TestCase):
                         "metric_runner_state",
                         "stream_events",
                         "stream_event_cursor_floors",
+                        "playback_snapshots",
                     }.issubset(tables)
                 )
             finally:
@@ -353,7 +354,7 @@ class TimingDatabaseTests(unittest.TestCase):
             finally:
                 connection.close()
 
-            self.assertEqual(migrate(path), ["0003", "0004", "0005"])
+            self.assertEqual(migrate(path), ["0003", "0004", "0005", "0006"])
             connection = connect(path)
             try:
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM participants").fetchone()[0], 1)
@@ -485,7 +486,7 @@ class TimingDatabaseTests(unittest.TestCase):
                 timestamp = now_us()
                 old = timestamp - 10 * 86_400_000_000
                 _, active_message = self.insert_frame(connection, "active", received_at_us=old)
-                _finished_frame, finished_message = self.insert_frame(connection, "finished", received_at_us=old)
+                finished_frame, finished_message = self.insert_frame(connection, "finished", received_at_us=old)
                 connection.execute(
                     """
                     INSERT INTO feed_frames(
@@ -517,6 +518,16 @@ class TimingDatabaseTests(unittest.TestCase):
                     """,
                     (finished_heat, anchor_frame, timestamp, timestamp),
                 )
+                connection.execute(
+                    """
+                    INSERT INTO playback_snapshots(
+                      source_heat_id,observed_second,observed_at_us,source_frame_id,source_message_id,
+                      source_key,projection_version,metric_version,is_event_boundary,payload_codec,payload,
+                      payload_sha256,created_at_us,updated_at_us
+                    ) VALUES (?,?,?,?,?,'playback:finished',1,1,0,'gzip-json-v1',X'7B7D',?, ?,?)
+                    """,
+                    (finished_heat, old // 1_000_000, old, finished_frame, finished_message, "0" * 64, timestamp, timestamp),
+                )
                 connection.execute("INSERT INTO stream_events(analysis_session_id,source_heat_id,event_type,payload_json,created_at_us) VALUES ('active',?,'state','{}',?)", (active_heat, old))
                 connection.execute("INSERT INTO stream_events(analysis_session_id,source_heat_id,event_type,payload_json,created_at_us) VALUES ('finished',?,'state','{}',?)", (finished_heat, old))
                 connection.commit()
@@ -544,6 +555,11 @@ class TimingDatabaseTests(unittest.TestCase):
                 self.assertEqual(
                     connection.execute("SELECT source_frame_id FROM state_checkpoints WHERE source_heat_id = ?", (finished_heat,)).fetchone()[0],
                     anchor_frame,
+                )
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT source_frame_id FROM playback_snapshots WHERE source_heat_id = ?", (finished_heat,)
+                    ).fetchone()[0]
                 )
                 self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
                 self.assertIsNotNone(active_message)

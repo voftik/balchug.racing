@@ -1,3 +1,5 @@
+import gzip
+import hashlib
 import json
 import tempfile
 import unittest
@@ -5,7 +7,9 @@ from pathlib import Path
 
 from timing.db import connect, migrate
 from timing.read_api import (
+    ArchiveProjectionMissingError,
     MetricScopeRequest,
+    ReadValidationError,
     ScopeNotFoundError,
     TimingReadModel,
 )
@@ -89,6 +93,7 @@ class TimingReadModelTests(unittest.TestCase):
             """,
             (self.heat_id, timestamp),
         )
+
         self.connection.execute(
             """
             INSERT INTO track_flag_current(
@@ -164,6 +169,31 @@ class TimingReadModelTests(unittest.TestCase):
             ) VALUES ('session-1',?,'state','{}',?)
             """,
             (self.heat_id, timestamp),
+        )
+
+    def _add_playback_snapshot(self, observed_at_us, payload, *, event_boundary=False):
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        self.connection.execute(
+            """
+            INSERT INTO playback_snapshots(
+              source_heat_id,observed_second,observed_at_us,source_key,projection_version,metric_version,
+              is_event_boundary,payload_codec,payload,payload_sha256,created_at_us,updated_at_us
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                self.heat_id,
+                observed_at_us // 1_000_000,
+                observed_at_us,
+                f"playback:{observed_at_us}",
+                1,
+                1,
+                int(event_boundary),
+                "gzip-json-v1",
+                gzip.compress(raw, mtime=0),
+                hashlib.sha256(raw).hexdigest(),
+                observed_at_us,
+                observed_at_us,
+            ),
         )
 
     def test_snapshot_exposes_source_facts_metrics_freshness_and_stream_barrier(self):
@@ -248,6 +278,61 @@ class TimingReadModelTests(unittest.TestCase):
         self.assertEqual(pits["items"][0]["pit_lane_ms"], 30_000)
         with self.assertRaises(ScopeNotFoundError):
             self.model.laps("session-1", participant_id="not-a-crew")
+
+    def test_archive_manifest_and_seek_use_only_durable_playback_keyframes(self):
+        self.connection.execute("UPDATE analysis_sessions SET lifecycle = 'stopped' WHERE id = 'session-1'")
+        for observed_at_us, position, event_boundary in (
+            (2_000_000, 4, False),
+            (5_000_000, 3, True),
+            (7_000_000, 2, False),
+        ):
+            self._add_playback_snapshot(
+                observed_at_us,
+                {
+                    "schema_version": "timing-archive.v1",
+                    "observed_at_us": observed_at_us,
+                    "measured": {"track_flag": {"flag": "GREEN"}},
+                    "computed": {"session": {"position_overall": position, "pace_5_ms": 107_000 + position}},
+                    "class_participants": [{"measured": {"participant_id": "competitor"}}],
+                },
+                event_boundary=event_boundary,
+            )
+        self.connection.execute(
+            """
+            INSERT INTO track_flag_periods(
+              source_heat_id,flag,started_at_us,ended_at_us,source_key,created_at_us
+            ) VALUES (?,'RED',4000000,6000000,'flag:4',4000000)
+            """,
+            (self.heat_id,),
+        )
+        self.connection.commit()
+
+        sessions = self.model.archived_sessions()
+        self.assertEqual([item["session"]["id"] for item in sessions["items"]], ["session-1"])
+        manifest = self.model.archive_manifest("session-1")
+        self.assertEqual(manifest["schema_version"], "timing-archive.v1")
+        self.assertEqual(manifest["range"]["source_point_count"], 3)
+        self.assertEqual([point["observed_at_us"] for point in manifest["keyframes"]], [2_000_000, 5_000_000, 7_000_000])
+        self.assertTrue(manifest["keyframes"][1]["is_event_boundary"])
+        self.assertNotIn("class_participants", manifest["keyframes"][1]["snapshot"])
+        self.assertEqual(manifest["markers"]["flags"][0]["flag"], "RED")
+
+        snapshot = self.model.archive_snapshot("session-1", at_us=6_000_000)
+        self.assertEqual(snapshot["playback"]["requested_at_us"], 6_000_000)
+        self.assertEqual(snapshot["playback"]["effective_at_us"], 5_000_000)
+        self.assertEqual(snapshot["playback"]["next_at_us"], 7_000_000)
+        self.assertEqual(snapshot["snapshot"]["computed"]["session"]["position_overall"], 3)
+        self.assertEqual(snapshot["snapshot"]["class_participants"][0]["measured"]["participant_id"], "competitor")
+        with self.assertRaises(ReadValidationError):
+            self.model.archive_snapshot("session-1", at_us=1_999_999)
+
+    def test_archive_requires_a_stopped_session_with_a_projection(self):
+        with self.assertRaises(ReadValidationError):
+            self.model.archive_manifest("session-1")
+        self.connection.execute("UPDATE analysis_sessions SET lifecycle = 'stopped' WHERE id = 'session-1'")
+        self.connection.commit()
+        with self.assertRaises(ArchiveProjectionMissingError):
+            self.model.archive_manifest("session-1")
 
 
 if __name__ == "__main__":

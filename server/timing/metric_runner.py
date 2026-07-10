@@ -33,7 +33,9 @@ from .metric_store import (
     load_metric_runner_state,
     materialize_metric_samples,
     MetricRunnerStateCandidate,
+    PlaybackSnapshotCandidate,
 )
+from .playback import build_playback_payload
 from .stream_events import StreamEventCandidate
 
 
@@ -67,14 +69,25 @@ class TimingMetricRunner:
         observed_at_us: int,
         source_message_id: int | None,
         source_key: str,
+        replay_active: bool = False,
     ) -> MetricRunResult:
-        """Evaluate one committed normalized frame and persist its metric state."""
+        """Evaluate one committed normalized frame and persist its metric state.
+
+        A stopped session can be rebuilt only after its capture is over.  Its
+        historical frames nevertheless occurred while the tactical channel was
+        active, so recovery explicitly opts into that historical evaluation
+        context without mutating the durable session lifecycle.
+        """
         if connection.in_transaction:
             raise MetricRunnerError("Metric runner requires normalized facts to be committed first")
+        if type(replay_active) is not bool:
+            raise MetricRunnerError("replay_active must be a boolean")
         # A server-time-only frame can advance the session clock without
         # changing a participant row, so the metric tick follows this durable
         # frame timestamp rather than the last changed row in the read model.
         heat = replace(load_heat_metric_input(connection, source_heat_id), observed_at_us=observed_at_us)
+        if replay_active:
+            heat = replace(heat, session=replace(heat.session, lifecycle="active"))
         # 180 s is the longest tactical closure window. Keep a small extra
         # cadence margin so a sample immediately before the cutoff is present.
         history = load_metric_history(
@@ -129,12 +142,29 @@ class TimingMetricRunner:
                 source_key=source_key,
                 observed_at_us=observed_at_us,
             ),
+            playback_snapshot=PlaybackSnapshotCandidate(
+                payload=build_playback_payload(heat, evaluation),
+                event_boundary=self._is_playback_boundary(heat, evaluation),
+            ),
         )
         if materialization.runner_state_written:
             self._previous[source_heat_id] = evaluation.boundary_state
         elif previous is not None:
             self._previous[source_heat_id] = previous
         return MetricRunResult(evaluation=evaluation, materialization=materialization)
+
+    @staticmethod
+    def _is_playback_boundary(heat: HeatMetricInput, evaluation: MetricEngineResult) -> bool:
+        """Keep archive anchors for track and Balchug events, not every car tick."""
+
+        ours = heat.our_participant
+        ours_id = ours.id if ours is not None else None
+        for event_key in evaluation.event_keys:
+            if event_key in {"track_flag", "source_gap"}:
+                return True
+            if ours_id is not None and event_key in {f"lap:{ours_id}", f"pit_or_stint:{ours_id}"}:
+                return True
+        return False
 
     @staticmethod
     def _stream_events(

@@ -1,3 +1,4 @@
+import gzip
 import json
 import tempfile
 import time
@@ -54,6 +55,10 @@ class MetricRunnerIntegrationTests(unittest.TestCase):
         self.store.mark_processed(frame)
         return frame
 
+    @staticmethod
+    def playback_payload(row):
+        return json.loads(gzip.decompress(bytes(row["payload"])))
+
     def test_normalizer_materializes_current_each_tick_and_sparse_history(self):
         provider_start = 40_000_000
         received = TIME_SERVICE_EPOCH_UNIX_US + provider_start
@@ -103,6 +108,15 @@ class MetricRunnerIntegrationTests(unittest.TestCase):
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM state_ticks").fetchone()[0], 1)
         first_history_count = self.connection.execute("SELECT COUNT(*) FROM metric_samples").fetchone()[0]
         self.assertEqual(first_history_count, 3)
+        playback = self.connection.execute(
+            "SELECT observed_at_us,is_event_boundary,payload FROM playback_snapshots"
+        ).fetchone()
+        self.assertEqual(playback["observed_at_us"], received)
+        self.assertFalse(playback["is_event_boundary"])
+        playback_payload = self.playback_payload(playback)
+        self.assertEqual(playback_payload["schema_version"], "timing-archive.v1")
+        self.assertEqual(playback_payload["measured"]["ours"]["start_number"], "21")
+        self.assertEqual(playback_payload["computed"]["session"]["track_flag"], "GREEN")
         first_events = self.connection.execute(
             "SELECT id,event_type,event_key,source_frame_id FROM stream_events ORDER BY id"
         ).fetchall()
@@ -123,6 +137,7 @@ class MetricRunnerIntegrationTests(unittest.TestCase):
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM state_ticks").fetchone()[0], 2)
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM metric_samples").fetchone()[0], first_history_count)
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM stream_events").fetchone()[0], 4)
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM playback_snapshots").fetchone()[0], 1)
 
     def test_restart_restores_the_prior_boundary_before_a_red_transition(self):
         provider_start = 50_000_000
@@ -152,6 +167,11 @@ class MetricRunnerIntegrationTests(unittest.TestCase):
             for row in self.connection.execute("SELECT event_type FROM stream_events")
         }
         self.assertTrue({"state", "metric", "flag", "alert"}.issubset(event_types))
+        playback = self.connection.execute(
+            "SELECT is_event_boundary,payload FROM playback_snapshots ORDER BY observed_at_us"
+        ).fetchall()
+        self.assertEqual([row["is_event_boundary"] for row in playback], [0, 1])
+        self.assertEqual(self.playback_payload(playback[-1])["measured"]["track_flag"]["flag"], "RED")
 
     def test_retry_after_metric_runner_failure_preserves_the_pending_red_transition(self):
         provider_start = 60_000_000

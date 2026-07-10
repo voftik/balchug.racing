@@ -38,6 +38,7 @@ from .lifecycle import (
 from .read_api import (
     DEFAULT_FACT_LIMIT,
     MAX_CHART_POINTS,
+    ArchiveProjectionMissingError,
     MetricScopeRequest,
     ReadValidationError,
     ScopeNotFoundError as ReadScopeNotFoundError,
@@ -124,6 +125,14 @@ class TimingFactsResponse(BaseModel):
     schema_version: Literal["timing-live.v1"]
 
 
+class TimingArchiveResponse(BaseModel):
+    """Versioned public archive envelope for immutable stopped-session reads."""
+
+    model_config = ConfigDict(extra="allow")
+
+    schema_version: Literal["timing-archive.v1"]
+
+
 def _read_model() -> TimingReadModel:
     """Create a stateless reader so tests and deployments honor TIMING_DB now."""
 
@@ -140,9 +149,18 @@ def _live_payload(payload: dict[str, Any]) -> JSONResponse:
     )
 
 
+def _archive_payload(payload: dict[str, Any]) -> JSONResponse:
+    """Stopped-session reads may be buffered and compressed by the proxy."""
+
+    payload.setdefault("schema_version", "timing-archive.v1")
+    return JSONResponse(payload, headers={"Cache-Control": "no-store"})
+
+
 def _raise_read_error(error: TimingReadError) -> None:
     if isinstance(error, (ReadSessionNotFoundError, ReadScopeNotFoundError)):
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(error)) from error
+    if isinstance(error, ArchiveProjectionMissingError):
+        raise HTTPException(status.HTTP_409_CONFLICT, str(error)) from error
     if isinstance(error, ReadValidationError):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(error)) from error
     raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "timing read model is unavailable") from error
@@ -297,6 +315,56 @@ def active_session(source_slug: str) -> dict[str, object]:
         _raise_lifecycle_error(error)
     finally:
         connection.close()
+
+
+@app.get("/sessions/archive", response_model=TimingArchiveResponse)
+def archived_timing_sessions(limit: int = 50) -> JSONResponse:
+    """List stopped sessions that have a durable archive playback projection."""
+
+    try:
+        return _archive_payload(_read_model().archived_sessions(limit=limit))
+    except TimingReadError as error:
+        _raise_read_error(error)
+
+
+@app.get("/sessions/{session_id}/archive", response_model=TimingArchiveResponse)
+def archive_manifest(
+    session_id: str,
+    generation: int | None = None,
+    max_points: int = MAX_CHART_POINTS,
+) -> JSONResponse:
+    """Return bounded archive keyframes and markers for one stopped heat."""
+
+    try:
+        return _archive_payload(
+            _read_model().archive_manifest(
+                session_id,
+                generation=generation,
+                max_points=max_points,
+            )
+        )
+    except TimingReadError as error:
+        _raise_read_error(error)
+
+
+@app.get("/sessions/{session_id}/archive/snapshot", response_model=TimingArchiveResponse)
+def archive_snapshot(
+    session_id: str,
+    at_us: int | None = None,
+    generation: int | None = None,
+) -> JSONResponse:
+    """Return the confirmed historical state at or before a selected moment."""
+
+    try:
+        return _archive_payload(
+            _read_model().archive_snapshot(
+                session_id,
+                at_us=at_us,
+                generation=generation,
+            )
+        )
+    except TimingReadError as error:
+        _raise_read_error(error)
 
 
 @app.get("/sessions/{session_id}")

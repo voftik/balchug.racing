@@ -89,6 +89,7 @@ class TimingStreamReadTests(unittest.TestCase):
         )
         self.connection.commit()
         self.assertTrue(read_cursor_window("session-a", cursor=0, database=self.path).requires_reset(0))
+        self.assertTrue(read_cursor_window("session-a", cursor=first, database=self.path).requires_reset(first))
 
     def test_sse_format_and_cursor_parser_are_non_ambiguous(self):
         self.assertEqual(parse_last_event_id("00012"), 12)

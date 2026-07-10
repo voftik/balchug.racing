@@ -57,6 +57,14 @@ def plan_retention(
                   -- checkpoint is required before an older anchor may go.
                   AND c.source_frame_id > e.id
               )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM source_heats h
+                WHERE h.analysis_session_id = e.analysis_session_id
+                  AND NOT EXISTS (
+                    SELECT 1 FROM playback_snapshots p WHERE p.source_heat_id = h.id
+                  )
+              )
             """,
             (raw_before,),
         )
@@ -95,7 +103,15 @@ def apply_retention(connection: sqlite3.Connection, plan: RetentionPlan) -> int:
                     FROM state_checkpoints c
                     JOIN source_heats h ON h.id = c.source_heat_id
                     WHERE h.analysis_session_id = feed_frames.analysis_session_id
-                      AND c.source_frame_id > feed_frames.id
+                  AND c.source_frame_id > feed_frames.id
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM source_heats h
+                    WHERE h.analysis_session_id = feed_frames.analysis_session_id
+                      AND NOT EXISTS (
+                        SELECT 1 FROM playback_snapshots p WHERE p.source_heat_id = h.id
+                      )
                   )
                 """,
                 (frame_id, plan.raw_before_us),

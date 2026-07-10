@@ -42,6 +42,10 @@
     color:var(--navy);line-height:1.25;}
   .rec .meta{font-size:11.5px;color:var(--muted);display:flex;flex-wrap:wrap;gap:4px 10px;}
   .rec .meta b{color:var(--navy);font-weight:600;}
+  .timing-card-relation{display:flex;align-items:center;flex-wrap:wrap;gap:6px;margin-top:2px;padding-top:8px;border-top:1px dashed var(--line);}
+  .timing-card-label{font-family:var(--display);font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);}
+  .timing-card-link{min-width:0;border:0;background:transparent;padding:0;color:var(--navy);font:10px var(--display);text-align:left;text-decoration:underline;text-decoration-color:#b8c3d2;text-underline-offset:3px;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .timing-card-link:hover,.timing-card-link:focus-visible{color:var(--red);text-decoration-color:currentColor;outline:0;}
 
   /* Индикация включённого режима на обоих триггерах Бориса. */
   body.admin .boris-btn{background:var(--ok);border-color:var(--ok);color:#06121f;}
@@ -83,6 +87,13 @@
     padding:7px 10px;display:flex;justify-content:space-between;gap:10px;transition:.15s;}
   .files a:hover{border-color:var(--red);color:var(--red);}
   .files a .sz{color:var(--muted);font-size:11px;}
+  .timing-relation{margin:0 0 14px;padding:12px 14px;border:1px solid var(--line);border-radius:8px;background:#f8fafc;}
+  .timing-relation[hidden]{display:none;}
+  .timing-relation-title{font-family:var(--display);font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--navy);}
+  .timing-relation-note{margin:5px 0 9px;font-size:12px;line-height:1.45;color:var(--muted);}
+  .timing-relation-links{display:flex;flex-wrap:wrap;gap:7px;}
+  .timing-relation-link{border:1px solid #cbd5e2;border-radius:6px;background:#fff;padding:7px 9px;color:var(--navy);font:10px var(--display);cursor:pointer;}
+  .timing-relation-link:hover,.timing-relation-link:focus-visible{border-color:var(--red);color:var(--red);outline:0;}
   /* админ-правка */
   .admin-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:14px;padding-top:12px;border-top:1px dashed var(--line);}
   .admin-row input{font-size:12.5px;border:1px solid var(--line);border-radius:7px;padding:7px 9px;}
@@ -120,6 +131,56 @@
   .boris-brand b{color:var(--navy);}
   .boris-note{font-size:12px;color:var(--muted);margin-top:16px;line-height:1.5;}
   .boris-note.ok{color:#1b9e5e;font-weight:600;}
+
+  /* ---- Архив инженерной телеметрии ---- */
+  .timing-archive{margin:0 0 28px;border:1px solid var(--line);border-radius:8px;background:#fff;overflow:hidden;}
+  .timing-archive[hidden]{display:none;}
+  .ta-head{display:flex;align-items:center;gap:14px;padding:15px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap;}
+  .ta-title{display:flex;align-items:baseline;gap:10px;min-width:0;}
+  .ta-title h2{font-family:var(--display);font-size:15px;line-height:1;text-transform:uppercase;letter-spacing:0;margin:0;color:var(--navy);}
+  .ta-title span{font-family:var(--display);font-size:9.5px;line-height:1;text-transform:uppercase;letter-spacing:0;color:var(--muted);white-space:nowrap;}
+  .ta-session{display:flex;align-items:center;gap:8px;margin-left:auto;min-width:min(100%,430px);}
+  .ta-video-relation{display:flex;align-items:center;gap:8px;flex-basis:100%;min-width:0;padding-top:11px;border-top:1px dashed var(--line);}
+  .ta-video-relation[hidden]{display:none;}
+  .ta-video-label{font-family:var(--display);font-size:9.5px;text-transform:uppercase;letter-spacing:0;color:var(--navy);white-space:nowrap;}
+  .ta-video-note{font:10px var(--body);color:var(--muted);white-space:nowrap;}
+  .ta-video-links{display:flex;flex:1;min-width:0;gap:6px;overflow:auto;padding-bottom:1px;}
+  .ta-video-link{flex:0 0 auto;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border:1px solid var(--line);border-radius:5px;background:#fff;padding:6px 8px;color:var(--navy);font:9.5px var(--display);cursor:pointer;}
+  .ta-video-link:hover,.ta-video-link:focus-visible{border-color:var(--red);color:var(--red);outline:0;}
+  .ta-session label,.ta-rate label,.ta-time label{font-family:var(--display);font-size:9.5px;text-transform:uppercase;letter-spacing:0;color:var(--muted);white-space:nowrap;}
+  .ta-session select,.ta-rate select,.ta-time input{min-width:0;width:100%;height:36px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--navy);font:12px var(--body);padding:0 10px;outline:none;}
+  .ta-session select:focus,.ta-rate select:focus,.ta-time input:focus,.ta-icon:focus-visible{border-color:var(--navy);outline:2px solid rgba(27,54,93,.18);outline-offset:1px;}
+  .ta-empty{padding:22px 16px;color:var(--muted);font:12px var(--body);}
+  .ta-body{display:grid;grid-template-columns:minmax(0,1fr) 214px;min-height:0;}
+  .ta-main{min-width:0;border-right:1px solid var(--line);}
+  .ta-flag{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:42px;padding:0 16px;background:#f4f7fb;border-bottom:1px solid var(--line);}
+  .ta-flag strong{font-family:var(--display);font-size:13px;text-transform:uppercase;letter-spacing:0;color:var(--navy);}
+  .ta-flag span{font-family:var(--display);font-size:9px;text-transform:uppercase;letter-spacing:0;color:var(--muted);text-align:right;}
+  .ta-flag.flag-green{border-left:5px solid #2eac72;}.ta-flag.flag-red{border-left:5px solid var(--red);}.ta-flag.flag-yellow,.ta-flag.flag-fcy,.ta-flag.flag-full-course-yellow,.ta-flag.flag-code-60{border-left:5px solid #d89a00;}.ta-flag.flag-safety-car{border-left:5px solid #7d55b8;}.ta-flag.flag-finish{border-left:5px solid #303946;}
+  .ta-kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));border-bottom:1px solid var(--line);}
+  .ta-kpi{min-width:0;padding:12px 14px;border-right:1px solid var(--line);}
+  .ta-kpi:nth-child(4n){border-right:0;}.ta-kpi:nth-child(n+5){border-top:1px solid var(--line);}
+  .ta-kpi b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--display);font-size:14px;line-height:1.15;color:var(--navy);font-variant-numeric:tabular-nums;}
+  .ta-kpi span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:4px;font-family:var(--display);font-size:8.5px;text-transform:uppercase;letter-spacing:0;color:var(--muted);}
+  .ta-chart-wrap{padding:14px 16px 10px;border-bottom:1px solid var(--line);}
+  .ta-chart-labels{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:0 0 8px;color:var(--muted);font-family:var(--display);font-size:9px;text-transform:uppercase;letter-spacing:0;}
+  .ta-chart-labels span:last-child{color:var(--navy);font-variant-numeric:tabular-nums;}
+  .ta-chart{display:block;width:100%;height:172px;cursor:crosshair;touch-action:manipulation;}
+  .ta-controls{display:grid;grid-template-columns:auto auto auto auto minmax(80px,1fr) minmax(110px,auto) minmax(104px,auto);align-items:center;gap:8px;padding:12px 16px;}
+  .ta-icon{display:inline-flex;align-items:center;justify-content:center;width:44px;height:44px;border:1px solid var(--line);border-radius:6px;background:#fff;color:var(--navy);font:16px var(--body);cursor:pointer;line-height:1;}
+  .ta-icon:hover{border-color:var(--navy);background:#f4f7fb;}.ta-icon.primary{background:var(--navy);border-color:var(--navy);color:#fff;}
+  .ta-range{appearance:none;width:100%;height:44px;background:transparent;border-radius:0;outline:none;cursor:pointer;}
+  .ta-range::-webkit-slider-runnable-track{height:4px;background:var(--line);}.ta-range::-moz-range-track{height:4px;background:var(--line);}
+  .ta-range::-webkit-slider-thumb{appearance:none;width:16px;height:16px;border:2px solid #fff;border-radius:50%;background:var(--red);box-shadow:0 0 0 1px var(--red);}
+  .ta-range::-moz-range-thumb{width:14px;height:14px;border:2px solid #fff;border-radius:50%;background:var(--red);box-shadow:0 0 0 1px var(--red);}
+  .ta-rate,.ta-time{display:flex;align-items:center;gap:6px;}.ta-rate select{width:66px;}.ta-time input{width:102px;font-variant-numeric:tabular-nums;}
+  .ta-side{min-width:0;display:flex;flex-direction:column;}
+  .ta-side-head{padding:13px 14px 10px;border-bottom:1px solid var(--line);font-family:var(--display);font-size:10px;text-transform:uppercase;letter-spacing:0;color:var(--navy);}
+  .ta-events{overflow:auto;max-height:316px;}.ta-event{display:grid;grid-template-columns:48px 1fr;gap:8px;width:100%;padding:10px 14px;border:0;border-bottom:1px solid var(--line);background:#fff;color:inherit;text-align:left;font:11px var(--body);line-height:1.3;cursor:pointer;}.ta-event:hover,.ta-event:focus-visible{background:#f4f7fb;outline:0;}.ta-event time{font-family:var(--display);font-size:9px;color:var(--muted);font-variant-numeric:tabular-nums;}.ta-event b{display:block;font-family:var(--display);font-size:10px;text-transform:uppercase;letter-spacing:0;color:var(--navy);}.ta-event span{display:block;margin-top:2px;color:var(--muted);}.ta-event.active{border-left:3px solid var(--red);padding-left:11px;}
+  .ta-side-empty{padding:14px;color:var(--muted);font-size:11px;line-height:1.4;}
+  @media(max-width:880px){.ta-body{grid-template-columns:1fr;}.ta-main{border-right:0;}.ta-side{border-top:1px solid var(--line);}.ta-events{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));max-height:none;}.ta-event{border-bottom:0;border-right:1px solid var(--line);}.ta-side-empty{grid-column:1/-1;}.ta-session{margin-left:0;width:100%;}.ta-session select{flex:1;}}
+  @media(max-width:620px){.ta-head{padding:14px;}.ta-video-relation{align-items:flex-start;flex-wrap:wrap;gap:5px 8px;}.ta-video-links{flex-basis:100%;}.ta-video-link{max-width:100%;}.ta-kpis{grid-template-columns:repeat(2,minmax(0,1fr));}.ta-kpi:nth-child(4n){border-right:1px solid var(--line);}.ta-kpi:nth-child(2n){border-right:0;}.ta-kpi:nth-child(n+3){border-top:1px solid var(--line);}.ta-chart-wrap{padding:12px 14px 8px;}.ta-controls{grid-template-columns:auto auto auto auto minmax(48px,1fr);grid-template-areas:"play back forward reset range" "rate rate time time time";padding:11px 14px;}.ta-session select,.ta-rate select,.ta-time input{height:44px;}.ta-play{grid-area:play;}.ta-back{grid-area:back;}.ta-forward{grid-area:forward;}.ta-reset{grid-area:reset;}.ta-range{grid-area:range;}.ta-rate{grid-area:rate;min-width:0;}.ta-time{grid-area:time;justify-content:flex-end;min-width:0;}.ta-events{grid-template-columns:1fr;}.ta-event{border-right:0;border-bottom:1px solid var(--line);}}
+  @media(max-width:360px){.ta-rate label,.ta-time label{display:none;}.ta-time input{width:82px;}}
 </style>
 </head>
 <body>
@@ -142,6 +203,35 @@
         <span class="sub">Онборд-видео · телеметрия · сезоны команды</span>
         <button class="boris-btn" type="button" data-boris-trigger>Кнопка для Бориса</button>
       </div>
+
+      <section class="timing-archive reveal" id="timingArchive" aria-labelledby="timingArchiveTitle">
+        <div class="ta-head">
+          <div class="ta-title"><h2 id="timingArchiveTitle">Телеметрия сессии</h2><span>архив</span></div>
+          <div class="ta-session"><label for="timingSession">Сессия</label><select id="timingSession" aria-label="Выбор архивной телеметрической сессии" disabled><option>Загрузка…</option></select></div>
+          <div class="ta-video-relation" id="timingVideoRelation" hidden></div>
+        </div>
+        <div class="ta-empty" id="timingArchiveEmpty" role="status">Загрузка сохранённых телеметрических сессий…</div>
+        <div class="ta-body" id="timingArchiveBody" hidden>
+          <div class="ta-main">
+            <div class="ta-flag" id="timingFlag"><strong>—</strong><span id="timingObserved">—</span></div>
+            <div class="ta-kpis" id="timingKpis"></div>
+            <div class="ta-chart-wrap">
+              <div class="ta-chart-labels"><span>Pace5 · Gap впереди</span><span id="timingChartRange">—</span></div>
+              <canvas class="ta-chart" id="timingChart" aria-label="Временной график темпа и интервала" role="img"></canvas>
+            </div>
+            <div class="ta-controls" aria-label="Управление воспроизведением телеметрии">
+              <button class="ta-icon primary ta-play" id="timingPlay" type="button" aria-label="Воспроизвести" title="Воспроизвести">&#9654;</button>
+              <button class="ta-icon ta-back" id="timingStepBack" type="button" aria-label="Предыдущий срез" title="Предыдущий срез">&#9664;</button>
+              <button class="ta-icon ta-forward" id="timingStepForward" type="button" aria-label="Следующий срез" title="Следующий срез">&#9654;</button>
+              <button class="ta-icon ta-reset" id="timingReset" type="button" aria-label="К началу сессии" title="К началу сессии">&#8617;</button>
+              <input class="ta-range" id="timingRange" type="range" min="0" max="0" value="0" step="1" aria-label="Положение во времени" />
+              <div class="ta-rate"><label for="timingRate">Скорость</label><select id="timingRate" aria-label="Скорость воспроизведения"><option value="0.25">0.25x</option><option value="0.5">0.5x</option><option value="1">1x</option><option value="2">2x</option><option value="4" selected>4x</option><option value="8">8x</option><option value="16">16x</option><option value="32">32x</option><option value="64">64x</option></select></div>
+              <div class="ta-time"><label for="timingTime">Запись</label><input id="timingTime" inputmode="numeric" autocomplete="off" aria-label="Время с начала сохранённой записи" value="00:00:00" /></div>
+            </div>
+          </div>
+          <aside class="ta-side" aria-label="События сессии"><div class="ta-side-head">События</div><div class="ta-events" id="timingEvents"></div></aside>
+        </div>
+      </section>
 
       <div class="filters reveal">
         <input class="search" id="q" type="search" placeholder="Поиск: пилот, трасса, заголовок…" />
@@ -198,5 +288,6 @@
 
   <script src="/assets/hls.min.js"></script>
   <script src="/assets/archive.js"></script>
+  <script src="/assets/timing-archive.js"></script>
 </body>
 </html>

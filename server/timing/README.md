@@ -85,8 +85,9 @@ about 70 MB of raw WebSocket data over 24 hours at that cadence. Race traffic
 is deliberately budgeted much higher: reserve 500 MB of raw data and 1 GB total
 for a 24-hour analysis session, then keep at least 10 GB free under
 `/var/lib/balchug` before race day. The seven-day raw-retention policy is only
-applied to stopped sessions after a checkpoint exists; normalized analytics and
-backups are not removed by that command.
+applied to stopped sessions after a checkpoint and a durable archive-playback
+projection exist for every captured heat; normalized analytics, playback
+anchors and backups are not removed by that command.
 
 ## Engineer session lifecycle
 
@@ -154,8 +155,9 @@ freshness-only `quality` events have no cursor and cannot hide a stale source.
 
 If a stopped session was recorded before a normalizer or metric release, rebuild
 only its derived state from its unchanged raw frames. Always inspect the
-preflight first; the command rejects active sessions and leaves raw frames and
-decoded messages intact:
+preflight first; the command rejects active sessions, pending/failed raw frames
+and any persisted reconnect gap (until temporal gap replay is implemented), and
+leaves raw frames and decoded messages intact:
 
 ```bash
 PYTHONPATH=server python3 -m timing.rebuild --db /var/lib/balchug/timing.db \
@@ -163,6 +165,31 @@ PYTHONPATH=server python3 -m timing.rebuild --db /var/lib/balchug/timing.db \
 PYTHONPATH=server python3 -m timing.rebuild --db /var/lib/balchug/timing.db \
   --session <analysis-session-id>
 ```
+
+## Telemetry archive playback API
+
+Stopped or aborted sessions receive a compact `timing-archive.v1` keyframe
+projection every five seconds and at Balchug/track event boundaries. Each
+keyframe contains the normalized decision-strip state, current flag and a
+compact class comparison; it is compressed, checksummed and retained after raw
+frame retention. The archive UI treats values as `last_observed`, never
+interpolates POS/PIC/STATE/flag/pit facts, and labels the effective source time
+of every selected snapshot.
+
+```text
+GET /api/timing/sessions/archive
+GET /api/timing/sessions/{id}/archive?generation={n}&max_points=720
+GET /api/timing/sessions/{id}/archive/snapshot?generation={n}&at_us={utc-microseconds}
+```
+
+The session list includes available heat generations. A multi-heat session
+requires `generation`; generations are never merged into one replay timeline.
+The manifest is bounded to 720 keyframes, retaining endpoints and relevant
+event boundaries where possible. Its flag, pit and lap markers come from
+durable normalized facts, not the expiring live SSE outbox. A legacy stopped
+session with raw frames can be backfilled using the rebuild command above; a
+session without either raw evidence or a projection returns an explicit missing
+archive response rather than a fabricated history.
 
 ## Ingest worker operation
 

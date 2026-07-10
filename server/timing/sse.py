@@ -70,9 +70,13 @@ class CursorWindow:
     def requires_reset(self, cursor: int) -> bool:
         if cursor < 0 or cursor > self.latest_id:
             return True
-        if cursor < self.deleted_through_id:
+        # A retained cursor floor marks a destructive retention/rebuild
+        # boundary. Be conservative at the exact boundary too: a full
+        # snapshot is inexpensive and cannot combine new deltas with an old
+        # client-side generation.
+        if self.deleted_through_id and cursor <= self.deleted_through_id:
             return True
-        if cursor in {0, self.deleted_through_id, self.latest_id}:
+        if cursor in {0, self.latest_id}:
             return False
         return not self.cursor_exists
 

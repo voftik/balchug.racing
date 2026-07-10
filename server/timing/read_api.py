@@ -9,6 +9,8 @@ permission to mutate timing facts.
 
 from __future__ import annotations
 
+import gzip
+import hashlib
 import json
 import sqlite3
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -19,6 +21,8 @@ from typing import Any, Literal
 
 from .config import now_us
 from .db import connect
+from .metric_store import PLAYBACK_PAYLOAD_CODEC, PLAYBACK_PROJECTION_VERSION
+from .playback import PLAYBACK_SCHEMA_VERSION
 
 
 US_PER_SECOND = 1_000_000
@@ -30,6 +34,12 @@ MAX_CHART_POINTS = 720
 DEFAULT_FACT_LIMIT = 200
 MAX_FACT_LIMIT = 500
 LIVE_SCHEMA_VERSION = "timing-live.v1"
+ARCHIVE_SCHEMA_VERSION = PLAYBACK_SCHEMA_VERSION
+MAX_ARCHIVE_SESSIONS = 100
+# Markers are limited independently from chart keyframes.  A 24-hour stint can
+# contain more than 500 own laps, so retain the entire plausible engineer
+# timeline while keeping the public manifest bounded.
+MAX_ARCHIVE_MARKERS = 2_000
 
 SCOPE_KINDS = frozenset(("participant", "class", "session"))
 FreshnessStatus = Literal["LIVE", "STALE", "OFFLINE"]
@@ -49,6 +59,10 @@ class ReadValidationError(TimingReadError):
 
 class ScopeNotFoundError(TimingReadError):
     """A requested metric scope is not a source-derived scope in this heat."""
+
+
+class ArchiveProjectionMissingError(TimingReadError):
+    """A stopped session has no durable historical playback projection yet."""
 
 
 @dataclass(frozen=True)
@@ -195,6 +209,37 @@ class TimingReadModel:
             from_at_us=from_at_us,
             to_at_us=to_at_us,
             limit=limit,
+        )
+
+    def archived_sessions(self, *, limit: int = 50) -> dict[str, Any]:
+        return read_archived_sessions(database=self.database, limit=limit)
+
+    def archive_manifest(
+        self,
+        session_id: str,
+        *,
+        generation: int | None = None,
+        max_points: int = MAX_CHART_POINTS,
+    ) -> dict[str, Any]:
+        return read_archive_manifest(
+            session_id,
+            database=self.database,
+            generation=generation,
+            max_points=max_points,
+        )
+
+    def archive_snapshot(
+        self,
+        session_id: str,
+        *,
+        at_us: int | None = None,
+        generation: int | None = None,
+    ) -> dict[str, Any]:
+        return read_archive_snapshot(
+            session_id,
+            database=self.database,
+            at_us=at_us,
+            generation=generation,
         )
 
 
@@ -1071,6 +1116,402 @@ def read_metric_history(
                 for row in rows
             ],
             "provenance_contract": _provenance_contract(),
+        }
+
+
+def _require_archived_session(connection: sqlite3.Connection, session_id: str) -> sqlite3.Row:
+    session = _session_row(connection, session_id)
+    if session["lifecycle"] not in {"stopped", "aborted"}:
+        raise ReadValidationError("Archive playback is available only for stopped or aborted sessions")
+    return session
+
+
+def _archive_heat_rows(connection: sqlite3.Connection, session_id: str) -> list[sqlite3.Row]:
+    return list(
+        connection.execute(
+            """
+            SELECT h.id,h.analysis_session_id,h.generation,h.external_name,h.provider_started_at_us,
+                   h.provider_finished_at_us,h.created_at_us,
+                   MIN(p.observed_at_us) AS first_at_us,MAX(p.observed_at_us) AS last_at_us,
+                   COUNT(*) AS point_count,MIN(p.projection_version) AS projection_version,
+                   MAX(p.metric_version) AS metric_version
+            FROM source_heats h
+            JOIN playback_snapshots p ON p.source_heat_id = h.id
+            WHERE h.analysis_session_id = ?
+            GROUP BY h.id
+            ORDER BY h.generation,h.id
+            """,
+            (session_id,),
+        ).fetchall()
+    )
+
+
+def _select_archive_heat(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+    generation: int | None,
+) -> tuple[sqlite3.Row, list[sqlite3.Row]]:
+    if generation is not None and (type(generation) is not int or generation < 1):
+        raise ReadValidationError("generation must be a positive integer")
+    heats = _archive_heat_rows(connection, session_id)
+    if not heats:
+        raise ArchiveProjectionMissingError(
+            "Archive playback projection is missing; rebuild this stopped session from retained raw frames"
+        )
+    if generation is None:
+        if len(heats) != 1:
+            raise ReadValidationError("generation is required when an archived session contains multiple heats")
+        return heats[0], heats
+    selected = next((heat for heat in heats if int(heat["generation"]) == generation), None)
+    if selected is None:
+        raise ScopeNotFoundError(f"Archived heat generation not found: {generation}")
+    return selected, heats
+
+
+def _decode_playback_payload(row: sqlite3.Row) -> dict[str, Any]:
+    if row["payload_codec"] != PLAYBACK_PAYLOAD_CODEC:
+        raise TimingReadError("Stored archive playback payload has an unsupported codec")
+    if int(row["projection_version"]) != PLAYBACK_PROJECTION_VERSION:
+        raise TimingReadError("Stored archive playback payload has an unsupported projection version")
+    try:
+        encoded = gzip.decompress(bytes(row["payload"]))
+        digest = hashlib.sha256(encoded).hexdigest()
+        payload = json.loads(encoded)
+    except (OSError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise TimingReadError("Stored archive playback payload is invalid") from error
+    if digest != row["payload_sha256"]:
+        raise TimingReadError("Stored archive playback payload hash does not match")
+    if not isinstance(payload, dict) or payload.get("schema_version") != ARCHIVE_SCHEMA_VERSION:
+        raise TimingReadError("Stored archive playback payload has an unsupported schema")
+    if payload.get("observed_at_us") != int(row["observed_at_us"]):
+        raise TimingReadError("Stored archive playback payload does not match its timeline boundary")
+    return payload
+
+
+def _manifest_playback_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep chart manifests small; detailed class state is seek-only data."""
+
+    manifest_payload = dict(payload)
+    manifest_payload.pop("class_participants", None)
+    return manifest_payload
+
+
+def _archive_point_rows(
+    connection: sqlite3.Connection,
+    *,
+    heat_id: int,
+    max_points: int,
+) -> tuple[list[sqlite3.Row], int]:
+    metadata = connection.execute(
+        """
+        SELECT observed_second,observed_at_us,is_event_boundary
+        FROM playback_snapshots
+        WHERE source_heat_id = ?
+        ORDER BY observed_at_us,observed_second
+        """,
+        (heat_id,),
+    ).fetchall()
+    count = len(metadata)
+    if count <= max_points:
+        selected_seconds = [int(row["observed_second"]) for row in metadata]
+    else:
+        mandatory = [int(metadata[0]["observed_second"]), int(metadata[-1]["observed_second"])]
+        mandatory.extend(int(row["observed_second"]) for row in metadata if row["is_event_boundary"])
+        mandatory = sorted(set(mandatory))
+        if len(mandatory) >= max_points:
+            selected_seconds = _evenly_spaced(mandatory, max_points)
+        else:
+            selected = set(mandatory)
+            candidates = [int(row["observed_second"]) for row in metadata if int(row["observed_second"]) not in selected]
+            selected.update(_evenly_spaced(candidates, max_points - len(selected)))
+            selected_seconds = sorted(selected)
+    placeholders = ",".join("?" for _ in selected_seconds)
+    rows = connection.execute(
+        f"""
+        SELECT observed_second,observed_at_us,source_frame_id,source_message_id,source_key,
+               projection_version,metric_version,is_event_boundary,payload_codec,payload,payload_sha256
+        FROM playback_snapshots
+        WHERE source_heat_id = ? AND observed_second IN ({placeholders})
+        ORDER BY observed_at_us,observed_second
+        """,
+        (heat_id, *selected_seconds),
+    ).fetchall()
+    return list(rows), count
+
+
+def _evenly_spaced(values: Sequence[int], count: int) -> list[int]:
+    if count <= 0 or not values:
+        return []
+    if count >= len(values):
+        return list(values)
+    if count == 1:
+        return [values[0]]
+    return sorted({values[(index * (len(values) - 1)) // (count - 1)] for index in range(count)})
+
+
+def _archive_markers(
+    connection: sqlite3.Connection,
+    *,
+    heat_id: int,
+    first_at_us: int,
+    last_at_us: int,
+) -> dict[str, list[dict[str, Any]]]:
+    def authoritative(*values: Any) -> Any:
+        return next((value for value in values if value is not None), None)
+
+    flag_rows = connection.execute(
+        """
+        SELECT flag,provider_code,provider_label,started_at_us,ended_at_us,
+               observed_started_at_us,observed_ended_at_us,calibrated_started_at_us,calibrated_ended_at_us
+        FROM track_flag_periods
+        WHERE source_heat_id = ? AND started_at_us <= ?
+          AND (ended_at_us IS NULL OR ended_at_us >= ?)
+        ORDER BY started_at_us,id
+        LIMIT ?
+        """,
+        (heat_id, last_at_us, first_at_us, MAX_ARCHIVE_MARKERS),
+    ).fetchall()
+    pit_rows = connection.execute(
+        """
+        SELECT f.entered_at_us,f.exited_at_us,f.entered_lap,f.exited_lap,f.pit_lane_ms,f.completed,
+               f.stop_number,p.id AS participant_id,p.start_number,p.team_name
+        FROM pit_stops f
+        JOIN participants p ON p.id = f.participant_id
+        WHERE f.source_heat_id = ? AND p.is_ours = 1
+          AND f.entered_at_us >= ? AND f.entered_at_us <= ?
+        ORDER BY f.entered_at_us,f.stop_number
+        LIMIT ?
+        """,
+        (heat_id, first_at_us, last_at_us, MAX_ARCHIVE_MARKERS),
+    ).fetchall()
+    lap_rows = connection.execute(
+        """
+        SELECT f.completed_at_us,f.lap_number,f.duration_ms,f.flag,f.is_clean,p.id AS participant_id
+        FROM laps f
+        JOIN participants p ON p.id = f.participant_id
+        WHERE f.source_heat_id = ? AND p.is_ours = 1 AND f.completed_at_us IS NOT NULL
+          AND f.completed_at_us >= ? AND f.completed_at_us <= ?
+        ORDER BY f.completed_at_us,f.lap_number
+        LIMIT ?
+        """,
+        (heat_id, first_at_us, last_at_us, MAX_ARCHIVE_MARKERS),
+    ).fetchall()
+    return {
+        "flags": [
+            {
+                "flag": row["flag"],
+                "provider_code": row["provider_code"],
+                "provider_label": row["provider_label"],
+                "started_at_us": authoritative(
+                    row["calibrated_started_at_us"], row["observed_started_at_us"], row["started_at_us"]
+                ),
+                "ended_at_us": authoritative(
+                    row["calibrated_ended_at_us"], row["observed_ended_at_us"], row["ended_at_us"]
+                ),
+            }
+            for row in flag_rows
+        ],
+        "pits": [
+            {
+                "participant_id": row["participant_id"],
+                "start_number": row["start_number"],
+                "team_name": row["team_name"],
+                "stop_number": row["stop_number"],
+                "entered_at_us": row["entered_at_us"],
+                "exited_at_us": row["exited_at_us"],
+                "entered_lap": row["entered_lap"],
+                "exited_lap": row["exited_lap"],
+                "pit_lane_ms": row["pit_lane_ms"],
+                "completed": bool(row["completed"]),
+            }
+            for row in pit_rows
+        ],
+        "laps": [
+            {
+                "participant_id": row["participant_id"],
+                "completed_at_us": row["completed_at_us"],
+                "lap_number": row["lap_number"],
+                "duration_ms": row["duration_ms"],
+                "flag": row["flag"],
+                "is_clean": bool(row["is_clean"]),
+            }
+            for row in lap_rows
+        ],
+    }
+
+
+def _archive_heat_summary(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        **_heat_payload(row),
+        "first_at_us": int(row["first_at_us"]),
+        "last_at_us": int(row["last_at_us"]),
+        "point_count": int(row["point_count"]),
+        "projection_version": int(row["projection_version"]),
+        "metric_version": int(row["metric_version"]),
+    }
+
+
+def read_archived_sessions(
+    *,
+    database: str | Path | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """List bounded archive-ready sessions without exposing any writer surface."""
+
+    if type(limit) is not int or not 1 <= limit <= MAX_ARCHIVE_SESSIONS:
+        raise ReadValidationError(f"limit must be an integer from 1 through {MAX_ARCHIVE_SESSIONS}")
+    with _readonly_snapshot(database) as connection:
+        rows = connection.execute(
+            """
+            SELECT s.id,ts.slug AS source_slug,ts.source_url,ts.display_name AS source_name,
+                   s.timezone_name,s.mode,s.lifecycle,s.race_duration_s,s.required_pits,
+                   s.our_participant_id,s.our_class,s.identity_state,s.started_at_us,
+                   s.stopped_at_us,s.stop_intent,s.created_at_us,s.updated_at_us,
+                   MIN(p.observed_at_us) AS first_at_us,MAX(p.observed_at_us) AS last_at_us,
+                   COUNT(DISTINCT h.id) AS heat_count,COUNT(p.observed_second) AS point_count
+            FROM analysis_sessions s
+            JOIN timing_sources ts ON ts.id = s.source_id
+            JOIN source_heats h ON h.analysis_session_id = s.id
+            JOIN playback_snapshots p ON p.source_heat_id = h.id
+            WHERE s.lifecycle IN ('stopped','aborted')
+            GROUP BY s.id
+            ORDER BY last_at_us DESC,s.created_at_us DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            heats = [_archive_heat_summary(heat) for heat in _archive_heat_rows(connection, row["id"])]
+            items.append(
+                {
+                    "session": _session_payload(row),
+                    "first_at_us": int(row["first_at_us"]),
+                    "last_at_us": int(row["last_at_us"]),
+                    "heat_count": int(row["heat_count"]),
+                    "point_count": int(row["point_count"]),
+                    "heats": heats,
+                }
+            )
+        return {
+            "schema_version": ARCHIVE_SCHEMA_VERSION,
+            "items": items,
+            "semantics": {"state": "last_observed", "series": "step"},
+        }
+
+
+def read_archive_manifest(
+    session_id: str,
+    *,
+    database: str | Path | None = None,
+    generation: int | None = None,
+    max_points: int = MAX_CHART_POINTS,
+) -> dict[str, Any]:
+    """Read one archived heat's bounded keyframes and source event markers."""
+
+    session_id = _require_session_id(session_id)
+    max_points = _require_max_points(max_points)
+    with _readonly_snapshot(database) as connection:
+        session = _require_archived_session(connection, session_id)
+        heat, available_heats = _select_archive_heat(connection, session_id=session_id, generation=generation)
+        point_rows, source_point_count = _archive_point_rows(
+            connection,
+            heat_id=int(heat["id"]),
+            max_points=max_points,
+        )
+        first_at_us = int(heat["first_at_us"])
+        last_at_us = int(heat["last_at_us"])
+        return {
+            "schema_version": ARCHIVE_SCHEMA_VERSION,
+            "session": _session_payload(session),
+            "heat": _archive_heat_summary(heat),
+            "available_heats": [_archive_heat_summary(candidate) for candidate in available_heats],
+            "range": {
+                "first_at_us": first_at_us,
+                "last_at_us": last_at_us,
+                "source_point_count": source_point_count,
+                "downsampled": source_point_count > len(point_rows),
+            },
+            "keyframes": [
+                {
+                    "observed_at_us": int(row["observed_at_us"]),
+                    "is_event_boundary": bool(row["is_event_boundary"]),
+                    "source": {
+                        "frame_id": row["source_frame_id"],
+                        "message_id": row["source_message_id"],
+                        "key": row["source_key"],
+                    },
+                    "snapshot": _manifest_playback_payload(_decode_playback_payload(row)),
+                }
+                for row in point_rows
+            ],
+            "markers": _archive_markers(
+                connection,
+                heat_id=int(heat["id"]),
+                first_at_us=first_at_us,
+                last_at_us=last_at_us,
+            ),
+            "semantics": {"state": "last_observed", "series": "step"},
+            "system_assumption": _system_assumptions(),
+        }
+
+
+def read_archive_snapshot(
+    session_id: str,
+    *,
+    database: str | Path | None = None,
+    at_us: int | None = None,
+    generation: int | None = None,
+) -> dict[str, Any]:
+    """Return the last confirmed archive state at or before one playhead time."""
+
+    session_id = _require_session_id(session_id)
+    at_us = _require_timestamp("at_us", at_us)
+    with _readonly_snapshot(database) as connection:
+        session = _require_archived_session(connection, session_id)
+        heat, _ = _select_archive_heat(connection, session_id=session_id, generation=generation)
+        first_at_us = int(heat["first_at_us"])
+        last_at_us = int(heat["last_at_us"])
+        requested_at_us = last_at_us if at_us is None else at_us
+        if not first_at_us <= requested_at_us <= last_at_us:
+            raise ReadValidationError("at_us must be inside the archived heat range")
+        row = connection.execute(
+            """
+            SELECT observed_second,observed_at_us,source_frame_id,source_message_id,source_key,
+                   projection_version,metric_version,is_event_boundary,payload_codec,payload,payload_sha256
+            FROM playback_snapshots
+            WHERE source_heat_id = ? AND observed_at_us <= ?
+            ORDER BY observed_at_us DESC,observed_second DESC
+            LIMIT 1
+            """,
+            (int(heat["id"]), requested_at_us),
+        ).fetchone()
+        if row is None:
+            raise TimingReadError("Archive projection has no snapshot at the requested time")
+        next_row = connection.execute(
+            """
+            SELECT observed_at_us
+            FROM playback_snapshots
+            WHERE source_heat_id = ? AND observed_at_us > ?
+            ORDER BY observed_at_us,observed_second
+            LIMIT 1
+            """,
+            (int(heat["id"]), requested_at_us),
+        ).fetchone()
+        return {
+            "schema_version": ARCHIVE_SCHEMA_VERSION,
+            "session": _session_payload(session),
+            "heat": _archive_heat_summary(heat),
+            "playback": {
+                "requested_at_us": requested_at_us,
+                "effective_at_us": int(row["observed_at_us"]),
+                "next_at_us": int(next_row["observed_at_us"]) if next_row is not None else None,
+                "is_event_boundary": bool(row["is_event_boundary"]),
+            },
+            "snapshot": _decode_playback_payload(row),
+            "semantics": {"state": "last_observed", "series": "step"},
+            "system_assumption": _system_assumptions(),
         }
 
 

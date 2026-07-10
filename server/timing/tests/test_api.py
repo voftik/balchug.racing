@@ -1,3 +1,6 @@
+import gzip
+import hashlib
+import json
 import os
 import tempfile
 import unittest
@@ -141,6 +144,73 @@ class TimingApiTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(response.status_code, 503)
         self.assertIsNone((await self.client.get("/sources/moscow/sessions/active")).json()["session"])
+
+    async def test_public_archive_routes_serve_only_stopped_durable_projection(self):
+        created = await self.create("igora", {"mode": "practice"}, "archive-session")
+        session_id = created.json()["session"]["id"]
+        self.assertEqual((await self.client.get(f"/sessions/{session_id}/archive")).status_code, 422)
+
+        connection = connect(self.database)
+        try:
+            timestamp = 10_000_000
+            connection.execute(
+                "UPDATE analysis_sessions SET lifecycle = 'stopped', stopped_at_us = ? WHERE id = ?",
+                (timestamp, session_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO source_heats(analysis_session_id,generation,external_name,created_at_us)
+                VALUES (?,1,'Practice - Open-Pit',?)
+                """,
+                (session_id, timestamp),
+            )
+            heat_id = connection.execute(
+                "SELECT id FROM source_heats WHERE analysis_session_id = ?", (session_id,)
+            ).fetchone()[0]
+            payload = {
+                "schema_version": "timing-archive.v1",
+                "observed_at_us": timestamp,
+                "measured": {"track_flag": {"flag": "RED"}},
+                "computed": {"session": {"position_overall": 1, "pace_5_ms": 107_491}},
+            }
+            raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            connection.execute(
+                """
+                INSERT INTO playback_snapshots(
+                  source_heat_id,observed_second,observed_at_us,source_key,projection_version,metric_version,
+                  is_event_boundary,payload_codec,payload,payload_sha256,created_at_us,updated_at_us
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    heat_id,
+                    timestamp // 1_000_000,
+                    timestamp,
+                    "archive:10",
+                    1,
+                    1,
+                    1,
+                    "gzip-json-v1",
+                    gzip.compress(raw, mtime=0),
+                    hashlib.sha256(raw).hexdigest(),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        sessions = await self.client.get("/sessions/archive")
+        self.assertEqual(sessions.status_code, 200)
+        self.assertEqual(sessions.json()["schema_version"], "timing-archive.v1")
+        self.assertEqual(sessions.json()["items"][0]["session"]["id"], session_id)
+        manifest = await self.client.get(f"/sessions/{session_id}/archive")
+        self.assertEqual(manifest.status_code, 200)
+        self.assertEqual(manifest.headers["cache-control"], "no-store")
+        self.assertEqual(manifest.json()["keyframes"][0]["snapshot"]["measured"]["track_flag"]["flag"], "RED")
+        snapshot = await self.client.get(f"/sessions/{session_id}/archive/snapshot?at_us={timestamp}")
+        self.assertEqual(snapshot.status_code, 200)
+        self.assertEqual(snapshot.json()["playback"]["effective_at_us"], timestamp)
 
     async def test_public_read_routes_expose_only_bounded_normalized_timing_data(self):
         created = await self.create("igora", {"mode": "practice"}, "read-surface-session")
