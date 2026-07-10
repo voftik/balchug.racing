@@ -55,10 +55,16 @@ until their per-column semantics are decoded; they are not universally integers.
 `STATE` is not a lap-time field. The normalizer preserves every raw value in
 `state_raw` and maps only recognized status forms to `state_kind`:
 
-- a running source timer or recognized elapsed-state encoding -> `ON_TRACK`;
-- `In Pit` and equivalent source forms -> `IN_PIT`;
-- `OutLap` and equivalent source forms -> `OUT_LAP`;
+- `S<literal>` is a source literal: `SIn Pit` -> `IN_PIT`, `SOutLap` ->
+  `OUT_LAP`, and another literal stays `UNKNOWN` until mapped;
+- `E<TsTime>` is an on-track timer target, not a lap/pit duration ->
+  `ON_TRACK` when the TsTime is valid;
 - a new or unrecognized token -> `UNKNOWN`, never a guessed pit or zero time.
+
+Time Service `TsTime` is integer microseconds since `2000-01-01T00:00:00Z`.
+The normalizer stores its raw form and converts only validated values to Unix
+UTC microseconds for `*_at_us` fields. `E<TsTime>` is retained separately as a
+state timer target so it cannot be confused with `LAST`, `BEST` or `L-PIT`.
 
 Pit entry/exit is not inferred from one text cell alone. The state transition is
 reconciled with `t_p.lastPassingIsInPit` and the source `PIT` count, then
