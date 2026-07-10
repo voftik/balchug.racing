@@ -130,11 +130,11 @@
       detail: { selection: selected, trigger: focusReturn }
     }));
   }
-  function timingButton(entry, className) {
+  function timingButton(entry, className, label) {
     var button = document.createElement("button");
     button.type = "button";
     button.className = className;
-    button.textContent = timingEntryTitle(entry);
+    button.textContent = label || timingEntryTitle(entry);
     button.title = "Открыть сохранённую телеметрию. Временная шкала видео не синхронизируется с телеметрией.";
     button.setAttribute("aria-label", "Открыть телеметрию: " + timingEntryTitle(entry) + ". Временная шкала видео независима.");
     button.addEventListener("click", function (event) {
@@ -158,7 +158,7 @@
     label.textContent = "Телеметрия трассы";
     label.title = "Совпали дата, трасса и тип. Временные шкалы записей независимы.";
     slot.appendChild(label);
-    slot.appendChild(timingButton(entries[0], "timing-card-link"));
+    slot.appendChild(timingButton(entries[0], "timing-card-link", "Открыть"));
   }
   function renderModalTimingLinks(item) {
     var slot = $("timingRelation");
