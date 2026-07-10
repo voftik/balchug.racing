@@ -434,6 +434,12 @@ class TimingNormalizer:
             return
         if handle == "a_r":
             self.statistics = {}
+            if write:
+                # ``a_r`` resets the provider's current Statistics view. Raw
+                # feed messages and append-only history rows remain available
+                # for replay; only materialized current snapshots are cleared.
+                connection.execute("DELETE FROM heat_statistics_current WHERE source_heat_id = ?", (self.heat_id,))
+                connection.execute("DELETE FROM source_statistics_current WHERE source_heat_id = ?", (self.heat_id,))
 
     def _start_new_heat(self, connection: sqlite3.Connection, context: FrameMessage) -> None:
         """Close an observed provider heat reset without treating a reconnect as one."""
@@ -632,62 +638,95 @@ class TimingNormalizer:
         driver_name = _text(row.get("current_driver"))
         if not any((start_number, team_name, class_name, car_name, driver_name)):
             return None
-        external_key = (
-            f"nr:{_key(start_number)}"
-            if _key(start_number)
-            else f"team:{_key(team_name)}:class:{_key(class_name)}"
-            if _key(team_name)
-            else f"row:{row_index}"
-        )
-        participant_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"balchug-racing:{self.heat_id}:{external_key}"))
         team_key = _key(team_name)
         start_key = _key(start_number)
         car_key = _key(car_name)
         class_key = _key(class_name)
-        is_ours = int(team_key == OUR_TEAM_KEY or (team_key is None and start_key == OUR_START_NUMBER))
+        existing_ours_conflict = None
+        if start_key == OUR_START_NUMBER and team_key not in {None, OUR_TEAM_KEY}:
+            existing_ours_conflict = connection.execute(
+                """
+                SELECT id FROM participants
+                WHERE source_heat_id = ? AND start_number_key = ? AND team_name_key = ? AND is_ours = 1
+                LIMIT 1
+                """,
+                (self.heat_id, start_key, OUR_TEAM_KEY),
+            ).fetchone()
+        matched_without_number = None
+        if start_key is None and team_key is not None:
+            clauses = ["source_heat_id = ?", "team_name_key = ?"]
+            parameters: list[Any] = [self.heat_id, team_key]
+            if class_key is not None:
+                clauses.append("class_name_key = ?")
+                parameters.append(class_key)
+            matched_without_number = connection.execute(
+                f"SELECT id,external_key FROM participants WHERE {' AND '.join(clauses)} "
+                "ORDER BY is_ours DESC,last_seen_at_us DESC LIMIT 1",
+                tuple(parameters),
+            ).fetchone()
+        if existing_ours_conflict is not None:
+            external_key = f"conflict:nr:{start_key}:team:{team_key}"
+        elif matched_without_number is not None:
+            external_key = matched_without_number["external_key"]
+        elif start_key:
+            external_key = f"nr:{start_key}"
+        elif team_key:
+            external_key = f"team:{team_key}:class:{class_key or ''}"
+        else:
+            external_key = f"row:{row_index}"
+        participant_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"balchug-racing:{self.heat_id}:{external_key}"))
+        is_ours = int(
+            existing_ours_conflict is None
+            and (team_key == OUR_TEAM_KEY or (team_key is None and start_key == OUR_START_NUMBER))
+        )
+        participant_values = {
+            "id": participant_id,
+            "source_heat_id": self.heat_id,
+            "external_key": external_key,
+            "transponder_id": None,
+            "start_number": start_number,
+            "team_name": team_name,
+            "car_name": car_name,
+            "class_name": class_name,
+            "is_ours": is_ours,
+            "active": 1,
+            "first_seen_at_us": context.received_at_us,
+            "last_seen_at_us": context.received_at_us,
+            "identity_key": external_key,
+            "start_number_key": start_key,
+            "team_name_key": team_key,
+            "car_name_key": car_key,
+            "class_name_key": class_key,
+            "identity_source_message_id": context.id,
+            "identity_source_key": context.source_key,
+            "identity_observed_at_us": context.received_at_us,
+        }
+        participant_updates = [
+            "is_ours",
+            "active",
+            "last_seen_at_us",
+            "identity_key",
+            "identity_source_message_id",
+            "identity_source_key",
+            "identity_observed_at_us",
+        ]
+        # A sparse layout can omit NR/CAR/CLS for one tick. Preserve the last
+        # source observation instead of erasing identity and creating a second
+        # participant when the header returns.
+        for raw_column, key_column in (
+            ("start_number", "start_number_key"),
+            ("team_name", "team_name_key"),
+            ("car_name", "car_name_key"),
+            ("class_name", "class_name_key"),
+        ):
+            if participant_values[raw_column] is not None:
+                participant_updates.extend((raw_column, key_column))
         _upsert(
             connection,
             "participants",
-            {
-                "id": participant_id,
-                "source_heat_id": self.heat_id,
-                "external_key": external_key,
-                "transponder_id": None,
-                "start_number": start_number,
-                "team_name": team_name,
-                "car_name": car_name,
-                "class_name": class_name,
-                "is_ours": is_ours,
-                "active": 1,
-                "first_seen_at_us": context.received_at_us,
-                "last_seen_at_us": context.received_at_us,
-                "identity_key": external_key,
-                "start_number_key": start_key,
-                "team_name_key": team_key,
-                "car_name_key": car_key,
-                "class_name_key": class_key,
-                "identity_source_message_id": context.id,
-                "identity_source_key": context.source_key,
-                "identity_observed_at_us": context.received_at_us,
-            },
+            participant_values,
             conflict_columns=("source_heat_id", "external_key"),
-            update_columns=(
-                "start_number",
-                "team_name",
-                "car_name",
-                "class_name",
-                "is_ours",
-                "active",
-                "last_seen_at_us",
-                "identity_key",
-                "start_number_key",
-                "team_name_key",
-                "car_name_key",
-                "class_name_key",
-                "identity_source_message_id",
-                "identity_source_key",
-                "identity_observed_at_us",
-            ),
+            update_columns=tuple(participant_updates),
         )
         # Re-read because the deterministic identifier is only a proposed key;
         # the unique source_heat/external_key constraint owns the actual row.
@@ -744,6 +783,20 @@ class TimingNormalizer:
             class_name,
             driver_name,
         )
+        if existing_ours_conflict is not None:
+            self._emit_stream_event(
+                connection,
+                context,
+                event_type="identity_conflict",
+                payload={
+                    "expected_start_number": OUR_START_NUMBER,
+                    "expected_team": OUR_TEAM_NAME,
+                    "observed_start_number": start_number,
+                    "observed_team": team_name,
+                    "observed_class": class_name,
+                    "participant_id": participant_id,
+                },
+            )
         if team_key == OUR_TEAM_KEY:
             connection.execute(
                 """
@@ -764,6 +817,41 @@ class TimingNormalizer:
                 (context.received_at_us, self.analysis_session_id),
             )
         return participant_id
+
+    def _emit_stream_event(
+        self,
+        connection: sqlite3.Connection,
+        context: FrameMessage,
+        *,
+        event_type: str,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """Emit a replay-safe exceptional event without making it dashboard data."""
+        exists = connection.execute(
+            """
+            SELECT 1 FROM stream_events
+            WHERE analysis_session_id = ? AND source_message_id = ? AND event_type = ?
+            LIMIT 1
+            """,
+            (self.analysis_session_id, context.id, event_type),
+        ).fetchone()
+        if exists is None:
+            connection.execute(
+                """
+                INSERT INTO stream_events(
+                  analysis_session_id,source_heat_id,source_message_id,source_key,event_type,payload_json,created_at_us
+                ) VALUES (?,?,?,?,?,?,?)
+                """,
+                (
+                    self.analysis_session_id,
+                    self.heat_id,
+                    context.id,
+                    context.source_key,
+                    event_type,
+                    _json(payload),
+                    now_us(),
+                ),
+            )
 
     def _write_identity_segment(
         self,
@@ -935,6 +1023,22 @@ class TimingNormalizer:
             conflict_columns=("source_heat_id", "participant_id"),
         )
         if observed:
+            source_laps = _integer(row.get("laps"), minimum=0)
+            if (
+                old is not None
+                and old["laps"] is not None
+                and source_laps is not None
+                and source_laps > int(old["laps"])
+            ):
+                self._complete_laps_from_grid(
+                    connection,
+                    context,
+                    participant_id,
+                    previous_lap=int(old["laps"]),
+                    current_lap=source_laps,
+                    last_lap_ms=_duration_us_to_ms(row.get("last_lap")),
+                    state_kind=state.kind,
+                )
             self._reconcile_pit_and_tire_stint(
                 connection,
                 context,
@@ -944,6 +1048,51 @@ class TimingNormalizer:
                 _integer(row.get("laps"), minimum=0),
                 _text(row.get("pit_time")),
                 old,
+            )
+
+    def _complete_laps_from_grid(
+        self,
+        connection: sqlite3.Connection,
+        context: FrameMessage,
+        participant_id: str,
+        *,
+        previous_lap: int,
+        current_lap: int,
+        last_lap_ms: int | None,
+        state_kind: str,
+    ) -> None:
+        """Create source-numbered lap rows for an explicit LAPS increase.
+
+        If the provider skips numbers, the intermediate rows are retained with
+        unknown duration/completion time rather than inventing individual laps.
+        """
+        for lap_number in range(previous_lap + 1, current_lap + 1):
+            is_latest = lap_number == current_lap
+            _insert_ignore(
+                connection,
+                "laps",
+                {
+                    "id": str(
+                        uuid.uuid5(
+                            uuid.NAMESPACE_URL,
+                            f"balchug-racing:grid-lap:{self.heat_id}:{participant_id}:{context.source_key}:{lap_number}",
+                        )
+                    ),
+                    "source_heat_id": self.heat_id,
+                    "participant_id": participant_id,
+                    "lap_number": lap_number,
+                    "completed_at_us": context.received_at_us if is_latest else None,
+                    "duration_ms": last_lap_ms if is_latest else None,
+                    "sectors_json": None,
+                    "flag": self._current_flag_kind(connection),
+                    "is_in_lap": 0,
+                    "is_out_lap": int(is_latest and state_kind == "OUT_LAP"),
+                    "crosses_pit": 0,
+                    "is_clean": 0,
+                    "source_message_id": context.id,
+                    "source_key": context.source_key,
+                    "created_at_us": now_us(),
+                },
             )
 
     def _write_immediate_flag(self, connection: sqlite3.Connection, context: FrameMessage, flag: FlagState) -> None:

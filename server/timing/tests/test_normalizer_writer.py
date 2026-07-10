@@ -250,6 +250,124 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual([tuple(stint) for stint in stints], [(1, None, 1, 1), (2, 1, None, 1)])
 
+    def test_explicit_laps_create_known_and_skipped_lap_rows_without_guessing_missing_times(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 60_000_000
+        self.apply(
+            [
+                [
+                    "r_i",
+                    {
+                        "l": {"h": [{"n": "NR"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "STATE"}, {"n": "LAPS"}, {"n": "LAST"}]},
+                        "r": [[0, 0, "21"], [0, 1, "BALCHUG Racing"], [0, 2, "CN PRO"], [0, 3, "E60000000"], [0, 4, "5"], [0, 5, "110000000"]],
+                    },
+                ]
+            ],
+            received_at_us=received,
+        )
+        self.apply([["r_c", [[0, 4, "7"], [0, 5, "108000000"]]]], received_at_us=received + 1_000_000)
+        laps = self.connection.execute(
+            "SELECT lap_number,completed_at_us,duration_ms FROM laps ORDER BY lap_number"
+        ).fetchall()
+        self.assertEqual([tuple(lap) for lap in laps], [(6, None, None), (7, received + 1_000_000, 108000)])
+
+    def test_missing_nr_reuses_team_identity_and_conflicting_nr_21_does_not_replace_ours(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 70_000_000
+        self.apply(
+            [
+                [
+                    "r_i",
+                    {
+                        "l": {"h": [{"n": "NR"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "STATE"}]},
+                        "r": [[0, 0, "21"], [0, 1, "BALCHUG Racing"], [0, 2, "CN PRO"], [0, 3, "E70000000"]],
+                    },
+                ]
+            ],
+            received_at_us=received,
+        )
+        self.apply(
+            [
+                [
+                    "r_i",
+                    {
+                        "l": {"h": [{"n": "TEAM"}, {"n": "CLS"}, {"n": "STATE"}]},
+                        "r": [[0, 0, "BALCHUG Racing"], [0, 1, "CN PRO"], [0, 2, "E70001000"]],
+                    },
+                ]
+            ],
+            received_at_us=received + 1_000_000,
+        )
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM participants").fetchone()[0], 1)
+        self.apply(
+            [
+                [
+                    "r_i",
+                    {
+                        "l": {"h": [{"n": "NR"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "STATE"}]},
+                        "r": [[0, 0, "21"], [0, 1, "Another Team"], [0, 2, "CN PRO"], [0, 3, "E70002000"]],
+                    },
+                ]
+            ],
+            received_at_us=received + 2_000_000,
+        )
+        participants = self.connection.execute(
+            "SELECT team_name,is_ours FROM participants ORDER BY is_ours DESC,team_name"
+        ).fetchall()
+        self.assertEqual([tuple(row) for row in participants], [("BALCHUG Racing", 1), ("Another Team", 0)])
+        self.assertEqual(
+            self.connection.execute("SELECT COUNT(*) FROM stream_events WHERE event_type='identity_conflict'").fetchone()[0],
+            1,
+        )
+
+    def test_statistics_reset_clears_only_current_materialization_not_history(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 80_000_000
+        self.apply(
+            [
+                ["s_i", 80_000_000],
+                [
+                    "a_i",
+                    {
+                        "o": "10",
+                        "x": "2",
+                        "b": {
+                            "1": {
+                                "r": "3",
+                                "i": "107491000",
+                                "t": "80001000",
+                                "a": "173.58",
+                                "d": "Киракозов Кирилл",
+                                "n": "BALCHUG Racing",
+                                "c": "Ligier JS53 evo2",
+                                "s": "21",
+                            }
+                        },
+                    },
+                ],
+            ],
+            received_at_us=received,
+        )
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM heat_statistics_current").fetchone()[0], 1)
+        self.apply([["a_r", {}]], received_at_us=received + 1_000_000)
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM heat_statistics_current").fetchone()[0], 0)
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM source_statistics_current").fetchone()[0], 0)
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM statistics_best_lap_history").fetchone()[0], 1)
+
+    def test_lapped_gap_stays_raw_instead_of_becoming_zero_milliseconds(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 90_000_000
+        self.apply(
+            [
+                [
+                    "r_i",
+                    {
+                        "l": {"h": [{"n": "NR"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "STATE"}, {"n": "GAP"}]},
+                        "r": [[0, 0, "21"], [0, 1, "BALCHUG Racing"], [0, 2, "CN PRO"], [0, 3, "E90000000"], [0, 4, "1 lap"]],
+                    },
+                ]
+            ],
+            received_at_us=received,
+        )
+        gap = self.connection.execute("SELECT gap_raw,gap_ms,gap_kind FROM participant_state_current").fetchone()
+        self.assertEqual(tuple(gap), ("1 lap", None, None))
+
 
 if __name__ == "__main__":
     unittest.main()

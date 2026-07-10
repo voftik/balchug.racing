@@ -151,6 +151,59 @@ class IngestSupervisorTests(unittest.IsolatedAsyncioTestCase):
         finally:
             reader.close()
 
+    async def test_reconnect_gap_and_duplicate_physical_passing_do_not_duplicate_normalized_events(self):
+        calls = 0
+        raw = (
+            '{"M":[["s_i",1000000],["h_i",{"n":"Practice","s":1000000,"f":2}],'
+            '["t_i",{"l":[[0,false,0]],"d":[]}],'
+            '["r_i",{"l":{"h":[{"n":"NR"},{"n":"TEAM"},{"n":"CLS"},{"n":"STATE"}]},'
+            '"r":[[0,0,"21"],[0,1,"BALCHUG Racing"],[0,2,"CN PRO"],[0,3,"E1000000"]]}],'
+            '["t_p",[[42,"21",0,500,0,47000,false,1000100]]]]}'
+        )
+
+        class FakeClient:
+            async def raw_frames(self):
+                nonlocal calls
+                calls += 1
+                yield Bootstrap("https://example.test/igora", f"tid-{calls}", None), raw
+                if calls >= 2:
+                    await asyncio.sleep(10)
+
+        supervisor = TimingIngestSupervisor(
+            self.path,
+            client_factory=lambda _url: FakeClient(),
+            frame_processor=TimingNormalizerRegistry(),
+            settings=IngestSettings(reconnect_backoff_s=(0,), active_poll_s=0.01),
+        )
+        task = asyncio.create_task(supervisor.run_session(self.session))
+        try:
+            for _ in range(200):
+                reader = connect(self.path, readonly=True)
+                try:
+                    connections = reader.execute("SELECT COUNT(*) FROM ingest_connections").fetchone()[0]
+                    passings = reader.execute("SELECT COUNT(*) FROM tracker_passing_observations").fetchone()[0]
+                finally:
+                    reader.close()
+                if connections >= 2 and passings == 1:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                self.fail("worker did not reconnect and deduplicate the passing")
+        finally:
+            writable = connect(self.path)
+            try:
+                stop_session(writable, session_id=self.session.id, idempotency_key="stop-reconnect-normalizer")
+            finally:
+                writable.close()
+            await task
+        reader = connect(self.path, readonly=True)
+        try:
+            self.assertEqual(reader.execute("SELECT COUNT(*) FROM ingest_gaps").fetchone()[0], 1)
+            self.assertEqual(reader.execute("SELECT COUNT(*) FROM tracker_passing_observations").fetchone()[0], 1)
+            self.assertEqual(reader.execute("SELECT COUNT(*) FROM track_flag_periods WHERE flag='RED'").fetchone()[0], 1)
+        finally:
+            reader.close()
+
 
 if __name__ == "__main__":
     unittest.main()
