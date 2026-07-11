@@ -117,6 +117,8 @@ The API keeps each visible history at no more than 720 points. A local
 | canvas nonblank check | 32,598 opaque; 31,159 colored pixels |
 | 50 Overview -> Pace -> Pits cycles, p95 after timeline | 10.1 ms |
 | heap after timeline interaction sample | 5.9 MB |
+| 50 four-tab cycles on live-format 24 h fixture, p95 including four animation frames | 80.5 ms |
+| heap after live-format interval interaction sample | 8.9 MB |
 
 The implementation phase in #19 adds source-backed lap, interval, flag and pit
 markers without changing these layout or selection contracts.
@@ -135,6 +137,19 @@ fabricated duration.
 This display is derived entirely from `dashboard/history.pit_stops`, `flags`
 and deterministic participant metrics. Changing the comparison selection only
 changes the displayed rows and never writes a tactical input.
+
+### Interval continuity
+
+The Intervals tab draws seconds only inside one source-valid class-neighbour
+segment. `LAPPED`, non-racing, invalid-source and target-change states arrive
+as explicit null points. The client also inserts a null boundary when the
+source lap difference changes, either compared car enters a confirmed pit
+interval, or an ingest gap overlaps the two observations. uPlot therefore
+cannot bridge those periods with a visually plausible but false line.
+
+The lower axis keeps a tick for every BALCHUG lap. Labels use the requested
+five-lap step while it fits; a full 12/24-hour overview thins labels only by a
+multiple of five to prevent overlap, and zooming restores the five-lap labels.
 
 ## Responsive matrix
 

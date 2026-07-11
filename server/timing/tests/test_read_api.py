@@ -1659,6 +1659,105 @@ class TimingReadModelTests(unittest.TestCase):
         self.assertFalse(dashboard["lap_series"]["ours"]["truncated"])
         self.assertIn("time_axes", dashboard)
 
+    def test_dashboard_interval_history_keeps_explicit_breaks_between_valid_segments(self):
+        self.connection.execute(
+            "UPDATE analysis_sessions SET our_participant_id = 'ours',our_class = 'CN PRO' WHERE id = 'session-1'"
+        )
+        self.connection.execute(
+            """
+            INSERT INTO participants(
+              id,source_heat_id,external_key,start_number,team_name,car_name,class_name,
+              class_name_key,is_ours,active,first_seen_at_us,last_seen_at_us
+            ) VALUES ('rival',?,'nr:29','29','TEAMGARIS','LIGIER JS P325','CN PRO',
+                      'cn pro',0,1,1000000,12000000)
+            """,
+            (self.heat_id,),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO participant_state_current(
+              source_heat_id,participant_id,position_overall,position_class,laps,state,state_raw,
+              state_kind,last_lap_ms,best_lap_ms,last_sectors_json,source_key,updated_at_us
+            ) VALUES (?,'rival',5,2,12,'ON_TRACK','E123','ON_TRACK',108000,107900,
+                      '[]','rival:12',12000000)
+            """,
+            (self.heat_id,),
+        )
+
+        def relation(status, *, value_ms=None, ours_laps=12, target_laps=12, target_id="rival"):
+            return {
+                "target_participant_id": target_id,
+                "status": status,
+                "value_ms": value_ms,
+                "relation_kind": "GAP_PAIR_COMMON_OVERALL_LEADER" if status == "VALID" else None,
+                "source_observed_at_us": None,
+                "ours_state_kind": "ON_TRACK",
+                "target_state_kind": "ON_TRACK",
+                "ours_laps": ours_laps,
+                "target_laps": target_laps,
+            }
+
+        samples = (
+            (2_000_000, relation("VALID", value_ms=1_500)),
+            (3_000_000, relation("LAPPED", ours_laps=12, target_laps=13)),
+            (4_000_000, relation("LAPPED", ours_laps=12, target_laps=13)),
+            (5_000_000, relation("VALID", value_ms=900, ours_laps=13, target_laps=13)),
+            (6_000_000, relation("NO_TARGET", target_id=None, target_laps=None)),
+            (7_000_000, relation("VALID", value_ms=700, ours_laps=14, target_laps=14)),
+        )
+        for observed_at_us, ahead in samples:
+            if ahead["status"] == "VALID":
+                ahead["source_observed_at_us"] = observed_at_us
+            values = {
+                "track_flag": "GREEN",
+                "relation_intervals": {
+                    "class_ahead": ahead,
+                    "class_behind": relation("NO_TARGET", target_id=None, target_laps=None),
+                },
+            }
+            self.connection.execute(
+                """
+                INSERT INTO metric_samples(
+                  source_heat_id,scope_kind,scope_key,observed_second,observed_at_us,
+                  metric_version,values_json,source_key,created_at_us
+                ) VALUES (?,'session','session-1',?,?,1,?,?,1000000)
+                """,
+                (
+                    self.heat_id,
+                    observed_at_us // 1_000_000,
+                    observed_at_us,
+                    json.dumps(values),
+                    f"session:{observed_at_us}",
+                ),
+            )
+        self.connection.commit()
+
+        dashboard = self.model.dashboard_history(
+            "session-1",
+            participant_ids=["ours", "rival"],
+            max_points=20,
+        )
+        points = [
+            point
+            for point in dashboard["interval_series"]["points"]
+            if point["participant_id"] == "rival" and point["relation"] == "ahead"
+        ]
+
+        self.assertEqual(
+            [(point["observed_at_us"], point["signed_ms"], point["status"]) for point in points],
+            [
+                (2_000_000, 1_500, "VALID"),
+                (3_000_000, None, "LAPPED"),
+                (5_000_000, 900, "VALID"),
+                (6_000_000, None, "NO_TARGET"),
+                (7_000_000, 700, "VALID"),
+            ],
+        )
+        self.assertEqual(points[1]["target_laps"], 13)
+        self.assertEqual(points[1]["ours_laps"], 12)
+        self.assertEqual(dashboard["interval_series"]["source_point_count"], len(samples))
+        self.assertIn("explicit null line breaks", dashboard["semantics"]["interval_series"])
+
     def test_dashboard_history_requires_a_bounded_participant_selection(self):
         with self.assertRaises(ReadValidationError):
             self.model.dashboard_history("session-1", participant_ids=[])
