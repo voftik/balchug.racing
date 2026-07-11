@@ -1980,6 +1980,154 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         self.assertEqual(tuple(refreshed)[2:], ("1.246", 1246, "0.120", 120))
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM participant_interval_source_facts").fetchone()[0], 3)
 
+    def test_race_control_messages_keep_an_immutable_ledger_and_safe_current_board(self):
+        """m_* lifecycle is independent from grid data and replay-safe."""
+
+        received = TIME_SERVICE_EPOCH_UNIX_US + 120_000_000
+        first = {
+            "Id": "race-control-21",
+            "t": "№1 - Нарушение границы гоночной дорожки в Т12 - Аннулирование результата круга 4",
+            "l": 2,
+            "m": 0,
+            "bc": "255,102,0",
+            "fc": "0,0,0",
+        }
+        second = {
+            "Id": "race-control-34",
+            "t": "№34 - Нарушение границы гоночной дорожки в Т10 - Аннулирование результата круга 9",
+            "l": 2,
+            "m": 0,
+            "bc": "255,102,0",
+            "fc": "0,0,0",
+        }
+        self.apply(
+            [
+                ["h_i", {"n": "Qualifying - Group A", "f": 6}],
+                ["m_i", [first, second]],
+            ],
+            received_at_us=received,
+        )
+        observations = self.connection.execute(
+            """
+            SELECT source_handle,operation,message_id_raw,source_message_ordinal,
+                   source_change_ordinal,observed_at_us,provider_occurred_at_us
+            FROM race_control_message_observations ORDER BY id
+            """
+        ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in observations],
+            [
+                ("m_i", "INITIAL_SNAPSHOT", second["Id"], 1, 1, received, None),
+                ("m_i", "INITIAL_SNAPSHOT", first["Id"], 1, 0, received, None),
+            ],
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM race_control_messages_current WHERE is_active = 1"
+            ).fetchone()[0],
+            2,
+        )
+
+        upsert_frame = self.apply(
+            [["m_c", {"Id": first["Id"], "t": "№1 - результат круга 4 восстановлен", "m": 1}]],
+            received_at_us=received + 1_000_000,
+        )
+        current = self.connection.execute(
+            """
+            SELECT text_raw,line,modality,background_color_raw,font_color_raw,is_active,
+                   first_observation_kind,last_action,first_observed_at_us,last_observed_at_us,
+                   provider_occurred_at_us
+            FROM race_control_messages_current WHERE message_id_raw = ?
+            """,
+            (first["Id"],),
+        ).fetchone()
+        self.assertEqual(
+            tuple(current),
+            (
+                "№1 - результат круга 4 восстановлен",
+                2,
+                1,
+                "255,102,0",
+                "0,0,0",
+                1,
+                "INITIAL_SNAPSHOT",
+                "UPSERT",
+                received,
+                received + 1_000_000,
+                None,
+            ),
+        )
+        # A crash retry can invoke the normalizer with the same decoded RAW
+        # frame. The immutable key must make it a no-op for the newer board.
+        self.normalizer(self.connection, upsert_frame, self.store.decode_frame(upsert_frame))
+        self.assertEqual(
+            self.connection.execute("SELECT COUNT(*) FROM race_control_message_observations").fetchone()[0],
+            3,
+        )
+
+        # A valid snapshot is authoritative: a previously shown message not
+        # present in it becomes inactive with snapshot provenance.
+        self.apply(
+            [["m_i", [{"Id": first["Id"], "t": "№1 - результат круга 4 восстановлен"}]]],
+            received_at_us=received + 2_000_000,
+        )
+        removed_by_snapshot = self.connection.execute(
+            """
+            SELECT is_active,last_action,removal_action,removed_at_us,removed_source_key
+            FROM race_control_messages_current WHERE message_id_raw = ?
+            """,
+            (second["Id"],),
+        ).fetchone()
+        self.assertEqual(
+            tuple(removed_by_snapshot)[:4],
+            (0, "SNAPSHOT_RECONCILIATION", "SNAPSHOT_RECONCILIATION", received + 2_000_000),
+        )
+        self.assertTrue(removed_by_snapshot["removed_source_key"])
+
+        self.apply(
+            [["m_d", first["Id"]]],
+            received_at_us=received + 3_000_000,
+        )
+        self.assertEqual(
+            tuple(
+                self.connection.execute(
+                    "SELECT is_active,last_action,removal_action,removed_at_us FROM race_control_messages_current WHERE message_id_raw = ?",
+                    (first["Id"],),
+                ).fetchone()
+            ),
+            (0, "DELETE", "DELETE", received + 3_000_000),
+        )
+
+        # An incomplete initial snapshot may add its valid record, but cannot
+        # falsely remove a message omitted by a malformed provider payload.
+        hold = {"Id": "race-control-hold", "t": "Hold position", "l": 1, "m": 0}
+        self.apply([["m_c", hold]], received_at_us=received + 4_000_000)
+        self.apply(
+            [["m_i", [hold, {"t": "missing provider id"}]]],
+            received_at_us=received + 5_000_000,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT is_active FROM race_control_messages_current WHERE message_id_raw = ?", (hold["Id"],)
+            ).fetchone()[0],
+            1,
+        )
+
+        self.apply([["m_a"]], received_at_us=received + 6_000_000)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM race_control_messages_current WHERE is_active = 1"
+            ).fetchone()[0],
+            0,
+        )
+        self.apply([["m_x", {"unexpected": True}]], received_at_us=received + 7_000_000)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT operation FROM race_control_message_observations ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0],
+            "UNKNOWN",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

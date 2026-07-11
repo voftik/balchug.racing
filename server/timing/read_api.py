@@ -226,6 +226,30 @@ class TimingReadModel:
             limit=limit,
         )
 
+    def race_control_messages(
+        self,
+        session_id: str,
+        *,
+        active_only: bool = False,
+        limit: int = DEFAULT_FACT_LIMIT,
+        observation_limit: int = DEFAULT_FACT_LIMIT,
+    ) -> dict[str, Any]:
+        """Read Race Control's current board and its immutable message ledger.
+
+        The provider does not attach an occurrence timestamp to these events.
+        ``observed_at_us`` is therefore the recorder receive time, while
+        ``provider_occurred_at_us`` remains null unless a future provider
+        payload supplies it explicitly.
+        """
+
+        return read_race_control_messages(
+            session_id,
+            database=self.database,
+            active_only=active_only,
+            limit=limit,
+            observation_limit=observation_limit,
+        )
+
     def archived_sessions(self, *, limit: int = 50) -> dict[str, Any]:
         return read_archived_sessions(database=self.database, limit=limit)
 
@@ -3435,3 +3459,198 @@ def read_pit_stops(
             "items": items,
             "provenance_contract": _provenance_contract(),
         }
+
+
+def _require_boolean(name: str, value: bool) -> bool:
+    """Reject truthy values: public filters must remain explicit booleans."""
+
+    if type(value) is not bool:
+        raise ReadValidationError(f"{name} must be a boolean")
+    return value
+
+
+def _race_control_source(row: sqlite3.Row, *, prefix: str) -> dict[str, Any]:
+    """Format durable SignalR provenance without inventing a provider time."""
+
+    column_prefix = f"{prefix}_" if prefix else ""
+    return {
+        "message_id": row[f"{column_prefix}source_message_id"],
+        "key": row[f"{column_prefix}source_key"],
+        "message_ordinal": row[f"{column_prefix}source_message_ordinal"],
+        "source_change_ordinal": row[f"{column_prefix}source_change_ordinal"],
+    }
+
+
+def _race_control_content(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "text_raw": row["text_raw"],
+        "line": row["line"],
+        "modality": row["modality"],
+        "background_color_raw": row["background_color_raw"],
+        "font_color_raw": row["font_color_raw"],
+    }
+
+
+def _race_control_current_item(row: sqlite3.Row) -> dict[str, Any]:
+    """Expose one current Race Control board message and both evidence edges."""
+
+    return {
+        "message_id": row["message_id_raw"],
+        **_race_control_content(row),
+        "raw_record": _json_value(row["raw_record_json"], context="Race Control current record"),
+        "is_active": bool(row["is_active"]),
+        # The current Time Service ScreenMessagesList payload does not include
+        # a message creation/display instant. This is intentionally null until
+        # such a source value exists; it must never be inferred from receive
+        # time.
+        "provider_occurred_at_us": row["provider_occurred_at_us"],
+        "first_observation": {
+            "kind": row["first_observation_kind"],
+            "observed_at_us": row["first_observed_at_us"],
+            "source": _race_control_source(row, prefix="first"),
+        },
+        "last_observation": {
+            "action": row["last_action"],
+            "observed_at_us": row["last_observed_at_us"],
+            "source": _race_control_source(row, prefix="last"),
+        },
+        "removed_at_us": row["removed_at_us"],
+        "provenance": "measured",
+    }
+
+
+def _race_control_observation_item(row: sqlite3.Row) -> dict[str, Any]:
+    """Expose one immutable board observation in chronological evidence form."""
+
+    return {
+        "observation_id": int(row["id"]),
+        "message_id": row["message_id_raw"],
+        "action": row["action"],
+        **_race_control_content(row),
+        "raw_payload": _json_value(row["raw_payload_json"], context="Race Control observation payload"),
+        # The recorder has an exact receive timestamp. The provider currently
+        # supplies no event timestamp in m_* payloads, so keep the distinction
+        # explicit for subsequent LLM and audit consumers.
+        "observed_at_us": int(row["observed_at_us"]),
+        "provider_occurred_at_us": row["provider_occurred_at_us"],
+        "source": _race_control_source(row, prefix=""),
+        "provenance": "measured",
+    }
+
+
+def read_race_control_messages(
+    session_id: str,
+    *,
+    database: str | Path | None = None,
+    active_only: bool = False,
+    limit: int = DEFAULT_FACT_LIMIT,
+    observation_limit: int = DEFAULT_FACT_LIMIT,
+) -> dict[str, Any]:
+    """Read a bounded Race Control board plus its append-only source ledger.
+
+    This endpoint deliberately does not require an active session. An
+    engineer, archive reader, or later LLM pipeline can inspect the exact
+    capture provenance of a stopped session using the same contract.
+    """
+
+    session_id = _require_session_id(session_id)
+    active_only = _require_boolean("active_only", active_only)
+    limit = _require_limit(limit)
+    observation_limit = _require_limit(observation_limit)
+    with _readonly_snapshot(database) as connection:
+        _session_row(connection, session_id)
+        heat = _latest_heat_row(connection, session_id)
+        if heat is None:
+            return {
+                "schema_version": LIVE_SCHEMA_VERSION,
+                "session_id": session_id,
+                "heat": None,
+                "active_only": active_only,
+                "limit": limit,
+                "observation_limit": observation_limit,
+                "current_source_count": 0,
+                "observation_source_count": 0,
+                "items": [],
+                "observations": [],
+                "semantics": _race_control_semantics(),
+                "provenance_contract": _provenance_contract(),
+            }
+
+        heat_id = int(heat["id"])
+        current_count_filter = " AND is_active = 1" if active_only else ""
+        current_row_filter = " AND current.is_active = 1" if active_only else ""
+        current_count = int(
+            connection.execute(
+                f"SELECT COUNT(*) FROM race_control_messages_current WHERE source_heat_id = ?{current_count_filter}",
+                (heat_id,),
+            ).fetchone()[0]
+        )
+        current_rows = connection.execute(
+            f"""
+            SELECT current.message_id_raw,current.text_raw,current.line,current.modality,
+                   current.background_color_raw,current.font_color_raw,current.raw_record_json,
+                   current.is_active,current.first_observed_at_us,current.last_observed_at_us,
+                   current.removed_at_us,current.provider_occurred_at_us,
+                   current.first_observation_kind,current.last_action,
+                   current.first_source_message_id,current.first_source_key,
+                   first_message.ordinal AS first_source_message_ordinal,
+                   current.first_source_change_ordinal,current.last_source_message_id,
+                   current.last_source_key,last_message.ordinal AS last_source_message_ordinal,
+                   current.last_source_change_ordinal
+            FROM race_control_messages_current AS current
+            LEFT JOIN feed_messages AS first_message ON first_message.id = current.first_source_message_id
+            LEFT JOIN feed_messages AS last_message ON last_message.id = current.last_source_message_id
+            WHERE current.source_heat_id = ?{current_row_filter}
+            ORDER BY current.is_active DESC,current.last_observed_at_us DESC,current.message_id_raw ASC
+            LIMIT ?
+            """,
+            (heat_id, limit),
+        ).fetchall()
+
+        observation_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM race_control_message_observations WHERE source_heat_id = ?",
+                (heat_id,),
+            ).fetchone()[0]
+        )
+        observation_rows = connection.execute(
+            """
+            SELECT id,message_id_raw,operation AS action,text_raw,line,modality,background_color_raw,font_color_raw,
+                   raw_payload_json,provider_occurred_at_us,source_message_id,source_key,
+                   source_message_ordinal,source_change_ordinal,observed_at_us
+            FROM race_control_message_observations
+            WHERE source_heat_id = ?
+            ORDER BY observed_at_us DESC,source_message_id DESC,source_change_ordinal DESC,id DESC
+            LIMIT ?
+            """,
+            (heat_id, observation_limit),
+        ).fetchall()
+
+        # SQL selects the newest bounded window efficiently. Publishing it in
+        # chronological order keeps a message timeline readable and preserves
+        # source-change ordering when several operations share one frame.
+        return {
+            "schema_version": LIVE_SCHEMA_VERSION,
+            "session_id": session_id,
+            "heat": _heat_payload(heat),
+            "active_only": active_only,
+            "limit": limit,
+            "observation_limit": observation_limit,
+            "current_source_count": current_count,
+            "observation_source_count": observation_count,
+            "items": [_race_control_current_item(row) for row in current_rows],
+            "observations": [_race_control_observation_item(row) for row in reversed(observation_rows)],
+            "semantics": _race_control_semantics(),
+            "provenance_contract": _provenance_contract(),
+        }
+
+
+def _race_control_semantics() -> dict[str, str]:
+    """Explain the timestamp boundary once, rather than making UI infer it."""
+
+    return {
+        "items": "Current provider ScreenMessagesList materialization for the latest source heat.",
+        "observations": "Immutable m_i/m_c/m_d/m_a source operations in recorder-observed order.",
+        "observed_at_us": "Exact time the recorder received the SignalR source message.",
+        "provider_occurred_at_us": "Only a provider-supplied message occurrence time; null when absent.",
+    }

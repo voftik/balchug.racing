@@ -107,7 +107,7 @@ class TimingReadResponse(BaseModel):
 
 
 class TimingFactsResponse(BaseModel):
-    """Bounded measured-fact envelope returned by lap and pit endpoints."""
+    """Bounded measured-fact envelope returned by timing fact endpoints."""
 
     model_config = ConfigDict(
         extra="allow",
@@ -495,6 +495,33 @@ def pit_stops(
                 from_at_us=from_at_us,
                 to_at_us=to_at_us,
                 limit=limit,
+            )
+        )
+    except TimingReadError as error:
+        _raise_read_error(error)
+
+
+@app.get("/sessions/{session_id}/race-control-messages", response_model=TimingFactsResponse)
+def race_control_messages(
+    session_id: str,
+    active_only: bool = False,
+    limit: int = DEFAULT_FACT_LIMIT,
+    observation_limit: int = DEFAULT_FACT_LIMIT,
+) -> JSONResponse:
+    """Read the current Race Control board and its bounded immutable ledger.
+
+    The route remains available after a session stops.  ``observed_at_us`` is
+    the recorder receive instant; a provider occurrence time is returned only
+    where the source actually supplied one.
+    """
+
+    try:
+        return _live_payload(
+            _read_model().race_control_messages(
+                session_id,
+                active_only=active_only,
+                limit=limit,
+                observation_limit=observation_limit,
             )
         )
     except TimingReadError as error:

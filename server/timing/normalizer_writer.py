@@ -39,6 +39,7 @@ from .normalization import (
     validate_current_result_schema,
 )
 from .protocol import SignalRMessage
+from .race_control_store import RaceControlSource, project_screen_message
 from .result_grid import ResultGrid
 
 
@@ -521,6 +522,13 @@ class TimingNormalizer:
     def _apply_message(self, connection: sqlite3.Connection, context: FrameMessage, *, write: bool) -> None:
         payload = context.payload
         handle = context.handle
+        # Race Control has its own source identity and lifecycle. It must not
+        # be folded into the result grid or inferred from a rendered banner.
+        # Unknown `m_*` handles are written as raw-safe UNKNOWN observations.
+        if handle.startswith("m_"):
+            if write:
+                self._write_race_control_message(connection, context)
+            return
         if handle in {"s_i", "s_t"}:
             self._observe_clock(connection, context, write=write)
             # h_i normally arrives before the first server-clock sample. Write
@@ -716,6 +724,29 @@ class TimingNormalizer:
             WHERE id = ?
             """,
             (_text(self.heat.get("n")), calibrated_start, calibrated_finish, self.heat_id),
+        )
+
+    def _write_race_control_message(self, connection: sqlite3.Connection, context: FrameMessage) -> None:
+        """Persist one Race Control `m_*` invocation with frame-level evidence."""
+
+        row = connection.execute(
+            "SELECT frame_id FROM feed_messages WHERE id = ?",
+            (context.id,),
+        ).fetchone()
+        if row is None:
+            raise NormalizerError(f"Race Control source message is missing: {context.id}")
+        project_screen_message(
+            connection,
+            source=RaceControlSource(
+                source_heat_id=self.heat_id,
+                source_frame_id=int(row["frame_id"]),
+                source_message_id=context.id,
+                source_message_ordinal=context.ordinal,
+                source_key=context.source_key,
+                observed_at_us=context.received_at_us,
+            ),
+            handle=context.handle,
+            args=context.args,
         )
 
     def _ensure_layout(self, connection: sqlite3.Connection, context: FrameMessage) -> int | None:

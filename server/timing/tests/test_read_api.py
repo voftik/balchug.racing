@@ -520,6 +520,254 @@ class TimingReadModelTests(unittest.TestCase):
         with self.assertRaises(ScopeNotFoundError):
             self.model.laps("session-1", participant_id="not-a-crew")
 
+    def test_race_control_read_keeps_current_board_and_immutable_observations_distinct(self):
+        """Receipt time and exact SignalR evidence survive an ended session."""
+
+        observed_at_us = 20_000_000
+        self.connection.execute(
+            """
+            INSERT INTO ingest_runs(id,analysis_session_id,reducer_version,started_at_us)
+            VALUES ('race-control-run','session-1','test',?)
+            """,
+            (observed_at_us,),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO ingest_connections(id,ingest_run_id,ordinal,connected_at_us)
+            VALUES ('race-control-connection','race-control-run',1,?)
+            """,
+            (observed_at_us,),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO feed_frames(
+              analysis_session_id,ingest_connection_id,frame_sequence,received_at_us,monotonic_ns,
+              raw_payload,raw_sha256,decode_state,processed_at_us,created_at_us
+            ) VALUES ('session-1','race-control-connection',1,?,?,?,'race-control-hash','decoded',?,?)
+            """,
+            (observed_at_us, observed_at_us, b"{}", observed_at_us, observed_at_us),
+        )
+        frame_id = self.connection.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.connection.execute(
+            """
+            INSERT INTO feed_messages(frame_id,ordinal,handle,args_json,compressed,created_at_us)
+            VALUES (?,0,'m_i','[]',0,?)
+            """,
+            (frame_id, observed_at_us),
+        )
+        source_message_id = self.connection.execute("SELECT last_insert_rowid()").fetchone()[0]
+        live_text = "№1 - Нарушение границы гоночной дорожки в Т12 - Аннулирование результата круга 4"
+        live_raw = json.dumps(
+            {"Id": "race-control-live", "t": live_text, "l": 2, "m": 0, "bc": "255,102,0", "fc": "0,0,0"},
+            ensure_ascii=False,
+        )
+        removed_raw = json.dumps({"Id": "race-control-removed", "t": "Black flag"})
+        self.connection.executemany(
+            """
+            INSERT INTO race_control_messages_current(
+              source_heat_id,message_id_raw,text_raw,line,modality,background_color_raw,font_color_raw,
+              raw_record_json,is_active,first_observed_at_us,last_observed_at_us,removed_at_us,
+              provider_occurred_at_us,first_observation_kind,last_action,
+              first_source_message_id,first_source_key,first_source_change_ordinal,
+              last_source_message_id,last_source_key,last_source_change_ordinal,
+              removal_action,removed_source_frame_id,removed_source_message_id,removed_source_key,
+              removed_source_change_ordinal,removed_observation_id,created_at_us,updated_at_us
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                (
+                    self.heat_id,
+                    "race-control-live",
+                    live_text,
+                    2,
+                    0,
+                    "255,102,0",
+                    "0,0,0",
+                    live_raw,
+                    1,
+                    observed_at_us,
+                    22_000_000,
+                    None,
+                    None,
+                    "INITIAL_SNAPSHOT",
+                    "UPSERT",
+                    source_message_id,
+                    "race-control:1:0",
+                    0,
+                    source_message_id,
+                    "race-control:1:2",
+                    2,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    observed_at_us,
+                    22_000_000,
+                ),
+                (
+                    self.heat_id,
+                    "race-control-removed",
+                    "Black flag",
+                    1,
+                    0,
+                    None,
+                    None,
+                    removed_raw,
+                    0,
+                    observed_at_us,
+                    21_000_000,
+                    21_000_000,
+                    None,
+                    "INITIAL_SNAPSHOT",
+                    "DELETE",
+                    source_message_id,
+                    "race-control:1:1",
+                    1,
+                    source_message_id,
+                    "race-control:1:3",
+                    3,
+                    "DELETE",
+                    frame_id,
+                    source_message_id,
+                    "race-control:1:3",
+                    3,
+                    None,
+                    observed_at_us,
+                    21_000_000,
+                ),
+            ),
+        )
+        self.connection.executemany(
+            """
+            INSERT INTO race_control_message_observations(
+              source_heat_id,source_handle,operation,message_id_raw,text_raw,line,modality,
+              background_color_raw,font_color_raw,provider_occurred_at_us,raw_record_json,raw_payload_json,
+              source_frame_id,source_message_id,source_message_ordinal,source_key,source_change_ordinal,
+              observed_at_us,created_at_us
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                (
+                    self.heat_id,
+                    "m_i",
+                    "INITIAL_SNAPSHOT",
+                    "race-control-live",
+                    live_text,
+                    2,
+                    0,
+                    "255,102,0",
+                    "0,0,0",
+                    None,
+                    live_raw,
+                    live_raw,
+                    frame_id,
+                    source_message_id,
+                    0,
+                    "race-control:1:0",
+                    0,
+                    observed_at_us,
+                    observed_at_us,
+                ),
+                (
+                    self.heat_id,
+                    "m_i",
+                    "INITIAL_SNAPSHOT",
+                    "race-control-removed",
+                    "Black flag",
+                    1,
+                    0,
+                    None,
+                    None,
+                    None,
+                    removed_raw,
+                    removed_raw,
+                    frame_id,
+                    source_message_id,
+                    0,
+                    "race-control:1:1",
+                    1,
+                    observed_at_us,
+                    observed_at_us,
+                ),
+                (
+                    self.heat_id,
+                    "m_d",
+                    "DELETE",
+                    "race-control-removed",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    json.dumps({"Id": "race-control-removed"}),
+                    json.dumps({"Id": "race-control-removed"}),
+                    frame_id,
+                    source_message_id,
+                    0,
+                    "race-control:1:3",
+                    3,
+                    21_000_000,
+                    21_000_000,
+                ),
+                (
+                    self.heat_id,
+                    "m_c",
+                    "UPSERT",
+                    "race-control-live",
+                    live_text,
+                    2,
+                    0,
+                    "255,102,0",
+                    "0,0,0",
+                    None,
+                    live_raw,
+                    live_raw,
+                    frame_id,
+                    source_message_id,
+                    0,
+                    "race-control:1:2",
+                    2,
+                    22_000_000,
+                    22_000_000,
+                ),
+            ),
+        )
+        self.connection.commit()
+
+        payload = self.model.race_control_messages("session-1")
+        self.assertEqual(payload["current_source_count"], 2)
+        self.assertEqual(payload["observation_source_count"], 4)
+        self.assertEqual([item["message_id"] for item in payload["items"]], ["race-control-live", "race-control-removed"])
+        current = payload["items"][0]
+        self.assertTrue(current["is_active"])
+        self.assertEqual(current["text_raw"], live_text)
+        self.assertIsNone(current["provider_occurred_at_us"])
+        self.assertEqual(current["first_observation"]["observed_at_us"], observed_at_us)
+        self.assertEqual(current["last_observation"]["source"], {
+            "message_id": source_message_id,
+            "key": "race-control:1:2",
+            "message_ordinal": 0,
+            "source_change_ordinal": 2,
+        })
+        self.assertEqual([item["action"] for item in payload["observations"]], ["INITIAL_SNAPSHOT", "INITIAL_SNAPSHOT", "DELETE", "UPSERT"])
+        self.assertEqual(payload["observations"][0]["raw_payload"]["t"], live_text)
+        self.assertIsNone(payload["observations"][0]["provider_occurred_at_us"])
+
+        active = self.model.race_control_messages("session-1", active_only=True, limit=1, observation_limit=2)
+        self.assertEqual(active["current_source_count"], 1)
+        self.assertEqual(active["observation_source_count"], 4)
+        self.assertEqual([item["message_id"] for item in active["items"]], ["race-control-live"])
+        self.assertEqual([item["action"] for item in active["observations"]], ["DELETE", "UPSERT"])
+        with self.assertRaises(ReadValidationError):
+            self.model.race_control_messages("session-1", active_only=1)  # type: ignore[arg-type]
+
+        self.connection.execute("UPDATE analysis_sessions SET lifecycle = 'stopped' WHERE id = 'session-1'")
+        self.connection.commit()
+        self.assertEqual(self.model.race_control_messages("session-1")["items"][0]["message_id"], "race-control-live")
+
     def test_unproven_pit_duration_is_null_in_every_public_archive_surface(self):
         self.connection.execute(
             "UPDATE pit_stops SET pit_lane_duration_source_kind = NULL WHERE id = 'pit-1'"

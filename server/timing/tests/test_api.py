@@ -417,6 +417,158 @@ class TimingApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"id: 2", replay_chunk)
         await replay_stream.body_iterator.aclose()
 
+    async def test_race_control_read_route_is_bounded_and_remains_available_after_stop(self):
+        created = await self.create("igora", {"mode": "qualifying"}, "race-control-read")
+        session_id = created.json()["session"]["id"]
+        observed_at_us = 10_000_000
+        text = "№1 - Нарушение границы гоночной дорожки в Т12 - Аннулирование результата круга 4"
+        raw_record = json.dumps(
+            {"Id": "race-control-1", "t": text, "l": 2, "m": 0, "bc": "255,102,0", "fc": "0,0,0"},
+            ensure_ascii=False,
+        )
+        connection = connect(self.database)
+        try:
+            connection.execute(
+                """
+                INSERT INTO source_heats(analysis_session_id,generation,external_name,created_at_us)
+                VALUES (?,1,'Qualifying - Group A',?)
+                """,
+                (session_id, observed_at_us),
+            )
+            heat_id = connection.execute("SELECT last_insert_rowid()").fetchone()[0]
+            connection.execute(
+                """
+                INSERT INTO ingest_runs(id,analysis_session_id,reducer_version,started_at_us)
+                VALUES ('api-race-control-run',?,'test',?)
+                """,
+                (session_id, observed_at_us),
+            )
+            connection.execute(
+                """
+                INSERT INTO ingest_connections(id,ingest_run_id,ordinal,connected_at_us)
+                VALUES ('api-race-control-connection','api-race-control-run',1,?)
+                """,
+                (observed_at_us,),
+            )
+            connection.execute(
+                """
+                INSERT INTO feed_frames(
+                  analysis_session_id,ingest_connection_id,frame_sequence,received_at_us,monotonic_ns,
+                  raw_payload,raw_sha256,decode_state,processed_at_us,created_at_us
+                ) VALUES (?,?,1,?,?,?,'race-control-api-hash','decoded',?,?)
+                """,
+                (session_id, "api-race-control-connection", observed_at_us, observed_at_us, b"{}", observed_at_us, observed_at_us),
+            )
+            frame_id = connection.execute("SELECT last_insert_rowid()").fetchone()[0]
+            connection.execute(
+                """
+                INSERT INTO feed_messages(frame_id,ordinal,handle,args_json,compressed,created_at_us)
+                VALUES (?,0,'m_i','[]',0,?)
+                """,
+                (frame_id, observed_at_us),
+            )
+            source_message_id = connection.execute("SELECT last_insert_rowid()").fetchone()[0]
+            connection.execute(
+                """
+                INSERT INTO race_control_message_observations(
+                  source_heat_id,source_handle,operation,message_id_raw,text_raw,line,modality,
+                  background_color_raw,font_color_raw,raw_record_json,raw_payload_json,
+                  source_frame_id,source_message_id,source_message_ordinal,source_key,
+                  source_change_ordinal,observed_at_us,created_at_us
+                ) VALUES (?,'m_i','INITIAL_SNAPSHOT',?,?,?,?,?,?,?, ?,?,?,0,'api-race-control:1:0',0,?,?)
+                """,
+                (
+                    heat_id,
+                    "race-control-1",
+                    text,
+                    2,
+                    0,
+                    "255,102,0",
+                    "0,0,0",
+                    raw_record,
+                    raw_record,
+                    frame_id,
+                    source_message_id,
+                    observed_at_us,
+                    observed_at_us,
+                ),
+            )
+            observation_id = connection.execute("SELECT last_insert_rowid()").fetchone()[0]
+            connection.execute(
+                """
+                INSERT INTO race_control_messages_current(
+                  source_heat_id,message_id_raw,text_raw,line,modality,background_color_raw,font_color_raw,
+                  raw_record_json,is_active,first_observation_kind,first_observed_at_us,
+                  first_source_frame_id,first_source_message_id,first_source_key,first_source_change_ordinal,
+                  first_observation_id,last_action,last_observed_at_us,last_source_frame_id,
+                  last_source_message_id,last_source_key,last_source_change_ordinal,last_observation_id,
+                  created_at_us,updated_at_us
+                ) VALUES (?,?,?,?,?,?,?,?,1,'INITIAL_SNAPSHOT',?,?,?,?,?,?,'INITIAL_SNAPSHOT',?,?,?,?,?,?,?,?)
+                """,
+                (
+                    heat_id,
+                    "race-control-1",
+                    text,
+                    2,
+                    0,
+                    "255,102,0",
+                    "0,0,0",
+                    raw_record,
+                    observed_at_us,
+                    frame_id,
+                    source_message_id,
+                    "api-race-control:1:0",
+                    0,
+                    observation_id,
+                    observed_at_us,
+                    frame_id,
+                    source_message_id,
+                    "api-race-control:1:0",
+                    0,
+                    observation_id,
+                    observed_at_us,
+                    observed_at_us,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        response = await self.client.get(
+            f"/sessions/{session_id}/race-control-messages?active_only=true&limit=1&observation_limit=1"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        payload = response.json()
+        self.assertEqual(payload["schema_version"], "timing-live.v1")
+        self.assertEqual(payload["current_source_count"], 1)
+        self.assertEqual(payload["observation_source_count"], 1)
+        self.assertEqual(payload["items"][0]["message_id"], "race-control-1")
+        self.assertIsNone(payload["items"][0]["provider_occurred_at_us"])
+        self.assertEqual(payload["observations"][0]["source"], {
+            "message_id": source_message_id,
+            "key": "api-race-control:1:0",
+            "message_ordinal": 0,
+            "source_change_ordinal": 0,
+        })
+        self.assertEqual(
+            (await self.client.get(f"/sessions/{session_id}/race-control-messages?limit=0")).status_code,
+            422,
+        )
+
+        connection = connect(self.database)
+        try:
+            connection.execute(
+                "UPDATE analysis_sessions SET lifecycle = 'stopped', stopped_at_us = ? WHERE id = ?",
+                (observed_at_us + 1, session_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        stopped = await self.client.get(f"/sessions/{session_id}/race-control-messages")
+        self.assertEqual(stopped.status_code, 200)
+        self.assertEqual(stopped.json()["items"][0]["message_id"], "race-control-1")
+
 
 if __name__ == "__main__":
     unittest.main()

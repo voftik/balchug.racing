@@ -25,7 +25,9 @@ except ImportError:  # pragma: no cover - exercised by runtime configuration
     LZString = None
 
 
-DEFAULT_GROUPS = ("s", "h", "r", "t", "a")
+# `m` is the provider's Race Control ScreenMessagesList. It is a separate
+# group from results/statistics and must be subscribed for live m_c/m_d events.
+DEFAULT_GROUPS = ("s", "h", "r", "t", "a", "m")
 CLIENT_PROTOCOL = "1.5"
 
 

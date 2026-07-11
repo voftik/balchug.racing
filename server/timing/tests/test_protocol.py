@@ -1,10 +1,22 @@
 import json
 import unittest
 
-from timing.protocol import LiveTimingClient, ProtocolError, SignalRMessage, _messages_from_entries, decode_utf16_payload, parse_bootstrap
+from timing.protocol import (
+    DEFAULT_GROUPS,
+    LiveTimingClient,
+    ProtocolError,
+    SignalRMessage,
+    _messages_from_entries,
+    decode_utf16_payload,
+    parse_bootstrap,
+)
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_default_groups_subscribe_race_control_screen_messages(self):
+        self.assertEqual(DEFAULT_GROUPS, ("s", "h", "r", "t", "a", "m"))
+        self.assertEqual(LiveTimingClient("https://example.test/igora").group_string, "s,h,r,t,a,m")
+
     def test_parses_dynamic_bootstrap_fields(self):
         html = '<script>new liveTiming.LiveTimingApp({"tid":"abc123","dm":"19100"})</script>'
         bootstrap = parse_bootstrap(html, "https://livetiming.getraceresults.com/igora")
