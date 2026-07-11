@@ -382,6 +382,24 @@ class TimingReadModelTests(unittest.TestCase):
         self.assertEqual(snapshot["cursor"]["stream_event_id"], 1)
         self.assertTrue(snapshot["system_assumption"]["tyre_change_on_confirmed_pit_out"])
 
+    def test_snapshot_separates_exact_state_source_from_latest_materialized_row(self):
+        self.connection.execute(
+            """
+            UPDATE participant_state_current
+            SET state_source_key = 'state:9', state_observed_at_us = 9_000_000
+            WHERE source_heat_id = ? AND participant_id = 'ours'
+            """,
+            (self.heat_id,),
+        )
+        self.connection.commit()
+
+        state = self.model.snapshot("session-1").as_dict()["measured"]["participants"][0]["state"]
+        self.assertEqual(state["source"], {"message_id": None, "key": "frame:12", "observed_at_us": 12_000_000})
+        self.assertEqual(
+            state["state_source"],
+            {"cell_observation_id": None, "message_id": None, "key": "state:9", "observed_at_us": 9_000_000},
+        )
+
     def test_snapshot_interval_scalars_come_only_from_their_exact_source_facts(self):
         self.connection.execute(
             """

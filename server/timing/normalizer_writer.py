@@ -36,6 +36,7 @@ from .normalization import (
     parse_result_state,
     parse_tracker_passing,
     parse_ts_time,
+    validate_current_result_schema,
 )
 from .protocol import SignalRMessage
 from .result_grid import ResultGrid
@@ -705,6 +706,8 @@ class TimingNormalizer:
         ).fetchone()
         if existing is not None:
             self._layout_id = int(existing["id"])
+            self._reconcile_layout_column_definitions(connection, self._layout_id)
+            self._record_result_schema_contract(connection, self._layout_id)
             return self._layout_id
         ordinal = int(
             connection.execute(
@@ -754,7 +757,81 @@ class TimingNormalizer:
                     _json(raw_definition),
                 ),
             )
+        self._record_result_schema_contract(connection, self._layout_id)
         return self._layout_id
+
+    def _record_result_schema_contract(self, connection: sqlite3.Connection, layout_id: int) -> None:
+        """Persist the fixed live schema diagnostic alongside its raw layout."""
+
+        layout = connection.execute(
+            """
+            SELECT source_heat_id,source_message_id,source_key,observed_at_us
+            FROM result_layout_versions WHERE id = ?
+            """,
+            (layout_id,),
+        ).fetchone()
+        if layout is None:
+            raise NormalizerError("Result layout is missing while recording its contract")
+        validation = validate_current_result_schema(self.grid.columns)
+        values = {
+            "source_heat_id": int(layout["source_heat_id"]),
+            "layout_version_id": layout_id,
+            "contract_name": validation.contract_name,
+            "status": validation.status,
+            "required_keys_json": _json(list(validation.required_keys)),
+            "present_keys_json": _json(list(validation.present_keys)),
+            "missing_required_keys_json": _json(list(validation.missing_required_keys)),
+            "binding_mismatches_json": _json(list(validation.binding_mismatches)),
+            "optional_present_keys_json": _json(list(validation.optional_present_keys)),
+            "unknown_columns_json": _json(list(validation.unknown_columns)),
+            "source_message_id": layout["source_message_id"],
+            "source_key": layout["source_key"],
+            "observed_at_us": int(layout["observed_at_us"]),
+            "created_at_us": now_us(),
+        }
+        inserted = _insert_ignore(connection, "result_schema_contract_observations", values)
+        if inserted:
+            return
+        existing = connection.execute(
+            """
+            SELECT * FROM result_schema_contract_observations
+            WHERE layout_version_id = ? AND contract_name = ?
+            """,
+            (layout_id, validation.contract_name),
+        ).fetchone()
+        if existing is None or any(
+            existing[column] != value for column, value in values.items() if column != "created_at_us"
+        ):
+            raise NormalizerError("Result schema contract conflicts with replayed layout")
+
+    def _reconcile_layout_column_definitions(self, connection: sqlite3.Connection, layout_id: int) -> None:
+        """Upgrade pre-contract canonical metadata without touching raw cells."""
+
+        for index, column in self.grid.columns.items():
+            stored = connection.execute(
+                """
+                SELECT source_name_raw,source_parameter_raw,canonical_key
+                FROM result_column_definitions
+                WHERE layout_version_id = ? AND column_index = ?
+                """,
+                (layout_id, index),
+            ).fetchone()
+            if stored is None:
+                raise NormalizerError("Result layout is missing a stored column definition")
+            if (
+                stored["source_name_raw"] != column.source_name
+                or stored["source_parameter_raw"] != column.source_parameter
+            ):
+                raise NormalizerError("Result layout fingerprint conflicts with its column definitions")
+            if stored["canonical_key"] != column.key:
+                connection.execute(
+                    """
+                    UPDATE result_column_definitions
+                    SET canonical_key = ?
+                    WHERE layout_version_id = ? AND column_index = ?
+                    """,
+                    (column.key, layout_id, index),
+                )
 
     @staticmethod
     def _baseline_sort_key(baseline: ResultSchemaBaseline) -> tuple[int, int, int]:
@@ -1743,12 +1820,6 @@ class TimingNormalizer:
         if participant_id is None:
             return
         row = self.grid.row_values(row_index)
-        current_state = (
-            parse_result_state(row.get("state")) if "state" in row else ResultState(raw=None, kind="UNKNOWN")
-        )
-        current_pit_count_raw = _text(row.get("pit_stops"))
-        current_pit_count = _integer(row.get("pit_stops"), minimum=0)
-        current_pit_time_raw = _text(row.get("pit_time"))
         old = connection.execute(
             """
             SELECT * FROM participant_state_current
@@ -1756,6 +1827,18 @@ class TimingNormalizer:
             """,
             (self.heat_id, participant_id),
         ).fetchone()
+        if "state" in row:
+            current_state = parse_result_state(row.get("state"))
+        elif old is not None:
+            current_state = ResultState(
+                raw=old["state_raw"],
+                kind=old["state_kind"] or old["state"] or "UNKNOWN",
+            )
+        else:
+            current_state = ResultState(raw=None, kind="UNKNOWN")
+        current_pit_count_raw = _text(row.get("pit_stops"))
+        current_pit_count = _integer(row.get("pit_stops"), minimum=0)
+        current_pit_time_raw = _text(row.get("pit_time"))
         event_cells = self._row_event_cells(
             connection,
             participant_id=participant_id,
@@ -1832,49 +1915,56 @@ class TimingNormalizer:
         pit_count_source = pit_count_cell if pit_count_cell is not None else None
         pit_time_source = pit_time_cell if pit_time_cell is not None else None
         driver_stint_source = driver_stint_cell if driver_stint_cell is not None else None
-        state_event_key = f"{context.source_key}:state:{row_index}"
-        observed = _insert_ignore(
-            connection,
-            "participant_state_observations",
-            {
-                "source_heat_id": self.heat_id,
-                "participant_id": participant_id,
-                "layout_version_id": layout_id,
-                "provider_row_index": row_index,
-                "state_raw": state_cell.value_text if state_cell is not None else None,
-                "state_kind": event_state.kind if event_state is not None else "UNKNOWN",
-                "state_timer_target_raw": event_state.timer_target_raw if event_state is not None else None,
-                "state_timer_target_provider_us": event_state.timer_target_ts_time if event_state is not None else None,
-                "state_timer_target_at_us": clock.to_utc_us(event_state.timer_target_ts_time)
-                if event_state is not None
-                else None,
-                "state_timer_calibration_id": calibration_id if event_state is not None else None,
-                "provider_pit_count_raw": pit_count_cell.value_text if pit_count_cell is not None else None,
-                "provider_pit_count": event_pit_count,
-                "state_cell_observation_id": state_cell.id if state_cell is not None else None,
-                "provider_pit_count_cell_observation_id": pit_count_cell.id if pit_count_cell is not None else None,
-                "pit_time_raw": pit_time_cell.value_text if pit_time_cell is not None else None,
-                "pit_time_cell_observation_id": pit_time_cell.id if pit_time_cell is not None else None,
-                "driver_stint_raw": driver_stint_cell.value_text if driver_stint_cell is not None else None,
-                "driver_stint_kind": event_driver_stint.kind if event_driver_stint is not None else None,
-                "driver_stint_provider_ts_time": event_driver_stint.provider_ts_time
-                if event_driver_stint is not None
-                else None,
-                "driver_stint_at_us": clock.to_utc_us(event_driver_stint.provider_ts_time)
-                if event_driver_stint is not None and event_driver_stint.provider_ts_time is not None
-                else None,
-                "driver_stint_calibration_id": calibration_id
-                if event_driver_stint is not None and event_driver_stint.provider_ts_time is not None
-                else None,
-                "driver_stint_duration_ms": event_driver_stint.duration_ms if event_driver_stint is not None else None,
-                "driver_stint_cell_observation_id": driver_stint_cell.id if driver_stint_cell is not None else None,
-                "source_message_id": context.id,
-                "source_key": context.source_key,
-                "source_event_key": state_event_key,
-                "observed_at_us": context.received_at_us,
-                "created_at_us": now_us(),
-            },
+        has_state_observation = any(
+            source is not None
+            for source in (state_source, pit_count_source, pit_time_source, driver_stint_source)
         )
+        if has_state_observation:
+            _insert_ignore(
+                connection,
+                "participant_state_observations",
+                {
+                    "source_heat_id": self.heat_id,
+                    "participant_id": participant_id,
+                    "layout_version_id": layout_id,
+                    "provider_row_index": row_index,
+                    # A PIT/L-PIT/STINT-only event carries the materialized
+                    # state as context. Its NULL state-cell id makes clear that
+                    # it did not independently observe a new STATE value.
+                    "state_raw": state_cell.value_text if state_cell is not None else _text(current_state.raw),
+                    "state_kind": event_state.kind if event_state is not None else current_state.kind,
+                    "state_timer_target_raw": event_state.timer_target_raw if event_state is not None else None,
+                    "state_timer_target_provider_us": event_state.timer_target_ts_time if event_state is not None else None,
+                    "state_timer_target_at_us": clock.to_utc_us(event_state.timer_target_ts_time)
+                    if event_state is not None
+                    else None,
+                    "state_timer_calibration_id": calibration_id if event_state is not None else None,
+                    "provider_pit_count_raw": pit_count_cell.value_text if pit_count_cell is not None else None,
+                    "provider_pit_count": event_pit_count,
+                    "state_cell_observation_id": state_cell.id if state_cell is not None else None,
+                    "provider_pit_count_cell_observation_id": pit_count_cell.id if pit_count_cell is not None else None,
+                    "pit_time_raw": pit_time_cell.value_text if pit_time_cell is not None else None,
+                    "pit_time_cell_observation_id": pit_time_cell.id if pit_time_cell is not None else None,
+                    "driver_stint_raw": driver_stint_cell.value_text if driver_stint_cell is not None else None,
+                    "driver_stint_kind": event_driver_stint.kind if event_driver_stint is not None else None,
+                    "driver_stint_provider_ts_time": event_driver_stint.provider_ts_time
+                    if event_driver_stint is not None
+                    else None,
+                    "driver_stint_at_us": clock.to_utc_us(event_driver_stint.provider_ts_time)
+                    if event_driver_stint is not None and event_driver_stint.provider_ts_time is not None
+                    else None,
+                    "driver_stint_calibration_id": calibration_id
+                    if event_driver_stint is not None and event_driver_stint.provider_ts_time is not None
+                    else None,
+                    "driver_stint_duration_ms": event_driver_stint.duration_ms if event_driver_stint is not None else None,
+                    "driver_stint_cell_observation_id": driver_stint_cell.id if driver_stint_cell is not None else None,
+                    "source_message_id": context.id,
+                    "source_key": context.source_key,
+                    "source_event_key": f"{context.source_key}:state:{row_index}",
+                    "observed_at_us": context.received_at_us,
+                    "created_at_us": now_us(),
+                },
+            )
         _upsert(
             connection,
             "participant_state_current",
@@ -1935,6 +2025,15 @@ class TimingNormalizer:
                 "state_source_cell_observation_id": state_source.id
                 if state_source is not None
                 else (old["state_source_cell_observation_id"] if old is not None else None),
+                "state_source_message_id": context.id
+                if state_source is not None
+                else (old["state_source_message_id"] if old is not None else None),
+                "state_source_key": context.source_key
+                if state_source is not None
+                else (old["state_source_key"] if old is not None else None),
+                "state_observed_at_us": context.received_at_us
+                if state_source is not None
+                else (old["state_observed_at_us"] if old is not None else None),
                 "provider_pit_count": current_pit_count,
                 "provider_pit_count_raw": current_pit_count_raw,
                 "provider_pit_count_source_message_id": context.id
@@ -1991,27 +2090,27 @@ class TimingNormalizer:
             },
             conflict_columns=("source_heat_id", "participant_id"),
         )
-        if observed:
-            source_laps = _integer(lap_cell.value_text, minimum=0) if lap_cell is not None else None
-            if (
-                old is not None
-                and old["laps"] is not None
-                and source_laps is not None
-                and source_laps > int(old["laps"])
-            ):
-                self._complete_laps_from_grid(
-                    connection,
-                    context,
-                    participant_id,
-                    previous_lap=int(old["laps"]),
-                    current_lap=source_laps,
-                    last_lap_ms=_duration_us_to_ms(row.get("last_lap")),
-                    state_kind=current_state.kind,
-                )
-            # Keep an active stint available to same-frame tracker passings,
-            # but defer pit boundary mutations until every frame handle has
-            # supplied its chronology.
-            self._ensure_tire_stint(connection, context, participant_id, _integer(row.get("laps"), minimum=0))
+        source_laps = _integer(lap_cell.value_text, minimum=0) if lap_cell is not None else None
+        if (
+            old is not None
+            and old["laps"] is not None
+            and source_laps is not None
+            and source_laps > int(old["laps"])
+        ):
+            self._complete_laps_from_grid(
+                connection,
+                context,
+                participant_id,
+                previous_lap=int(old["laps"]),
+                current_lap=source_laps,
+                last_lap_ms=_duration_us_to_ms(row.get("last_lap")),
+                state_kind=current_state.kind,
+            )
+        # Keep an active stint available to same-frame tracker passings even
+        # when the changed row is only LAPS/LAST/GAP. Pit boundary mutations
+        # remain restricted to actual source STATE/PIT/L-PIT cells below.
+        self._ensure_tire_stint(connection, context, participant_id, _integer(row.get("laps"), minimum=0))
+        if state_cell is not None or pit_count_cell is not None or pit_time_cell is not None:
             self._pending_pit_events.append(
                 PendingPitEvent(
                     context=context,

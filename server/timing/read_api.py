@@ -674,6 +674,8 @@ def _participants(connection: sqlite3.Connection, heat_id: int) -> list[dict[str
                c.sector_json,c.speed_kph,c.pit_time_raw,c.provider_pit_count,
                c.state_timer_target_raw,c.state_timer_target_provider_us,c.state_timer_target_at_us,
                c.provider_pit_count_raw,c.source_message_id,c.source_key,c.updated_at_us,
+               c.state_source_cell_observation_id,c.state_source_message_id,
+               c.state_source_key,c.state_observed_at_us,
                gap_fact.id AS gap_fact_id,gap_fact.interval_kind AS gap_fact_interval_kind,
                gap_fact.raw_value AS gap_fact_raw_value,gap_fact.interval_ms AS gap_fact_interval_ms,
                gap_fact.value_kind AS gap_fact_value_kind,
@@ -760,6 +762,16 @@ def _participants(connection: sqlite3.Connection, heat_id: int) -> list[dict[str
                 "state_timer_target_raw": row["state_timer_target_raw"],
                 "state_timer_target_provider_us": row["state_timer_target_provider_us"],
                 "state_timer_target_at_us": row["state_timer_target_at_us"],
+                "state_source": (
+                    {
+                        "cell_observation_id": row["state_source_cell_observation_id"],
+                        "message_id": row["state_source_message_id"],
+                        "key": row["state_source_key"],
+                        "observed_at_us": row["state_observed_at_us"],
+                    }
+                    if row["state_source_key"] is not None
+                    else None
+                ),
                 "source": {
                     "message_id": row["source_message_id"],
                     "key": row["source_key"],

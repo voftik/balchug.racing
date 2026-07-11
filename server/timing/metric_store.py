@@ -811,7 +811,9 @@ def _interval_fact_input(row: sqlite3.Row, prefix: str) -> IntervalSourceFactInp
 
 
 def _state_input(row: sqlite3.Row) -> ParticipantStateInput | None:
-    if row["state_source_key"] is None:
+    # This is the current materialized row's freshness source, not the exact
+    # STATE cell provenance. The latter is exposed separately by the read API.
+    if row["row_source_key"] is None:
         return None
     return ParticipantStateInput(
         position_overall=_int(row["position_overall"]),
@@ -840,9 +842,9 @@ def _state_input(row: sqlite3.Row) -> ParticipantStateInput | None:
         speed_kph=float(row["speed_kph"]) if row["speed_kph"] is not None else None,
         pit_time_raw=row["pit_time_raw"],
         provider_pit_count=_int(row["provider_pit_count"]),
-        source_message_id=_int(row["state_source_message_id"]),
-        source_key=row["state_source_key"],
-        updated_at_us=int(row["state_updated_at_us"]),
+        source_message_id=_int(row["row_source_message_id"]),
+        source_key=row["row_source_key"],
+        updated_at_us=int(row["row_updated_at_us"]),
         gap_interval_fact=_interval_fact_input(row, "gap_fact"),
         diff_interval_fact=_interval_fact_input(row, "diff_fact"),
     )
@@ -1004,8 +1006,8 @@ def load_heat_metric_input(connection: sqlite3.Connection, source_heat_id: int) 
                    c.last_lap_number,c.best_lap_ms,c.best_lap_number,c.last_sectors_json,
                    c.best_sectors_json,c.last_speeds_json,c.gap_ms,c.gap_raw,c.gap_kind,c.diff_ms,
                    c.diff_raw,c.diff_kind,c.sector_json,c.speed_kph,c.pit_time_raw,c.provider_pit_count,
-                   c.source_message_id AS state_source_message_id,c.source_key AS state_source_key,
-                   c.updated_at_us AS state_updated_at_us,
+                   c.source_message_id AS row_source_message_id,c.source_key AS row_source_key,
+                   c.updated_at_us AS row_updated_at_us,
                    gap_fact.id AS gap_fact_id,gap_fact.interval_kind AS gap_fact_interval_kind,
                    gap_fact.raw_value AS gap_fact_raw_value,gap_fact.interval_ms AS gap_fact_interval_ms,
                    gap_fact.value_kind AS gap_fact_value_kind,

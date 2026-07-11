@@ -937,6 +937,148 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         )
         self.assertIsNotNone(current["driver_stint_source_cell_observation_id"])
 
+    def test_current_provider_layout_persists_a_current_contract_and_alias_drift(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 22_600_000
+        headers = [
+            {"n": "position"}, {"n": "marker"}, {"n": "startnumber"}, {"n": "State"},
+            {"n": "Team name"}, {"n": "CurrentDriver"}, {"n": "class"},
+            {"n": "position_in_class"}, {"n": "hole"}, {"n": "fastestRoundTime"},
+            {"n": "lastRoundTime"}, {"n": "CurrentDriverStintTime"}, {"n": "PitTime"},
+            {"n": "pitstops"}, {"n": "SectorTimes", "p": "1"},
+            {"n": "SectorTimes", "p": "2"}, {"n": "SectorTimes", "p": "3"},
+            {"n": "sectionMarker"},
+        ]
+        values = [
+            "1", "", "21", "E22600000", "BALCHUG Racing", "Киракозов Кирилл", "CN PRO", "1",
+            "0.000", "107491000", "108000000", "S22600000", "L0", "0",
+            "35000000", "36000000", "36500000", "",
+        ]
+        self.apply(
+            [["r_i", {"l": {"h": headers}, "r": [[0, index, value] for index, value in enumerate(values)]}]],
+            received_at_us=received,
+        )
+        current = self.connection.execute(
+            """
+            SELECT status,missing_required_keys_json,optional_present_keys_json
+            FROM result_schema_contract_observations
+            """
+        ).fetchone()
+        self.assertEqual(current["status"], "CURRENT")
+        self.assertEqual(json.loads(current["missing_required_keys_json"]), [])
+        self.assertEqual(json.loads(current["optional_present_keys_json"]), ["section_marker"])
+
+        # A pre-contract database can already hold this raw layout with stale
+        # NULL sector keys. Replaying any later result update repairs only the
+        # semantic metadata; its raw layout/cells are unchanged.
+        self.connection.execute(
+            """
+            UPDATE result_column_definitions SET canonical_key = NULL
+            WHERE column_index IN (14,15,16)
+            """
+        )
+        self.connection.commit()
+        self.apply([['r_c', [[0, 10, '107400000']]]], received_at_us=received + 500_000)
+        repaired_sectors = self.connection.execute(
+            """
+            SELECT canonical_key FROM result_column_definitions
+            WHERE column_index IN (14,15,16) ORDER BY column_index
+            """
+        ).fetchall()
+        self.assertEqual([row[0] for row in repaired_sectors], ["sector_1", "sector_2", "sector_3"])
+
+        alias_headers = list(headers)
+        alias_headers[0] = {"n": "POS"}
+        self.apply(
+            [["r_l", {"h": alias_headers}], ["r_i", {"r": [[0, 2, "21"], [0, 4, "BALCHUG Racing"], [0, 6, "CN PRO"]]}]],
+            received_at_us=received + 1_000_000,
+        )
+        drift = self.connection.execute(
+            """
+            SELECT status,missing_required_keys_json,binding_mismatches_json
+            FROM result_schema_contract_observations
+            ORDER BY id DESC LIMIT 1
+            """
+        ).fetchone()
+        self.assertEqual(drift["status"], "DEGRADED")
+        self.assertIn("position_overall", json.loads(drift["missing_required_keys_json"]))
+        self.assertEqual(json.loads(drift["binding_mismatches_json"])[0]["observed"][0]["source_name"], "POS")
+        raw_alias = self.connection.execute(
+            """
+            SELECT source_name_raw,canonical_key FROM result_column_definitions
+            WHERE layout_version_id = (
+              SELECT layout_version_id FROM result_schema_contract_observations ORDER BY id DESC LIMIT 1
+            ) AND column_index = 0
+            """
+        ).fetchone()
+        self.assertEqual(tuple(raw_alias), ("POS", "position_overall"))
+
+    def test_sparse_non_state_rows_preserve_state_provenance_and_laps(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 22_700_000
+        headers = [
+            {"n": "NR"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "STATE"}, {"n": "LAPS"},
+            {"n": "LAST"}, {"n": "PIT"}, {"n": "L-PIT"}, {"n": "STINT"},
+        ]
+        self.apply(
+            [
+                ["s_i", 22_700_000],
+                [
+                    "r_i",
+                    {
+                        "l": {"h": headers},
+                        "r": [
+                            [0, 0, "21"], [0, 1, "BALCHUG Racing"], [0, 2, "CN PRO"],
+                            [0, 3, "E22700000"], [0, 4, "5"], [0, 5, "108000000"],
+                            [0, 6, "0"], [0, 7, "L0"], [0, 8, "S22700000"],
+                        ],
+                    },
+                ],
+            ],
+            received_at_us=received,
+        )
+        before = self.connection.execute(
+            """
+            SELECT state_source_cell_observation_id,state_source_message_id,state_source_key
+            FROM participant_state_current
+            """
+        ).fetchone()
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM participant_state_observations").fetchone()[0], 1)
+
+        # LAST and LAPS are real source cells, but neither is a source STATE,
+        # PIT, L-PIT or STINT event. They must not manufacture state history.
+        self.apply([['r_c', [[0, 5, '107500000']]]], received_at_us=received + 1_000_000)
+        self.apply([['r_c', [[0, 4, '6']]]], received_at_us=received + 2_000_000)
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM participant_state_observations").fetchone()[0], 1)
+        lap = self.connection.execute("SELECT lap_number,duration_ms FROM laps ORDER BY lap_number").fetchone()
+        self.assertEqual(tuple(lap), (6, None))
+        after_sparse = self.connection.execute(
+            """
+            SELECT source_message_id,state_source_cell_observation_id,state_source_message_id,state_source_key
+            FROM participant_state_current
+            """
+        ).fetchone()
+        self.assertNotEqual(after_sparse["source_message_id"], before["state_source_message_id"])
+        self.assertEqual(after_sparse["state_source_cell_observation_id"], before["state_source_cell_observation_id"])
+        self.assertEqual(after_sparse["state_source_message_id"], before["state_source_message_id"])
+        self.assertEqual(after_sparse["state_source_key"], before["state_source_key"])
+
+        # PIT-only and STINT-only deltas are preserved as their own source
+        # events, without falsely claiming a new STATE cell.
+        self.apply([['r_c', [[0, 6, '1']]]], received_at_us=received + 3_000_000)
+        self.apply([['r_c', [[0, 8, 'P22704000']]]], received_at_us=received + 4_000_000)
+        observations = self.connection.execute(
+            """
+            SELECT state_cell_observation_id,provider_pit_count_cell_observation_id,
+                   driver_stint_cell_observation_id,state_kind
+            FROM participant_state_observations ORDER BY id
+            """
+        ).fetchall()
+        self.assertEqual(len(observations), 3)
+        self.assertIsNone(observations[1]["state_cell_observation_id"])
+        self.assertIsNotNone(observations[1]["provider_pit_count_cell_observation_id"])
+        self.assertIsNone(observations[2]["state_cell_observation_id"])
+        self.assertIsNotNone(observations[2]["driver_stint_cell_observation_id"])
+        self.assertTrue(all(row["state_kind"] == "ON_TRACK" for row in observations))
+
     def test_completed_pit_interval_rejects_the_next_lap_as_clean(self):
         received = TIME_SERVICE_EPOCH_UNIX_US + 22_000_000
         self.apply(

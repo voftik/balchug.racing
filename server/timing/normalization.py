@@ -185,6 +185,65 @@ class ResultColumn:
     key: str | None
 
 
+@dataclass(frozen=True)
+class ResultSchemaBinding:
+    """One source-name binding in the fixed current Time Service layout."""
+
+    key: str
+    source_name: str
+    source_parameter: str | None = None
+
+
+@dataclass(frozen=True)
+class ResultSchemaContractValidation:
+    """Diagnostic result for the known production result-table contract.
+
+    The result grid remains header-based.  This contract deliberately records
+    a drift instead of moving the meaning of a field to a fixed column index.
+    """
+
+    contract_name: str
+    status: str
+    required_keys: tuple[str, ...]
+    present_keys: tuple[str, ...]
+    missing_required_keys: tuple[str, ...]
+    binding_mismatches: tuple[dict[str, Any], ...]
+    optional_present_keys: tuple[str, ...]
+    unknown_columns: tuple[dict[str, Any], ...]
+
+
+CURRENT_RESULT_SCHEMA_CONTRACT = "time-service-result-grid-v1"
+"""Exact header contract observed on the current live Igora table."""
+
+
+CURRENT_RESULT_SCHEMA_REQUIRED: tuple[ResultSchemaBinding, ...] = (
+    ResultSchemaBinding("position_overall", "position"),
+    ResultSchemaBinding("start_number", "startnumber"),
+    ResultSchemaBinding("state", "State"),
+    ResultSchemaBinding("team_name", "Team name"),
+    ResultSchemaBinding("current_driver", "CurrentDriver"),
+    ResultSchemaBinding("class_name", "class"),
+    ResultSchemaBinding("position_class", "position_in_class"),
+    ResultSchemaBinding("gap", "hole"),
+    ResultSchemaBinding("best_lap", "fastestRoundTime"),
+    ResultSchemaBinding("last_lap", "lastRoundTime"),
+    ResultSchemaBinding("driver_stint", "CurrentDriverStintTime"),
+    ResultSchemaBinding("pit_time", "PitTime"),
+    ResultSchemaBinding("pit_stops", "pitstops"),
+    ResultSchemaBinding("sector_1", "SectorTimes", "1"),
+    ResultSchemaBinding("sector_2", "SectorTimes", "2"),
+    ResultSchemaBinding("sector_3", "SectorTimes", "3"),
+)
+
+
+CURRENT_RESULT_SCHEMA_OPTIONAL: tuple[ResultSchemaBinding, ...] = (
+    ResultSchemaBinding("car_name", "car"),
+    ResultSchemaBinding("laps", "laps"),
+    ResultSchemaBinding("diff", "diff"),
+    ResultSchemaBinding("section_marker", "sectionMarker"),
+)
+
+
 def _header_token(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.casefold())
 
@@ -282,6 +341,80 @@ def result_columns(layout: Any) -> dict[int, ResultColumn]:
             key=_result_field_key(source_name, source_parameter),
         )
     return columns
+
+
+def validate_current_result_schema(
+    columns: Mapping[int, ResultColumn],
+) -> ResultSchemaContractValidation:
+    """Validate the stable live layout without relying on column indexes.
+
+    A result remains ``DEGRADED`` when a familiar alias such as ``POS`` is
+    supplied in place of the provider's current wire header.  The generic
+    normalizer may still retain that alias as a raw/header-based fact, while
+    the durable diagnostic makes a production contract change explicit.
+    """
+
+    bindings = (*CURRENT_RESULT_SCHEMA_REQUIRED, *CURRENT_RESULT_SCHEMA_OPTIONAL)
+    required_keys = tuple(binding.key for binding in CURRENT_RESULT_SCHEMA_REQUIRED)
+    optional_keys = {binding.key for binding in CURRENT_RESULT_SCHEMA_OPTIONAL}
+    present_keys = tuple(sorted({column.key for column in columns.values() if column.key is not None}))
+    missing_required: list[str] = []
+    mismatches: list[dict[str, Any]] = []
+
+    for binding in bindings:
+        observed = tuple(
+            column
+            for _, column in sorted(columns.items())
+            if column.key == binding.key
+        )
+        exact = tuple(
+            column
+            for column in observed
+            if _header_token(column.source_name) == _header_token(binding.source_name)
+            and column.source_parameter == binding.source_parameter
+        )
+        if binding.key in required_keys and not exact:
+            missing_required.append(binding.key)
+        if not observed:
+            continue
+        if len(observed) != 1 or len(exact) != 1:
+            mismatches.append(
+                {
+                    "key": binding.key,
+                    "expected_source_name": binding.source_name,
+                    "expected_source_parameter": binding.source_parameter,
+                    "observed": [
+                        {
+                            "index": column.index,
+                            "source_name": column.source_name,
+                            "source_parameter": column.source_parameter,
+                            "canonical_key": column.key,
+                        }
+                        for column in observed
+                    ],
+                }
+            )
+
+    unknown_columns = tuple(
+        {
+            "index": column.index,
+            "source_name": column.source_name,
+            "source_parameter": column.source_parameter,
+        }
+        for _, column in sorted(columns.items())
+        if column.key is None
+    )
+    optional_present = tuple(key for key in sorted(optional_keys) if key in present_keys)
+    return ResultSchemaContractValidation(
+        contract_name=CURRENT_RESULT_SCHEMA_CONTRACT,
+        status="CURRENT" if not missing_required and not mismatches else "DEGRADED",
+        required_keys=required_keys,
+        present_keys=present_keys,
+        missing_required_keys=tuple(missing_required),
+        binding_mismatches=tuple(mismatches),
+        optional_present_keys=optional_present,
+        unknown_columns=unknown_columns,
+    )
 
 
 @dataclass(frozen=True)

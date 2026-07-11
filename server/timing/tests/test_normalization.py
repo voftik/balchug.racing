@@ -1,6 +1,7 @@
 import unittest
 
 from timing.normalization import (
+    CURRENT_RESULT_SCHEMA_CONTRACT,
     OPEN_ENDED_TS_TIME,
     TIME_SERVICE_EPOCH_UNIX_US,
     ConnectionClockCalibrator,
@@ -13,6 +14,7 @@ from timing.normalization import (
     received_at_to_unix_us,
     result_columns,
     time_service_to_unix_us,
+    validate_current_result_schema,
 )
 
 
@@ -41,6 +43,52 @@ class TimeServiceTimeTests(unittest.TestCase):
 
 
 class ResultTableNormalizationTests(unittest.TestCase):
+    @staticmethod
+    def current_provider_headers():
+        return [
+            {"n": "position"},
+            {"n": "marker"},
+            {"n": "startnumber"},
+            {"n": "State"},
+            {"n": "Team name"},
+            {"n": "CurrentDriver"},
+            {"n": "class"},
+            {"n": "position_in_class"},
+            {"n": "hole"},
+            {"n": "fastestRoundTime"},
+            {"n": "lastRoundTime"},
+            {"n": "CurrentDriverStintTime"},
+            {"n": "PitTime"},
+            {"n": "pitstops"},
+            {"n": "SectorTimes", "p": "1"},
+            {"n": "SectorTimes", "p": "2"},
+            {"n": "SectorTimes", "p": "3"},
+            {"n": "sectionMarker"},
+        ]
+
+    def test_current_provider_headers_are_a_complete_contract_without_optional_columns(self):
+        columns = result_columns({"l": {"h": self.current_provider_headers()}})
+        validation = validate_current_result_schema(columns)
+
+        self.assertEqual(validation.contract_name, CURRENT_RESULT_SCHEMA_CONTRACT)
+        self.assertEqual(validation.status, "CURRENT")
+        self.assertEqual(validation.missing_required_keys, ())
+        self.assertEqual(validation.binding_mismatches, ())
+        self.assertEqual(validation.optional_present_keys, ("section_marker",))
+        self.assertNotIn("car_name", validation.present_keys)
+        self.assertNotIn("laps", validation.present_keys)
+        self.assertNotIn("diff", validation.present_keys)
+
+    def test_current_contract_records_a_known_alias_as_schema_drift(self):
+        headers = self.current_provider_headers()
+        headers[0] = {"n": "POS"}
+        validation = validate_current_result_schema(result_columns({"l": {"h": headers}}))
+
+        self.assertEqual(validation.status, "DEGRADED")
+        self.assertIn("position_overall", validation.missing_required_keys)
+        self.assertEqual(validation.binding_mismatches[0]["key"], "position_overall")
+        self.assertEqual(validation.binding_mismatches[0]["observed"][0]["source_name"], "POS")
+
     def test_dynamic_headers_use_aliases_without_guessing_unknown_columns(self):
         columns = result_columns(
             {

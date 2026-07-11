@@ -24,30 +24,38 @@ The engineer's selected mode (Practice, Qualifying or Race) is stored separately
 from the provider heat name. A race strategy session can therefore run against a
 provider heat whose display title is not itself called “Race”.
 
-## Result grid: current headers
-| Source header | Persistent/query-ready destination | Notes |
-|---|---|---|
-| `POS` | `participant_state_current.position_overall` | Absolute overall position; never substituted for class position |
-| `NR` | `participants.start_number` | `21` is the known Balchug entry number; a conflicting team/number observation is an identity conflict, not a silent match |
-| `STATE` | `participant_state_current.state_raw/state_kind` | Raw source value plus canonical state; source may show a running timer, `In Pit`, `OutLap` or future tokens |
-| `TEAM` | participant + identity segment `team_name` | `BALCHUG Racing` identifies our car |
-| `DRIVER IN CAR` | current state + identity segment `driver_name_raw` | A change opens a new automatic driver segment |
-| `CAR` | participant + identity segment `car_name` | Observed car identity; never inferred from another heat |
-| `CLS` | participant + identity segment `class_name` | `CN PRO` scopes tactics and competitor selection |
-| `PIC` | `participant_state_current.position_class` | Position within class; drives class-only tactical comparisons |
-| `LAPS` | `participant_state_current.laps` | Official source lap total when present; it is not inferred from local capture order |
-| `GAP` | immutable `participant_interval_source_facts(GAP)` + current pointer | Exact source cell with message, time, subject/target position, state and lap context; only this fact may feed a gap metric |
-| `DIFF` | immutable `participant_interval_source_facts(DIFF)` + current pointer | Exact source cell to the absolute row ahead; never subtracted across unrelated table updates |
-| `BEST` | `best_lap_ms` | Invalid source sentinel remains raw-only |
-| `LAST` | current `last_lap_ms` plus immutable `LAST` cell ledger | The only source of a lap duration; every canonical source cell is retained with an explicit admission status before it can enter timing analytics |
-| `STINT` | `current_driver_stint_raw` | Source-specific driver-stint representation, preserved independently from tyre logic |
-| `L-PIT` | `pit_time_raw`, source pit facts and computed `pit_stops` | Pit-lane source field; it is not stationary service time |
-| `PIT` | provider pit count plus reconciled `pit_stops` | Counter corroborates automatic pit cycles; it cannot manufacture a completed stop |
-| `SECT 1`, `SECT 2`, `SECT 3` | `last_sectors_json` / `laps.sectors_json` | Per-sector values are retained with their exact source cells and linked only to a provable `LAST` boundary |
+## Result grid: fixed current wire contract
 
-The source may include additional display fields such as a marker or speed. They
-remain queryable raw facts, but they do not change the meaning of the fixed
-timing fields above.
+The visual dashboard labels and the provider wire header are different. The
+following `n`/`p` values are the stable production contract. It is validated
+for every raw layout as `time-service-result-grid-v1`, stored in
+`result_schema_contract_observations`, and reported as `CURRENT` or
+`DEGRADED`. The implementation never relies on the displayed column index.
+
+| Provider header (`n`, `p`) | Visual dashboard column | Persistent/query-ready destination | Notes |
+|---|---|---|---|
+| `position` | `POS` | `participant_state_current.position_overall` | Absolute overall position; never substituted for class position |
+| `startnumber` | `NR` | `participants.start_number` | `21` is the known Balchug entry number; a conflicting team/number observation is an identity conflict, not a silent match |
+| `State` | `STATE` | `participant_state_current.state_raw/state_kind` | Raw source value plus canonical state; source may show a running timer, `In Pit`, `OutLap` or future tokens |
+| `Team name` | `TEAM` | participant + identity segment `team_name` | `BALCHUG Racing` identifies our car |
+| `CurrentDriver` | `DRIVER IN CAR` | current state + identity segment `driver_name_raw` | A change opens a new automatic driver segment |
+| `class` | `CLS` | participant + identity segment `class_name` | `CN PRO` scopes tactics and competitor selection |
+| `position_in_class` | `PIC` | `participant_state_current.position_class` | Position within class; drives class-only tactical comparisons |
+| `hole` | `GAP` | immutable `participant_interval_source_facts(GAP)` + current pointer | Exact source cell with message, time, subject/target position, state and lap context; only this fact may feed a gap metric |
+| `fastestRoundTime` | `BEST` | `best_lap_ms` | Invalid source sentinel remains raw-only |
+| `lastRoundTime` | `LAST` | current `last_lap_ms` plus immutable `LAST` cell ledger | The only source of a lap duration; every canonical source cell is retained with an explicit admission status before it can enter timing analytics |
+| `CurrentDriverStintTime` | `STINT` | `current_driver_stint_raw` | Source-specific driver-stint representation, preserved independently from tyre logic |
+| `PitTime` | `L-PIT` | `pit_time_raw`, source pit facts and computed `pit_stops` | Pit-lane source field; it is not stationary service time |
+| `pitstops` | `PIT` | provider pit count plus reconciled `pit_stops` | Counter corroborates automatic pit cycles; it cannot manufacture a completed stop |
+| `SectorTimes`, `p=1/2/3` | `SECT 1/2/3` | `last_sectors_json` / `laps.sectors_json` | Per-sector values are retained with exact source cells and linked only to a provable `LAST` boundary |
+
+`CAR`, `LAPS` and `DIFF` are recognized optional source fields but are absent
+from the current wire layout. Their absence is explicit rather than inferred:
+car identity can still arrive from Statistics identity facts, official lap
+totals stay unavailable until a real `LAPS` column appears, and no DIFF value
+is synthesized. `sectionMarker` is a currently observed optional display field.
+Additional fields remain queryable raw facts, but they do not change the
+meaning of the fixed timing fields above.
 
 Values in sparse `r_c` cells can be prefixed (`E`, `S`, `L`) and must remain raw
 until their per-column semantics are decoded; they are not universally integers.
@@ -105,6 +113,15 @@ Pit entry/exit is recorded from observed `STATE` transitions and the source
 `PIT` count, while `t_p` passings are stored independently as corroborating raw
 track evidence. The original STATE observation remains available for replay;
 unknown source literals never manufacture a pit stop.
+
+`participant_state_current.source_*` identifies the latest materialized table
+row, which may be a sparse `LAST`, `GAP` or sector update. Exact STATE
+provenance is stored separately in `state_source_cell_observation_id`,
+`state_source_message_id`, `state_source_key` and `state_observed_at_us` and
+is preserved until a new source `STATE` cell arrives. A row in
+`participant_state_observations` is written only when that source message
+actually contains `STATE`, `PIT`, `L-PIT` or `STINT`; a `LAST`-only or
+`LAPS`-only sparse update cannot create a synthetic `UNKNOWN` state event.
 
 ## Heat, flag, tracker and statistics handles
 

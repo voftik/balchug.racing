@@ -67,7 +67,7 @@ class TimingDatabaseTests(unittest.TestCase):
             path = Path(temporary) / "timing.db"
             self.assertEqual(
                 migrate(path),
-                ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012"],
+                ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013"],
             )
             self.assertEqual(migrate(path), [])
             connection = connect(path)
@@ -90,6 +90,7 @@ class TimingDatabaseTests(unittest.TestCase):
                         "participant_interval_source_facts",
                         "result_schema_baselines",
                         "result_last_cell_ledger",
+                        "result_schema_contract_observations",
                     }.issubset(tables)
                 )
             finally:
@@ -188,6 +189,9 @@ class TimingDatabaseTests(unittest.TestCase):
                         "provider_pit_count",
                         "provider_pit_count_raw",
                         "state_source_cell_observation_id",
+                        "state_source_message_id",
+                        "state_source_key",
+                        "state_observed_at_us",
                         "provider_pit_count_source_cell_observation_id",
                         "pit_time_source_cell_observation_id",
                         "pit_time_source_message_id",
@@ -255,6 +259,20 @@ class TimingDatabaseTests(unittest.TestCase):
                         "sectors_json",
                         "sectors_source_cell_observation_ids_json",
                     }.issubset(last_ledger_columns)
+                )
+                contract_columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(result_schema_contract_observations)")
+                }
+                self.assertTrue(
+                    {
+                        "layout_version_id",
+                        "contract_name",
+                        "status",
+                        "required_keys_json",
+                        "missing_required_keys_json",
+                        "binding_mismatches_json",
+                        "optional_present_keys_json",
+                    }.issubset(contract_columns)
                 )
                 passing_columns = {row[1] for row in connection.execute("PRAGMA table_info(tracker_passings)")}
                 self.assertTrue(
@@ -454,7 +472,7 @@ class TimingDatabaseTests(unittest.TestCase):
 
             self.assertEqual(
                 migrate(path),
-                ["0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012"],
+                ["0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013"],
             )
             connection = connect(path)
             try:
@@ -464,6 +482,137 @@ class TimingDatabaseTests(unittest.TestCase):
                     "state_timer_target_at_us",
                     {row[1] for row in connection.execute("PRAGMA table_info(participant_state_current)")},
                 )
+            finally:
+                connection.close()
+
+    def test_schema_contract_migration_backfills_state_source_and_removes_only_synthetic_rows(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "timing.db"
+            legacy_migrations = root / "legacy-migrations"
+            legacy_migrations.mkdir()
+            for migration in sorted((Path(__file__).parent.parent / "migrations").glob("00[0-1][0-9]_*.sql")):
+                if migration.name.startswith("0013_"):
+                    continue
+                shutil.copyfile(migration, legacy_migrations / migration.name)
+            self.assertEqual(
+                migrate(path, directory=legacy_migrations),
+                ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012"],
+            )
+            connection = connect(path)
+            try:
+                source_id = self.insert_source(connection)
+                heat_id = self.insert_session(connection, "pre-0013", source_id)
+                observed_at_us = 4_000_000
+                _frame_id, message_id = self.insert_frame(
+                    connection, "pre-0013", received_at_us=observed_at_us
+                )
+                source_key = "connection-pre-0013:1:0"
+                connection.execute(
+                    """
+                    INSERT INTO result_layout_versions(
+                      source_heat_id,version_ordinal,layout_fingerprint,raw_layout_json,
+                      source_message_id,source_key,observed_at_us,created_at_us
+                    ) VALUES (?,?,?,?,?,?,?,?)
+                    """,
+                    (heat_id, 0, "pre-0013-layout", '{"h":[{"n":"State"}]}', message_id, source_key, observed_at_us, observed_at_us),
+                )
+                layout_id = connection.execute("SELECT id FROM result_layout_versions").fetchone()[0]
+                connection.execute(
+                    """
+                    INSERT INTO result_column_definitions(
+                      layout_version_id,column_index,source_name_raw,canonical_key,raw_definition_json
+                    ) VALUES (?,0,'State','state','{"n":"State"}')
+                    """,
+                    (layout_id,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO result_column_definitions(
+                      layout_version_id,column_index,source_name_raw,source_parameter_raw,canonical_key,raw_definition_json
+                    ) VALUES (?,1,'SectorTimes','1',NULL,'{"n":"SectorTimes","p":"1"}')
+                    """,
+                    (layout_id,),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO participants(
+                      id,source_heat_id,external_key,start_number,team_name,class_name,first_seen_at_us,last_seen_at_us
+                    ) VALUES ('car-21',?,'21','21','BALCHUG Racing','CN PRO',?,?)
+                    """,
+                    (heat_id, observed_at_us, observed_at_us),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO participant_result_cell_observations(
+                      source_heat_id,participant_id,layout_version_id,provider_row_index,column_index,
+                      raw_value_json,value_text,source_message_id,source_key,source_change_ordinal,
+                      observed_at_us,created_at_us
+                    ) VALUES (?, 'car-21', ?, 0, 0, '["E4000000"]', 'E4000000', ?, ?, 0, ?, ?)
+                    """,
+                    (heat_id, layout_id, message_id, source_key, observed_at_us, observed_at_us),
+                )
+                state_cell_id = connection.execute("SELECT id FROM participant_result_cell_observations").fetchone()[0]
+                connection.execute(
+                    """
+                    INSERT INTO participant_state_current(
+                      source_heat_id,participant_id,state,state_raw,state_kind,source_message_id,
+                      source_key,updated_at_us,state_source_cell_observation_id
+                    ) VALUES (?, 'car-21', 'ON_TRACK', 'E4000000', 'ON_TRACK', ?, 'generic:last', ?, ?)
+                    """,
+                    (heat_id, message_id, observed_at_us + 1, state_cell_id),
+                )
+                # This is the old erroneous sparse-row artifact: no source
+                # cells and no source value. It must disappear in 0013.
+                connection.execute(
+                    """
+                    INSERT INTO participant_state_observations(
+                      source_heat_id,participant_id,layout_version_id,provider_row_index,state_kind,
+                      source_key,source_event_key,observed_at_us,created_at_us
+                    ) VALUES (?, 'car-21', ?, 0, 'UNKNOWN', 'generic:last', 'synthetic:1', ?, ?)
+                    """,
+                    (heat_id, layout_id, observed_at_us + 1, observed_at_us + 1),
+                )
+                # A legitimate historic source observation without the newer
+                # cell-id columns must survive the conservative cleanup.
+                connection.execute(
+                    """
+                    INSERT INTO participant_state_observations(
+                      source_heat_id,participant_id,layout_version_id,provider_row_index,state_raw,state_kind,
+                      source_key,source_event_key,observed_at_us,created_at_us
+                    ) VALUES (?, 'car-21', ?, 0, 'E4000000', 'ON_TRACK', ?, 'historic:1', ?, ?)
+                    """,
+                    (heat_id, layout_id, source_key, observed_at_us, observed_at_us),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            self.assertEqual(migrate(path), ["0013"])
+            connection = connect(path)
+            try:
+                current = connection.execute(
+                    """
+                    SELECT state_source_message_id,state_source_key,state_observed_at_us
+                    FROM participant_state_current
+                    """
+                ).fetchone()
+                self.assertEqual(tuple(current), (message_id, source_key, observed_at_us))
+                observations = connection.execute(
+                    "SELECT source_event_key FROM participant_state_observations ORDER BY source_event_key"
+                ).fetchall()
+                self.assertEqual([row[0] for row in observations], ["historic:1"])
+                self.assertEqual(
+                    connection.execute(
+                        """
+                        SELECT canonical_key FROM result_column_definitions
+                        WHERE layout_version_id = ? AND column_index = 1
+                        """,
+                        (layout_id,),
+                    ).fetchone()[0],
+                    "sector_1",
+                )
+                self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
             finally:
                 connection.close()
 
