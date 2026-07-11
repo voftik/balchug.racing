@@ -294,7 +294,8 @@
   function timelineLapTicks(range, laps) {
     var entries = [];
     (Array.isArray(laps) ? laps : []).forEach(function (lap) {
-      var atUs = numericValue(lap && lap.completed_at_us);
+      var atUs = numericValue(lap && lap.board_observed_at_us);
+      if (atUs === null) atUs = numericValue(lap && lap.completed_at_us);
       var lapNumber = numericValue(lap && lap.lap_number);
       if (atUs === null || lapNumber === null || atUs < range.first_at_us || atUs > range.last_at_us) return;
       entries.push({ atUs: atUs, lapNumber: Math.round(lapNumber) });
@@ -1555,31 +1556,37 @@
 
   function rawLapStatus(point) {
     if (!point) return "";
+    if (point.timelineKind === "snapshot_baseline") return "Стартовый срез таблицы, не новый круг";
     if (point.value === null) return "время не передано источником";
     var labels = [];
+    if (point.timelineKind === "table_observation") labels.push("LAST табло, условия не подтверждены");
     if (point.crossesPit) labels.push("через пит-стоп");
     if (point.isInLap) labels.push("in lap");
     if (point.isOutLap) labels.push("out lap");
     if (point.flag && point.flag !== "GREEN") labels.push("флаг " + flagLabel(point.flag));
-    if (!point.isClean && !labels.length) labels.push("неподтверждённый круг");
-    return labels.length ? labels.join(" · ") : "боевой круг";
+    if (point.isClean === false && !labels.length) labels.push("круг с особыми условиями");
+    return labels.length ? labels.join(" · ") : "подтверждённый круг";
   }
 
   function rawLapPoints(laps, participant) {
     return (Array.isArray(laps) ? laps : []).map(function (lap) {
-      var atUs = numericValue(lap && lap.completed_at_us);
+      var atUs = numericValue(lap && lap.board_observed_at_us);
+      if (atUs === null) atUs = numericValue(lap && lap.completed_at_us);
       if (atUs === null) return null;
       var duration = numericValue(lap.duration_ms);
+      var source = asObject(lap && lap.source);
       return {
-        id: [lap.participant_id || participant && participant.participant_id || "", lap.lap_number, atUs].join(":"),
+        id: source.cell_observation_id || [lap.participant_id || participant && participant.participant_id || "", lap.lap_number, atUs].join(":"),
         atUs: atUs,
         value: duration,
         lapNumber: numericValue(lap.lap_number),
+        timelineKind: lap.timeline_kind || "confirmed_lap",
         participantId: lap.participant_id || participant && participant.participant_id || null,
         startNumber: lap.start_number || participant && participant.start_number || null,
         teamName: lap.team_name || participant && participant.team_name || null,
         isOurs: !!(participant && participant.is_ours),
-        isClean: !!lap.is_clean && duration !== null,
+        isClean: duration === null ? false :
+          (lap.is_clean === true ? true : (lap.is_clean === false ? false : null)),
         crossesPit: !!lap.crosses_pit,
         isInLap: !!lap.is_in_lap,
         isOutLap: !!lap.is_out_lap,
@@ -1704,6 +1711,7 @@
   }
 
   function archiveLapCaption(lapNumber, atUs) {
+    if (lapNumber === null || lapNumber === undefined) return "Номер круга не передан";
     var scope = archiveLapCountScope(historicalSnapshot(atUs || state.atUs));
     return (scope === "capture_tracker" ? "Зафиксированный круг #" : "Круг #") + valueOrDash(lapNumber);
   }
@@ -2283,7 +2291,7 @@
       context.restore();
       return;
     }
-    if (point.isClean) {
+    if (point.isClean === true) {
       context.beginPath(); context.arc(x, y, 2.7, 0, Math.PI * 2); context.fill();
     } else {
       context.fillStyle = "#fff";
@@ -2303,11 +2311,13 @@
         previous = null;
         return;
       }
-      var followsPreviousLap = previous && previous.lapNumber !== null && point.lapNumber !== null &&
-        point.lapNumber === previous.lapNumber + 1;
-      if (previous && followsPreviousLap) {
-        var isRaceLine = previous.isClean && point.isClean;
-        context.setLineDash(isRaceLine ? [] : [5, 4]);
+      if (point.timelineKind === "snapshot_baseline") {
+        previous = null;
+        return;
+      }
+      if (previous) {
+        var hasKnownSpecialConditions = previous.isClean !== true || point.isClean !== true;
+        context.setLineDash(hasKnownSpecialConditions ? [5, 4] : []);
         context.beginPath();
         context.moveTo(geometry.xAt(previous.atUs), rawPointY(geometry, previous));
         context.lineTo(geometry.xAt(point.atUs), rawPointY(geometry, point));

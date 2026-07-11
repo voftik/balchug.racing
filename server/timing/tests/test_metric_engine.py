@@ -572,6 +572,147 @@ class MetricEngineTests(unittest.TestCase):
             {alert["key"] for alert in candidate_values(changed_result, "session", "session-1")["alerts"]},
         )
 
+    def test_no_laps_source_event_boundary_survives_an_equal_last_duration(self):
+        initial = heat_input(flag="GREEN")
+        first = evaluate_heat_metrics(initial)
+        old_ours = initial.our_participant
+        changed_ours = replace(
+            old_ours,
+            # The source layout has no LAPS.  The provider can publish an
+            # identical LAST duration for two distinct laps, so the raw cell
+            # id—not a fabricated lap number—must advance the event cursor.
+            latest_timing_event_id=712,
+            laps=old_ours.laps
+            + (
+                LapInput(
+                    lap_number=None,
+                    completed_at_us=6_500_000,
+                    duration_ms=107_100,
+                    sectors_json=None,
+                    flag="GREEN",
+                    is_in_lap=False,
+                    is_out_lap=False,
+                    crosses_pit=False,
+                    is_clean=True,
+                    source_message_id=7,
+                    source_key="frame:7",
+                    timing_event_id=712,
+                    capture_sequence=1,
+                ),
+            ),
+        )
+        changed_scope = replace(
+            initial.class_scopes[0],
+            participants=(initial.participants[0], changed_ours, initial.participants[2]),
+        )
+        changed = replace(
+            initial,
+            observed_at_us=7_000_000,
+            participants=(initial.participants[0], changed_ours, initial.participants[2]),
+            class_scopes=(changed_scope,),
+        )
+
+        result = evaluate_heat_metrics(changed, previous=first)
+
+        self.assertIn("lap:ours", result.event_keys)
+        self.assertTrue(candidate_event_boundary(result, "session", "session-1"))
+        self.assertTrue(candidate_event_boundary(result, "class", "cn pro"))
+        self.assertTrue(candidate_event_boundary(result, "participant", "ours"))
+        self.assertEqual(candidate_values(result, "participant", "ours")["pace_5_ms"], 107_200.0)
+
+    def test_tracker_only_laps_do_not_dilute_timing_but_explicit_grid_laps_do(self):
+        initial = heat_input(flag="GREEN")
+        old_ours = initial.our_participant
+        changed_ours = replace(
+            old_ours,
+            laps=old_ours.laps
+            + (
+                LapInput(
+                    lap_number=13,
+                    completed_at_us=6_300_000,
+                    duration_ms=None,
+                    sectors_json=None,
+                    flag="GREEN",
+                    is_in_lap=False,
+                    is_out_lap=False,
+                    crosses_pit=False,
+                    is_clean=True,
+                    source_message_id=7,
+                    source_key="tracker:13",
+                    timing_eligible=False,
+                ),
+                LapInput(
+                    lap_number=14,
+                    completed_at_us=6_500_000,
+                    duration_ms=107_100,
+                    sectors_json=None,
+                    flag="GREEN",
+                    is_in_lap=False,
+                    is_out_lap=False,
+                    crosses_pit=False,
+                    is_clean=True,
+                    source_message_id=8,
+                    source_key="grid:14",
+                    timing_eligible=True,
+                ),
+            ),
+        )
+        changed_scope = replace(
+            initial.class_scopes[0],
+            participants=(initial.participants[0], changed_ours, initial.participants[2]),
+        )
+        changed = replace(
+            initial,
+            participants=(initial.participants[0], changed_ours, initial.participants[2]),
+            class_scopes=(changed_scope,),
+        )
+
+        values = candidate_values(evaluate_heat_metrics(changed), "participant", "ours")
+        self.assertEqual(values["observed_lap_count"], len(old_ours.laps) + 1)
+        self.assertEqual(values["clean_lap_count"], len(old_ours.laps) + 1)
+
+    def test_raw_last_source_order_beats_non_monotonic_receipt_time(self):
+        initial = heat_input(flag="GREEN")
+        old_ours = initial.our_participant
+        raw_later_frame = LapInput(
+            lap_number=None,
+            completed_at_us=7_000_000,
+            duration_ms=107_600,
+            sectors_json=None,
+            flag="GREEN",
+            is_in_lap=False,
+            is_out_lap=False,
+            crosses_pit=False,
+            is_clean=True,
+            source_message_id=7,
+            source_key="raw:later",
+            timing_event_id=702,
+            capture_sequence=2,
+            source_frame_id=12,
+            source_message_ordinal=0,
+            source_change_ordinal=0,
+        )
+        raw_earlier_frame = LapInput(
+            lap_number=None,
+            completed_at_us=8_000_000,
+            duration_ms=107_500,
+            sectors_json=None,
+            flag="GREEN",
+            is_in_lap=False,
+            is_out_lap=False,
+            crosses_pit=False,
+            is_clean=True,
+            source_message_id=8,
+            source_key="raw:earlier",
+            timing_event_id=701,
+            capture_sequence=1,
+            source_frame_id=11,
+            source_message_ordinal=0,
+            source_change_ordinal=0,
+        )
+        samples = metric_engine._lap_samples(replace(old_ours, laps=(raw_later_frame, raw_earlier_frame)))
+        self.assertEqual([sample.duration_ms for sample in samples], [107_500, 107_600])
+
     def test_red_flag_transition_emits_critical_alert_once(self):
         initial = heat_input(flag="GREEN")
         first = evaluate_heat_metrics(initial)

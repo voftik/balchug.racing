@@ -14,6 +14,7 @@ from timing.read_api import (
     ReadValidationError,
     ScopeNotFoundError,
     TimingReadModel,
+    _archive_result_last_rows,
     _bounded_archive_lap_rows,
 )
 
@@ -199,6 +200,77 @@ class TimingReadModelTests(unittest.TestCase):
             ),
         )
 
+    def _add_result_last_cells(self, cells):
+        """Seed immutable result-grid LAST evidence for archive read tests."""
+
+        self.connection.execute(
+            """
+            INSERT INTO ingest_runs(id,analysis_session_id,reducer_version,started_at_us)
+            VALUES ('raw-run','session-1','test',1)
+            """
+        )
+        self.connection.execute(
+            """
+            INSERT INTO ingest_connections(id,ingest_run_id,ordinal,connected_at_us)
+            VALUES ('raw-connection','raw-run',1,1)
+            """
+        )
+        layout_message_id = None
+        cell_ids = []
+        for sequence, (handle, value_text, observed_at_us) in enumerate(cells, start=1):
+            raw_payload = b"{}"
+            self.connection.execute(
+                """
+                INSERT INTO feed_frames(
+                  analysis_session_id,ingest_connection_id,frame_sequence,received_at_us,monotonic_ns,
+                  raw_payload,raw_sha256,decode_state,processed_at_us,created_at_us
+                ) VALUES ('session-1','raw-connection',?,?,?,?,'hash','decoded',?,?)
+                """,
+                (sequence, observed_at_us, sequence, raw_payload, observed_at_us, observed_at_us),
+            )
+            frame_id = self.connection.execute("SELECT last_insert_rowid()").fetchone()[0]
+            self.connection.execute(
+                """
+                INSERT INTO feed_messages(frame_id,ordinal,handle,args_json,compressed,created_at_us)
+                VALUES (?,?,?, '[]',0,?)
+                """,
+                (frame_id, 0, handle, observed_at_us),
+            )
+            message_id = self.connection.execute("SELECT last_insert_rowid()").fetchone()[0]
+            if layout_message_id is None:
+                layout_message_id = message_id
+                self.connection.execute(
+                    """
+                    INSERT INTO result_layout_versions(
+                      source_heat_id,version_ordinal,layout_fingerprint,raw_layout_json,
+                      source_message_id,source_key,observed_at_us,created_at_us
+                    ) VALUES (?,1,'layout:last','{}',?,'raw:layout',?,?)
+                    """,
+                    (self.heat_id, message_id, observed_at_us, observed_at_us),
+                )
+                layout_id = self.connection.execute("SELECT last_insert_rowid()").fetchone()[0]
+                self.connection.execute(
+                    """
+                    INSERT INTO result_column_definitions(
+                      layout_version_id,column_index,source_name_raw,canonical_key,raw_definition_json
+                    ) VALUES (?,0,'LAST','last_lap','{}')
+                    """,
+                    (layout_id,),
+                )
+            source_key = f"raw:{sequence}"
+            self.connection.execute(
+                """
+                INSERT INTO participant_result_cell_observations(
+                  source_heat_id,participant_id,layout_version_id,provider_row_index,column_index,
+                  raw_value_json,value_text,source_message_id,source_key,source_change_ordinal,
+                  observed_at_us,created_at_us
+                ) VALUES (?,'ours',?,0,0,?,?,?,?,0,?,?)
+                """,
+                (self.heat_id, layout_id, json.dumps([value_text]), value_text, message_id, source_key, observed_at_us, observed_at_us),
+            )
+            cell_ids.append(self.connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+        return cell_ids
+
     def test_snapshot_exposes_source_facts_metrics_freshness_and_stream_barrier(self):
         snapshot = self.model.snapshot("session-1").as_dict()
 
@@ -239,6 +311,19 @@ class TimingReadModelTests(unittest.TestCase):
         self.connection.execute("UPDATE track_flag_current SET flag = 'FINISH' WHERE source_heat_id = ?", (self.heat_id,))
         self.connection.commit()
         self.assertEqual(self.model.snapshot("session-1").freshness.reason, "track_finished")
+
+    def test_session_level_open_gap_is_visible_to_read_model(self):
+        self.connection.execute(
+            """
+            INSERT INTO ingest_gaps(analysis_session_id,source_heat_id,started_at_us,reason,created_at_us)
+            VALUES ('session-1',NULL,12000000,'connection_reset',12000000)
+            """
+        )
+        self.connection.commit()
+
+        snapshot = self.model.snapshot("session-1")
+        self.assertEqual(snapshot.freshness.reason, "source_gap")
+        self.assertEqual(snapshot.freshness.open_gap["reason"], "connection_reset")
 
     def test_pending_session_is_a_valid_empty_snapshot_and_read_surface(self):
         snapshot = self.model.snapshot("pending-1").as_dict()
@@ -636,6 +721,90 @@ class TimingReadModelTests(unittest.TestCase):
             self.model.archive_comparison("session-1", mode="participant", participant_id="ours")
         with self.assertRaises(ScopeNotFoundError):
             self.model.archive_comparison("session-1", mode="participant", participant_id="not-in-class")
+
+    def test_archive_comparison_uses_each_result_grid_last_without_inventing_lap_numbers(self):
+        self.connection.execute("UPDATE analysis_sessions SET lifecycle = 'stopped' WHERE id = 'session-1'")
+        baseline_cell, linked_cell, raw_cell = self._add_result_last_cells(
+            (
+                ("r_i", "108000000", 10_500_000),
+                ("r_c", "107200000", 12_000_000),
+                ("r_c", "106900000", 12_500_000),
+            )
+        )
+        self.connection.execute(
+            """
+            UPDATE laps
+            SET duration_source_cell_observation_id = ?, duration_source_message_id = 1,
+                duration_source_key = 'raw:2', duration_source_kind = 'RESULT_GRID_LAST'
+            WHERE id = 'lap-12'
+            """,
+            (linked_cell,),
+        )
+        payload = {
+            "schema_version": "timing-archive.v1",
+            "observed_at_us": 10_000_000,
+            "computed": {"session": {"ours_participant_id": "ours"}},
+            "class_participants": [
+                {
+                    "measured": {
+                        "participant_id": "ours",
+                        "start_number": "21",
+                        "team_name": "BALCHUG Racing",
+                        "class_name": "CN PRO",
+                        "is_ours": True,
+                        "state": {"state_kind": "ON_TRACK"},
+                    },
+                    "computed": {"participant_id": "ours", "is_ours": True, "pace_5_ms": 107_200},
+                }
+            ],
+        }
+        self._add_playback_snapshot(10_000_000, payload)
+        payload["observed_at_us"] = 13_000_000
+        self._add_playback_snapshot(13_000_000, payload)
+        self.connection.commit()
+
+        comparison = self.model.archive_comparison("session-1")
+        raw = comparison["lap_series"]["ours_raw"]
+        self.assertEqual([item["duration_ms"] for item in raw], [108_000, 107_200, 106_900])
+        self.assertEqual(
+            [item["timeline_kind"] for item in raw],
+            ["snapshot_baseline", "confirmed_lap", "table_observation"],
+        )
+        self.assertEqual([item["lap_number"] for item in raw], [None, 12, None])
+        self.assertEqual([item["board_observed_at_us"] for item in raw], [10_500_000, 12_000_000, 12_500_000])
+        self.assertEqual(raw[1]["completed_at_us"], 12_000_000)
+        self.assertEqual(raw[2]["completed_at_us"], None)
+        self.assertEqual(raw[2]["source"]["cell_observation_id"], raw_cell)
+        self.assertEqual(raw[0]["source"]["cell_observation_id"], baseline_cell)
+        self.assertIn("not an invented finish crossing", comparison["semantics"]["lap_series_ours_raw"])
+
+    def test_archive_raw_last_fails_closed_on_duplicate_last_columns(self):
+        self.connection.execute("UPDATE analysis_sessions SET lifecycle = 'stopped' WHERE id = 'session-1'")
+        self._add_result_last_cells((("r_i", "108000000", 10_500_000),))
+        layout_id = self.connection.execute(
+            "SELECT id FROM result_layout_versions WHERE source_heat_id = ? ORDER BY id DESC LIMIT 1",
+            (self.heat_id,),
+        ).fetchone()[0]
+        self.connection.execute(
+            """
+            INSERT INTO result_column_definitions(
+              layout_version_id,column_index,source_name_raw,canonical_key,raw_definition_json
+            ) VALUES (?,1,'LAST duplicate','last_lap','{}')
+            """,
+            (layout_id,),
+        )
+        self.connection.commit()
+
+        self.assertEqual(
+            _archive_result_last_rows(
+                self.connection,
+                heat_id=self.heat_id,
+                participant_ids=["ours"],
+                first_at_us=10_000_000,
+                last_at_us=11_000_000,
+            ),
+            {},
+        )
 
     def test_bounded_archive_laps_keep_breaks_when_non_clean_rows_are_decimated(self):
         laps = [

@@ -48,6 +48,7 @@ not engineer inputs.
     },
     "lap_and_stint_rules": {
       "completed_lap": "A provider-confirmed finish-loop crossing, using the grid LAPS value when present or the dynamic tracker topology when it is absent. Do not double count both sources. Public official lap totals remain null when the grid does not expose LAPS; tracker crossings remain available only for observed stint and chronology logic.",
+      "last_timing_stream": "Every valid changed r_c LAST cell from a no-LAPS layout is retained in source frame order as a timing event without inventing a provider lap number. An r_i snapshot is only a reconnect baseline. Pace may combine those raw LAST events with later explicit-LAPS rows only when the latter retain exact source-cell provenance; tracker-only and pre-provenance legacy rows remain available for tyre/stint chronology but are excluded from timing formulas.",
       "clean_lap": "A valid timed lap whose full lap interval is Green, is not an in-lap or out-lap, has no pit crossing, and does not intersect a feed/source gap.",
       "tyre_age_laps": "The number of provider-confirmed completed laps after the current stint start. At confirmed pit_out it is 0. The first partial stint begins at analysis activation and counts from that point until its first pit; it is not presented as a manual correction.",
       "mandatory_pit": "Count only a completed, ordered pit_in -> pit_out pair. A raw provider PIT counter alone cannot complete a mandatory stop."

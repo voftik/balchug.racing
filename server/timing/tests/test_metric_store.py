@@ -9,6 +9,7 @@ from timing.metric_store import (
     MetricMaterializationResult,
     MetricSampleCandidate,
     MetricStoreError,
+    _green_covers_interval,
     load_heat_metric_input,
     load_metric_history,
     materialize_metric_samples,
@@ -242,6 +243,227 @@ class MetricStoreTests(unittest.TestCase):
             ),
         )
 
+    def _insert_raw_result_message(self, *, sequence, observed_at_us, handle, connection_id="raw-connection"):
+        """Persist the minimal immutable frame/message pair used by raw LAST tests."""
+
+        if self.connection.execute("SELECT 1 FROM ingest_runs WHERE id = 'raw-run'").fetchone() is None:
+            self.connection.execute(
+                """
+                INSERT INTO ingest_runs(id,analysis_session_id,reducer_version,started_at_us)
+                VALUES ('raw-run','session-1','test',1000000)
+                """
+            )
+        if self.connection.execute("SELECT 1 FROM ingest_connections WHERE id = ?", (connection_id,)).fetchone() is None:
+            ordinal = int(
+                self.connection.execute("SELECT COUNT(*) FROM ingest_connections WHERE ingest_run_id = 'raw-run'").fetchone()[0]
+            ) + 1
+            self.connection.execute(
+                """
+                INSERT INTO ingest_connections(id,ingest_run_id,ordinal,connected_at_us)
+                VALUES (?,'raw-run',?,1000000)
+                """
+                ,
+                (connection_id, ordinal),
+            )
+        cursor = self.connection.execute(
+            """
+            INSERT INTO feed_frames(
+              analysis_session_id,ingest_connection_id,frame_sequence,received_at_us,monotonic_ns,
+              raw_payload,raw_sha256,decode_state,created_at_us
+            ) VALUES ('session-1',?,?,?,?,'{}','raw-sha','decoded',?)
+            """,
+            (connection_id, sequence, observed_at_us, sequence, observed_at_us),
+        )
+        frame_id = int(cursor.lastrowid)
+        cursor = self.connection.execute(
+            """
+            INSERT INTO feed_messages(frame_id,ordinal,handle,args_json,compressed,created_at_us)
+            VALUES (?,0,?,'[]',0,?)
+            """,
+            (frame_id, handle, observed_at_us),
+        )
+        return frame_id, int(cursor.lastrowid)
+
+    def _seed_no_laps_last_history(self):
+        """Seed r_i/r_c cells without using the normalizer under test elsewhere."""
+
+        _, initial_message_id = self._insert_raw_result_message(sequence=100, observed_at_us=1_500_000, handle="r_i")
+        layout_id = int(
+            self.connection.execute(
+                """
+                INSERT INTO result_layout_versions(
+                  source_heat_id,version_ordinal,layout_fingerprint,raw_layout_json,source_message_id,
+                  source_key,observed_at_us,created_at_us
+                ) VALUES (?,0,'raw-no-laps','{}',?,'raw:100',1500000,1500000)
+                """,
+                (self.source_heat_id, initial_message_id),
+            ).lastrowid
+        )
+        self.connection.executemany(
+            """
+            INSERT INTO result_column_definitions(
+              layout_version_id,column_index,source_name_raw,source_parameter_raw,display_name_raw,
+              canonical_key,raw_definition_json
+            ) VALUES (?,?,?,?,?,?,?)
+            """,
+            [
+                (layout_id, 0, "LAST", None, None, "last_lap", "{}"),
+                (layout_id, 1, "STATE", None, None, "state", "{}"),
+            ],
+        )
+
+        def cell(message_id, sequence, ordinal, column, value, observed_at_us):
+            cursor = self.connection.execute(
+                """
+                INSERT INTO participant_result_cell_observations(
+                  source_heat_id,participant_id,layout_version_id,provider_row_index,column_index,
+                  raw_value_json,value_text,source_message_id,source_key,source_change_ordinal,
+                  observed_at_us,created_at_us
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    self.source_heat_id,
+                    "ours",
+                    layout_id,
+                    0,
+                    column,
+                    json.dumps([value]),
+                    value,
+                    message_id,
+                    f"raw:{sequence}",
+                    ordinal,
+                    observed_at_us,
+                    observed_at_us,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+        initial_last_id = cell(initial_message_id, 100, 0, 0, "108000000", 1_500_000)
+        cell(initial_message_id, 100, 1, 1, "E1500000", 1_500_000)
+        raw_ids = []
+        for sequence, observed_at_us, value in (
+            (101, 2_000_000, "107500000"),
+            (102, 3_000_000, "107400000"),
+            (103, 4_000_000, "9223372036854775807"),
+        ):
+            _, message_id = self._insert_raw_result_message(
+                sequence=sequence, observed_at_us=observed_at_us, handle="r_c"
+            )
+            raw_ids.append(cell(message_id, sequence, 0, 0, value, observed_at_us))
+        _, reconnect_message_id = self._insert_raw_result_message(sequence=104, observed_at_us=5_000_000, handle="r_i")
+        cell(reconnect_message_id, 104, 0, 0, "107300000", 5_000_000)
+        _, final_message_id = self._insert_raw_result_message(sequence=105, observed_at_us=6_000_000, handle="r_c")
+        raw_ids.append(cell(final_message_id, 105, 0, 0, "107400000", 6_000_000))
+
+        self.connection.execute(
+            """
+            INSERT INTO track_flag_periods(
+              source_heat_id,flag,started_at_us,source_key,created_at_us
+            ) VALUES (?,'GREEN',1000000,'raw:green',1000000)
+            """,
+            (self.source_heat_id,),
+        )
+        tracker_id = int(
+            self.connection.execute(
+                """
+                INSERT INTO tracker_passing_observations(
+                  source_heat_id,participant_id,event_fingerprint,raw_passing_json,source_message_id,
+                  source_key,source_event_key,observed_at_us,created_at_us
+                ) VALUES (?,'ours','raw-tracker-r-c','{}',?,'raw:102','raw:tracker-r-c',3000000,3000000)
+                """,
+                (
+                    self.source_heat_id,
+                    self.connection.execute(
+                        "SELECT id FROM feed_messages WHERE frame_id = (SELECT id FROM feed_frames WHERE ingest_connection_id='raw-connection' AND frame_sequence=102)"
+                    ).fetchone()[0],
+                ),
+            ).lastrowid
+        )
+        self.connection.execute(
+            """
+            INSERT INTO laps(
+              id,source_heat_id,participant_id,lap_number,completed_at_us,duration_ms,sectors_json,flag,
+              is_in_lap,is_out_lap,crosses_pit,is_clean,source_key,created_at_us,
+              completion_passing_observation_id,duration_source_cell_observation_id,duration_source_kind
+            ) VALUES ('duplicate-r-c',?,'ours',97,3000000,107400,NULL,'GREEN',0,0,0,1,'raw:102',3000000,?,?,'RESULT_GRID_LAST')
+            """,
+            (self.source_heat_id, tracker_id, raw_ids[1]),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO laps(
+              id,source_heat_id,participant_id,lap_number,completed_at_us,duration_ms,sectors_json,flag,
+              is_in_lap,is_out_lap,crosses_pit,is_clean,source_key,created_at_us,
+              completion_passing_observation_id,duration_source_cell_observation_id,duration_source_kind
+            ) VALUES ('tracker-r-i',?,'ours',98,1500000,108000,NULL,'GREEN',0,0,0,1,'raw:100',1500000,?,?,'RESULT_GRID_LAST')
+            """,
+            (self.source_heat_id, tracker_id, initial_last_id),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO laps(
+              id,source_heat_id,participant_id,lap_number,completed_at_us,duration_ms,sectors_json,flag,
+              is_in_lap,is_out_lap,crosses_pit,is_clean,source_key,created_at_us,
+              completion_passing_observation_id,duration_source_cell_observation_id,duration_source_kind
+            ) VALUES ('tracker-unlinked',?,'ours',99,4000000,NULL,NULL,'GREEN',0,0,0,1,'raw:103',4000000,?,NULL,NULL)
+            """,
+            (self.source_heat_id, tracker_id),
+        )
+        return raw_ids
+
+    def _seed_explicit_lap_after_no_laps(self):
+        """Add an explicit-LAPS layout after raw no-LAPS LAST facts."""
+
+        self._seed_no_laps_last_history()
+        _, layout_message_id = self._insert_raw_result_message(sequence=106, observed_at_us=7_000_000, handle="r_i")
+        layout_id = int(
+            self.connection.execute(
+                """
+                INSERT INTO result_layout_versions(
+                  source_heat_id,version_ordinal,layout_fingerprint,raw_layout_json,source_message_id,
+                  source_key,observed_at_us,created_at_us
+                ) VALUES (?,1,'explicit-laps','{}',?,'raw:106',7000000,7000000)
+                """,
+                (self.source_heat_id, layout_message_id),
+            ).lastrowid
+        )
+        self.connection.executemany(
+            """
+            INSERT INTO result_column_definitions(
+              layout_version_id,column_index,source_name_raw,source_parameter_raw,display_name_raw,
+              canonical_key,raw_definition_json
+            ) VALUES (?,?,?,?,?,?,?)
+            """,
+            [
+                (layout_id, 0, "LAST", None, None, "last_lap", "{}"),
+                (layout_id, 1, "LAPS", None, None, "laps", "{}"),
+            ],
+        )
+        _, message_id = self._insert_raw_result_message(sequence=107, observed_at_us=8_000_000, handle="r_c")
+        duration_cell_id = int(
+            self.connection.execute(
+                """
+                INSERT INTO participant_result_cell_observations(
+                  source_heat_id,participant_id,layout_version_id,provider_row_index,column_index,
+                  raw_value_json,value_text,source_message_id,source_key,source_change_ordinal,
+                  observed_at_us,created_at_us
+                ) VALUES (?,'ours',?,0,0,'["106900000"]','106900000',?,'raw:107',0,8000000,8000000)
+                RETURNING id
+                """,
+                (self.source_heat_id, layout_id, message_id),
+            ).fetchone()[0]
+        )
+        self.connection.execute(
+            """
+            INSERT INTO laps(
+              id,source_heat_id,participant_id,lap_number,completed_at_us,duration_ms,sectors_json,flag,
+              is_in_lap,is_out_lap,crosses_pit,is_clean,source_message_id,source_key,created_at_us,
+              completion_passing_observation_id,duration_source_cell_observation_id,duration_source_kind
+            ) VALUES ('explicit-after-raw',?,'ours',100,8000000,106900,NULL,'GREEN',0,0,0,1,?,'raw:107',8000000,NULL,?,'RESULT_GRID_LAST')
+            """,
+            (self.source_heat_id, message_id, duration_cell_id),
+        )
+
     def test_loads_immutable_normalized_facts_and_automatic_class_scope(self):
         snapshot = load_heat_metric_input(self.connection, self.source_heat_id)
 
@@ -275,6 +497,110 @@ class MetricStoreTests(unittest.TestCase):
             snapshot.session.mode = "practice"
         with self.assertRaises(AttributeError):
             snapshot.participants.append(ours)
+
+    def test_loads_each_raw_r_c_last_without_inventing_a_provider_lap_number(self):
+        raw_ids = self._seed_no_laps_last_history()
+        self.connection.commit()
+
+        ours = load_heat_metric_input(self.connection, self.source_heat_id).our_participant
+        raw_laps = [lap for lap in ours.laps if lap.timing_event_id is not None]
+
+        # r_i is only a reconnect/baseline snapshot.  The sentinel is not a
+        # lap time.  Every valid r_c LAST remains an independent raw sample,
+        # including an equal consecutive duration.
+        self.assertEqual([lap.timing_event_id for lap in raw_laps], [raw_ids[0], raw_ids[1], raw_ids[3]])
+        self.assertEqual([lap.lap_number for lap in raw_laps], [None, None, None])
+        self.assertEqual([lap.capture_sequence for lap in raw_laps], [1, 2, 3])
+        self.assertEqual([lap.duration_ms for lap in raw_laps], [107_500, 107_400, 107_400])
+        self.assertEqual([lap.is_clean for lap in raw_laps], [False, True, False])
+        self.assertEqual(ours.latest_timing_event_id, raw_ids[3])
+        # Tracker rows stay in the durable chronology for tyre age, but they
+        # cannot dilute timing counts once raw no-LAPS LAST facts exist.
+        ineligible = [lap for lap in ours.laps if not lap.timing_eligible]
+        self.assertEqual([lap.lap_number for lap in ineligible], [11, 12, 98, 99])
+        self.assertEqual([lap.duration_ms for lap in ineligible], [107_500, 107_200, 108_000, None])
+        self.assertIn(98, [lap.lap_number for lap in ours.laps])
+        self.assertIn(99, [lap.lap_number for lap in ours.laps])
+
+    def test_raw_last_and_later_explicit_laps_are_both_timing_eligible(self):
+        self._seed_explicit_lap_after_no_laps()
+        self.connection.commit()
+
+        ours = load_heat_metric_input(self.connection, self.source_heat_id).our_participant
+        explicit = next(lap for lap in ours.laps if lap.lap_number == 100)
+        self.assertTrue(explicit.timing_eligible)
+        self.assertEqual(explicit.duration_ms, 106_900)
+        self.assertTrue(any(lap.timing_event_id is not None for lap in ours.laps))
+
+    def test_ambiguous_last_layout_is_not_a_raw_timing_source(self):
+        self._seed_no_laps_last_history()
+        layout_id = self.connection.execute(
+            "SELECT id FROM result_layout_versions WHERE layout_fingerprint = 'raw-no-laps'"
+        ).fetchone()[0]
+        self.connection.execute(
+            """
+            INSERT INTO result_column_definitions(
+              layout_version_id,column_index,source_name_raw,source_parameter_raw,display_name_raw,
+              canonical_key,raw_definition_json
+            ) VALUES (?,2,'LAST DUPLICATE',NULL,NULL,'last_lap','{}')
+            """,
+            (layout_id,),
+        )
+        self.connection.commit()
+
+        ours = load_heat_metric_input(self.connection, self.source_heat_id).our_participant
+        self.assertEqual([lap for lap in ours.laps if lap.timing_event_id is not None], [])
+
+    def test_overlapping_non_green_flag_rejects_raw_last_clean_classification(self):
+        self.assertFalse(
+            _green_covers_interval(
+                (("GREEN", 1_000_000, None), ("RED", 2_000_000, 3_000_000)),
+                started_at_us=1_500_000,
+                ended_at_us=3_500_000,
+            )
+        )
+
+    def test_session_level_open_gap_is_visible_to_metric_input(self):
+        self.connection.execute("DELETE FROM ingest_gaps WHERE source_heat_id = ?", (self.source_heat_id,))
+        self.connection.execute(
+            """
+            INSERT INTO ingest_gaps(analysis_session_id,source_heat_id,started_at_us,reason,created_at_us)
+            VALUES ('session-1',NULL,15000000,'connection_reset',15000000)
+            """
+        )
+        self.connection.commit()
+
+        snapshot = load_heat_metric_input(self.connection, self.source_heat_id)
+        self.assertEqual(snapshot.open_ingest_gap.reason, "connection_reset")
+
+    def test_no_laps_r_c_requires_an_initial_snapshot_from_the_same_connection(self):
+        self._seed_no_laps_last_history()
+        layout_id = self.connection.execute(
+            "SELECT id FROM result_layout_versions WHERE layout_fingerprint = 'raw-no-laps'"
+        ).fetchone()[0]
+        _, message_id = self._insert_raw_result_message(
+            sequence=1,
+            observed_at_us=7_000_000,
+            handle="r_c",
+            connection_id="raw-reconnect",
+        )
+        cell_id = int(
+            self.connection.execute(
+                """
+                INSERT INTO participant_result_cell_observations(
+                  source_heat_id,participant_id,layout_version_id,provider_row_index,column_index,
+                  raw_value_json,value_text,source_message_id,source_key,source_change_ordinal,
+                  observed_at_us,created_at_us
+                ) VALUES (?,'ours',?,0,0,'["106900000"]','106900000',?,'raw:reconnect',0,7000000,7000000)
+                RETURNING id
+                """,
+                (self.source_heat_id, layout_id, message_id),
+            ).fetchone()[0]
+        )
+        self.connection.commit()
+
+        ours = load_heat_metric_input(self.connection, self.source_heat_id).our_participant
+        self.assertNotIn(cell_id, [lap.timing_event_id for lap in ours.laps if lap.timing_event_id is not None])
 
     def test_rejects_missing_heat(self):
         with self.assertRaisesRegex(MetricStoreError, "does not exist"):

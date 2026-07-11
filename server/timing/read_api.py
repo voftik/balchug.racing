@@ -23,7 +23,7 @@ from typing import Any, Literal
 from .config import now_us
 from .db import connect
 from .metric_store import PLAYBACK_PAYLOAD_CODEC, PLAYBACK_PROJECTION_VERSION
-from .normalization import OPEN_ENDED_TS_TIME, time_service_to_unix_us
+from .normalization import OPEN_ENDED_TS_TIME, parse_ts_time, time_service_to_unix_us
 from .playback import PLAYBACK_SCHEMA_VERSION
 
 
@@ -488,11 +488,20 @@ def _open_gap(connection: sqlite3.Connection, heat_id: int) -> dict[str, Any] | 
         """
         SELECT started_at_us,reason,ingest_connection_id
         FROM ingest_gaps
-        WHERE source_heat_id = ? AND ended_at_us IS NULL
+        WHERE ended_at_us IS NULL
+          AND (
+            source_heat_id = ?
+            OR (
+              source_heat_id IS NULL
+              AND analysis_session_id = (
+                SELECT analysis_session_id FROM source_heats WHERE id = ?
+              )
+            )
+          )
         ORDER BY started_at_us DESC,id DESC
         LIMIT 1
         """,
-        (heat_id,),
+        (heat_id, heat_id),
     ).fetchone()
     return (
         {
@@ -1981,6 +1990,158 @@ def _archive_comparison_lap_rows(
     return grouped
 
 
+def _result_grid_duration_ms(value: Any) -> int | None:
+    """Decode one result-grid duration without accepting provider sentinels."""
+
+    source_us = parse_ts_time(value)
+    if source_us is None or not 1_000_000 <= source_us < OPEN_ENDED_TS_TIME:
+        return None
+    return source_us // 1_000
+
+
+def _archive_result_last_rows(
+    connection: sqlite3.Connection,
+    *,
+    heat_id: int,
+    participant_ids: Sequence[str],
+    first_at_us: int,
+    last_at_us: int,
+    clip_to_archive_range: bool = True,
+) -> dict[str, list[dict[str, Any]]]:
+    """Expose every immutable `LAST` cell without inventing a finish crossing.
+
+    A Time Service result grid can omit ``LAPS`` and deliver tracker passings
+    in different SignalR frames.  The result-grid cell is still the source of
+    the lap time, but its observation time is not a claimed finish timestamp.
+    A left join to ``laps`` provides tracker/explicit-grid chronology only when
+    the normalizer proved that exact cell belongs to a completed lap.
+    """
+
+    if not participant_ids:
+        return {}
+    placeholders = ",".join("?" for _ in participant_ids)
+    rows = connection.execute(
+        f"""
+        SELECT observation.id AS source_cell_observation_id,
+               observation.participant_id,observation.value_text AS duration_raw,
+               observation.observed_at_us AS board_observed_at_us,
+               observation.source_message_id,observation.source_key,
+               observation.source_change_ordinal,
+               message.handle,message.ordinal AS message_ordinal,
+               frame.id AS frame_id,
+               participant.start_number,participant.team_name,
+               lap.id AS linked_lap_id,lap.lap_number,lap.completed_at_us,
+               lap.flag,lap.is_in_lap,lap.is_out_lap,lap.crosses_pit,lap.is_clean
+        FROM participant_result_cell_observations AS observation
+        JOIN result_column_definitions AS definition
+          ON definition.layout_version_id = observation.layout_version_id
+         AND definition.column_index = observation.column_index
+        JOIN feed_messages AS message ON message.id = observation.source_message_id
+        JOIN feed_frames AS frame ON frame.id = message.frame_id
+        JOIN participants AS participant ON participant.id = observation.participant_id
+        LEFT JOIN laps AS lap ON lap.id = (
+          SELECT candidate.id
+          FROM laps AS candidate
+          WHERE candidate.source_heat_id = observation.source_heat_id
+            AND candidate.duration_source_cell_observation_id = observation.id
+          ORDER BY candidate.completed_at_us,candidate.lap_number,candidate.id
+          LIMIT 1
+        )
+        WHERE observation.source_heat_id = ?
+          AND observation.participant_id IN ({placeholders})
+          AND definition.canonical_key = 'last_lap'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM result_column_definitions AS duplicate_last
+            WHERE duplicate_last.layout_version_id = observation.layout_version_id
+              AND duplicate_last.canonical_key = 'last_lap'
+              AND duplicate_last.column_index <> observation.column_index
+          )
+        ORDER BY frame.id,message.ordinal,observation.source_change_ordinal,observation.id
+        """,
+        (heat_id, *participant_ids),
+    ).fetchall()
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        board_observed_at_us = int(row["board_observed_at_us"])
+        if clip_to_archive_range and not first_at_us <= board_observed_at_us <= last_at_us:
+            continue
+        linked_lap = row["linked_lap_id"] is not None
+        if linked_lap:
+            timeline_kind = "confirmed_lap"
+        elif row["handle"] == "r_i":
+            # A full grid snapshot can repeat a stale LAST display after a
+            # reconnect. Preserve it for audit, but never connect it as a new
+            # lap in the chart.
+            timeline_kind = "snapshot_baseline"
+        else:
+            timeline_kind = "table_observation"
+        participant_id = row["participant_id"]
+        grouped.setdefault(participant_id, []).append(
+            {
+                "participant_id": participant_id,
+                "start_number": row["start_number"],
+                "team_name": row["team_name"],
+                "lap_number": int(row["lap_number"]) if linked_lap else None,
+                "board_observed_at_us": board_observed_at_us,
+                "completed_at_us": int(row["completed_at_us"]) if linked_lap and row["completed_at_us"] is not None else None,
+                "duration_ms": _result_grid_duration_ms(row["duration_raw"]),
+                "duration_raw": row["duration_raw"],
+                "timeline_kind": timeline_kind,
+                "flag": row["flag"] if linked_lap else None,
+                "source_is_clean": bool(row["is_clean"]) if linked_lap else None,
+                "is_clean": bool(row["is_clean"]) if linked_lap else None,
+                "is_in_lap": bool(row["is_in_lap"]) if linked_lap else None,
+                "is_out_lap": bool(row["is_out_lap"]) if linked_lap else None,
+                "crosses_pit": bool(row["crosses_pit"]) if linked_lap else None,
+                "source": {
+                    "cell_observation_id": int(row["source_cell_observation_id"]),
+                    "message_id": int(row["source_message_id"]),
+                    "frame_id": int(row["frame_id"]),
+                    "message_ordinal": int(row["message_ordinal"]),
+                    "change_ordinal": int(row["source_change_ordinal"]),
+                    "handle": row["handle"],
+                    "key": row["source_key"],
+                },
+            }
+        )
+    return grouped
+
+
+def _archive_raw_last_or_lap_rows(
+    connection: sqlite3.Connection,
+    *,
+    heat_id: int,
+    participant_ids: Sequence[str],
+    first_at_us: int,
+    last_at_us: int,
+    clip_to_archive_range: bool,
+) -> dict[str, list[dict[str, Any]]]:
+    """Prefer source LAST observations; retain legacy lap facts as a fallback."""
+
+    source_rows = _archive_result_last_rows(
+        connection,
+        heat_id=heat_id,
+        participant_ids=participant_ids,
+        first_at_us=first_at_us,
+        last_at_us=last_at_us,
+        clip_to_archive_range=clip_to_archive_range,
+    )
+    fallback = _archive_comparison_lap_rows(
+        connection,
+        heat_id=heat_id,
+        participant_ids=participant_ids,
+        first_at_us=first_at_us,
+        last_at_us=last_at_us,
+        include_unplaced=True,
+        clip_to_archive_range=clip_to_archive_range,
+    )
+    return {
+        participant_id: source_rows.get(participant_id, fallback.get(participant_id, ()))
+        for participant_id in participant_ids
+    }
+
+
 def _archive_raw_lap_competitors(
     participants: Sequence[Mapping[str, Any]],
     laps_by_participant: Mapping[str, Sequence[Mapping[str, Any]]],
@@ -2250,22 +2411,20 @@ def read_archive_comparison(
                 if participant["participant_id"] != ours_id
             ]
         )
-        raw_competitor_laps = _archive_comparison_lap_rows(
+        raw_competitor_laps = _archive_raw_last_or_lap_rows(
             connection,
             heat_id=int(heat["id"]),
             participant_ids=raw_competitor_ids,
             first_at_us=first_at_us,
             last_at_us=last_at_us,
-            include_unplaced=True,
             clip_to_archive_range=False,
         )
-        raw_ours_laps = _archive_comparison_lap_rows(
+        raw_ours_laps = _archive_raw_last_or_lap_rows(
             connection,
             heat_id=int(heat["id"]),
             participant_ids=[ours_id],
             first_at_us=first_at_us,
             last_at_us=last_at_us,
-            include_unplaced=True,
             clip_to_archive_range=False,
         )
         lap_series = {
@@ -2327,16 +2486,18 @@ def read_archive_comparison(
                     else "one-minute median of the latest clean lap per competitor, excluding our car; pit-crossing intervals are excluded"
                 ),
                 "lap_series_competitors": (
-                    "unaggregated raw lap facts for every competitor in our archived class, ordered by participant "
-                    "number and lap number; includes non-clean laps and duration_ms=null rows without averaging or "
-                    "decimation"
+                    "unaggregated result-grid LAST observations for every competitor in our archived class, ordered "
+                    "by source stream position without averaging or decimation; tracker lap numbers are attached only "
+                    "when the exact LAST cell is proven to match a lap, and snapshot baselines are not new laps"
                     if mode == "all"
-                    else "unaggregated raw lap facts for the selected competitor, ordered by lap number; includes "
-                    "non-clean laps and duration_ms=null rows without averaging or decimation"
+                    else "unaggregated result-grid LAST observations for the selected competitor, ordered by source "
+                    "stream position without averaging or decimation; a lap number exists only when the exact LAST "
+                    "cell has a proven lap link"
                 ),
                 "lap_series_ours_raw": (
-                    "unaggregated raw lap facts for BALCHUG Racing; includes non-clean laps and duration_ms=null "
-                    "rows without averaging or decimation"
+                    "unaggregated result-grid LAST observations for BALCHUG Racing, ordered by source stream position "
+                    "without averaging or decimation; board_observed_at_us is the table observation time, not an "
+                    "invented finish crossing timestamp"
                 ),
                 "pit_stops": "confirmed pit in/out facts clipped only for timeline display; pit_lane_ms is populated only from an explicit Time Service L-PIT source",
                 "missing_values": "null values are not interpolated or converted to zero",

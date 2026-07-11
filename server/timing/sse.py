@@ -305,10 +305,14 @@ def _freshness_payload(
         gap = connection.execute(
             """
             SELECT reason FROM ingest_gaps
-            WHERE source_heat_id = ? AND ended_at_us IS NULL
+            WHERE ended_at_us IS NULL
+              AND (
+                source_heat_id = ?
+                OR (source_heat_id IS NULL AND analysis_session_id = ?)
+              )
             ORDER BY started_at_us DESC,id DESC LIMIT 1
             """,
-            (heat_id,),
+            (heat_id, session_id),
         ).fetchone()
         flag = connection.execute(
             "SELECT flag FROM track_flag_current WHERE source_heat_id = ?", (heat_id,)

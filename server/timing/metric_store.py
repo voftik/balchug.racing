@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Any, Iterator
 
 from .config import now_us
+from .normalization import OPEN_ENDED_TS_TIME, parse_result_state, parse_ts_time
 from .stream_events import StreamEventCandidate, StreamEventError, append_stream_events
 
 
@@ -142,7 +143,7 @@ class ParticipantStateInput:
 
 @dataclass(frozen=True)
 class LapInput:
-    lap_number: int
+    lap_number: int | None
     completed_at_us: int | None
     duration_ms: int | None
     sectors_json: str | None
@@ -153,6 +154,19 @@ class LapInput:
     is_clean: bool
     source_message_id: int | None
     source_key: str
+    # A raw r_c LAST fact has no official LAPS value.  Its immutable source
+    # cell id and capture-local ordinal retain chronology without pretending
+    # that the ordinal is a provider lap number.
+    timing_event_id: int | None = None
+    capture_sequence: int | None = None
+    # Tracker passings still drive tyre/stint chronology when a result grid
+    # omits LAPS. They are not timing evidence unless a same-frame LAST fact
+    # proves their duration. Keep that distinction per row so a later layout
+    # with explicit LAPS does not erase earlier or later valid grid timing.
+    timing_eligible: bool = True
+    source_frame_id: int | None = None
+    source_message_ordinal: int | None = None
+    source_change_ordinal: int | None = None
 
 
 @dataclass(frozen=True)
@@ -201,6 +215,7 @@ class ParticipantMetricInput:
     laps: tuple[LapInput, ...]
     pit_stops: tuple[PitStopInput, ...]
     tire_stints: tuple[TireStintInput, ...]
+    latest_timing_event_id: int | None = None
 
     @property
     def active_tire_stint(self) -> TireStintInput | None:
@@ -388,6 +403,335 @@ def _int(value: Any) -> int | None:
     return int(value) if value is not None else None
 
 
+@dataclass(frozen=True)
+class _ResultLastFact:
+    """One durable r_c LAST cell from a layout without the LAPS column."""
+
+    timing_event_id: int
+    participant_id: str
+    value_text: str | None
+    source_message_id: int
+    source_key: str
+    source_change_ordinal: int
+    observed_at_us: int
+    frame_id: int
+    message_ordinal: int
+
+
+@dataclass(frozen=True)
+class _ResultStateFact:
+    participant_id: str
+    state_kind: str
+    frame_id: int
+    message_ordinal: int
+    source_change_ordinal: int
+    cell_id: int
+
+
+def _result_last_duration_ms(value: Any) -> int | None:
+    """Parse only a real Time Service LAST duration, never a sentinel."""
+
+    source_us = parse_ts_time(value)
+    if source_us is None or not 1_000_000 <= source_us < OPEN_ENDED_TS_TIME:
+        return None
+    return source_us // 1_000
+
+
+def _interval_overlaps(
+    started_at_us: int,
+    ended_at_us: int,
+    candidate_started_at_us: int,
+    candidate_ended_at_us: int | None,
+) -> bool:
+    return candidate_started_at_us < ended_at_us and (
+        candidate_ended_at_us is None or candidate_ended_at_us > started_at_us
+    )
+
+
+def _load_result_last_facts(
+    connection: sqlite3.Connection, *, source_heat_id: int
+) -> tuple[_ResultLastFact, ...]:
+    """Read source LAST deltas without converting reconnect snapshots to laps.
+
+    The raw-cell table is already immutable and idempotent.  ``r_i`` is a
+    snapshot/reconnect baseline, so only an explicit ``r_c`` cell is evidence
+    of a new no-LAPS timing event.  A valid preceding r_i for the same layout
+    is required to keep schema-pending deltas out of tactical calculations.
+    """
+
+    rows = connection.execute(
+        """
+        SELECT observation.id AS timing_event_id,observation.participant_id,observation.value_text,
+               observation.source_message_id,observation.source_key,observation.source_change_ordinal,
+               observation.observed_at_us,frame.id AS frame_id,message.ordinal AS message_ordinal
+        FROM participant_result_cell_observations AS observation
+        JOIN result_column_definitions AS definition
+          ON definition.layout_version_id = observation.layout_version_id
+         AND definition.column_index = observation.column_index
+        JOIN feed_messages AS message ON message.id = observation.source_message_id
+        JOIN feed_frames AS frame ON frame.id = message.frame_id
+        WHERE observation.source_heat_id = ?
+          AND observation.participant_id IS NOT NULL
+          AND definition.canonical_key = 'last_lap'
+          AND message.handle = 'r_c'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM result_column_definitions AS laps_definition
+            WHERE laps_definition.layout_version_id = observation.layout_version_id
+              AND laps_definition.canonical_key = 'laps'
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM result_column_definitions AS duplicate_last
+            WHERE duplicate_last.layout_version_id = observation.layout_version_id
+              AND duplicate_last.canonical_key = 'last_lap'
+              AND duplicate_last.column_index <> observation.column_index
+          )
+          AND EXISTS (
+            SELECT 1
+            FROM participant_result_cell_observations AS snapshot_cell
+            JOIN feed_messages AS snapshot_message ON snapshot_message.id = snapshot_cell.source_message_id
+            JOIN feed_frames AS snapshot_frame ON snapshot_frame.id = snapshot_message.frame_id
+            WHERE snapshot_cell.source_heat_id = observation.source_heat_id
+              AND snapshot_cell.layout_version_id = observation.layout_version_id
+              AND snapshot_message.handle = 'r_i'
+              -- A reconnect needs its own authoritative grid snapshot. An
+              -- r_i from a previous socket cannot make an early r_c from the
+              -- new connection a trustworthy timing event.
+              AND snapshot_frame.ingest_connection_id = frame.ingest_connection_id
+              AND (
+                snapshot_frame.id < frame.id
+                OR (snapshot_frame.id = frame.id AND snapshot_message.ordinal < message.ordinal)
+              )
+          )
+        ORDER BY observation.participant_id,frame.id,message.ordinal,
+                 observation.source_change_ordinal,observation.id
+        """,
+        (source_heat_id,),
+    ).fetchall()
+    return tuple(
+        _ResultLastFact(
+            timing_event_id=int(row["timing_event_id"]),
+            participant_id=row["participant_id"],
+            value_text=row["value_text"],
+            source_message_id=int(row["source_message_id"]),
+            source_key=row["source_key"],
+            source_change_ordinal=int(row["source_change_ordinal"]),
+            observed_at_us=int(row["observed_at_us"]),
+            frame_id=int(row["frame_id"]),
+            message_ordinal=int(row["message_ordinal"]),
+        )
+        for row in rows
+    )
+
+
+def _load_result_state_facts(
+    connection: sqlite3.Connection, *, source_heat_id: int
+) -> dict[str, tuple[_ResultStateFact, ...]]:
+    """Load exact STATE cells; do not use synthetic UNKNOWN state observations."""
+
+    rows = connection.execute(
+        """
+        SELECT observation.id,observation.participant_id,observation.value_text,
+               observation.source_change_ordinal,frame.id AS frame_id,message.ordinal AS message_ordinal
+        FROM participant_result_cell_observations AS observation
+        JOIN result_column_definitions AS definition
+          ON definition.layout_version_id = observation.layout_version_id
+         AND definition.column_index = observation.column_index
+        JOIN feed_messages AS message ON message.id = observation.source_message_id
+        JOIN feed_frames AS frame ON frame.id = message.frame_id
+        WHERE observation.source_heat_id = ?
+          AND observation.participant_id IS NOT NULL
+          AND definition.canonical_key = 'state'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM result_column_definitions AS duplicate_state
+            WHERE duplicate_state.layout_version_id = observation.layout_version_id
+              AND duplicate_state.canonical_key = 'state'
+              AND duplicate_state.column_index <> observation.column_index
+          )
+        ORDER BY observation.participant_id,frame.id,message.ordinal,
+                 observation.source_change_ordinal,observation.id
+        """,
+        (source_heat_id,),
+    ).fetchall()
+    grouped: dict[str, list[_ResultStateFact]] = defaultdict(list)
+    for row in rows:
+        participant_id = row["participant_id"]
+        if not isinstance(participant_id, str):
+            continue
+        grouped[participant_id].append(
+            _ResultStateFact(
+                participant_id=participant_id,
+                state_kind=parse_result_state(row["value_text"]).kind,
+                frame_id=int(row["frame_id"]),
+                message_ordinal=int(row["message_ordinal"]),
+                source_change_ordinal=int(row["source_change_ordinal"]),
+                cell_id=int(row["id"]),
+            )
+        )
+    return {participant_id: tuple(facts) for participant_id, facts in grouped.items()}
+
+
+def _load_flag_periods(
+    connection: sqlite3.Connection, *, source_heat_id: int
+) -> tuple[tuple[str, int, int | None], ...]:
+    return tuple(
+        (row["flag"], int(row["started_at_us"]), _int(row["ended_at_us"]))
+        for row in connection.execute(
+            """
+            SELECT flag,started_at_us,ended_at_us
+            FROM track_flag_periods
+            WHERE source_heat_id = ?
+            ORDER BY started_at_us,id
+            """,
+            (source_heat_id,),
+        )
+    )
+
+
+def _green_covers_interval(
+    periods: Sequence[tuple[str, int, int | None]], *, started_at_us: int, ended_at_us: int
+) -> bool:
+    """Require positive Green coverage for the entire observed LAST interval."""
+
+    if ended_at_us <= started_at_us:
+        return False
+    # Period reconciliation can temporarily retain an old open GREEN period
+    # beside a newer caution period. A matching GREEN interval alone is not
+    # sufficient: any non-Green overlap fails the lap closed.
+    if any(
+        flag != "GREEN" and _interval_overlaps(started_at_us, ended_at_us, period_started_at_us, period_ended_at_us)
+        for flag, period_started_at_us, period_ended_at_us in periods
+    ):
+        return False
+    cursor = started_at_us
+    for flag, period_started_at_us, period_ended_at_us in periods:
+        if flag != "GREEN" or period_started_at_us > cursor:
+            continue
+        if period_ended_at_us is not None and period_ended_at_us <= cursor:
+            continue
+        cursor = max(cursor, period_ended_at_us if period_ended_at_us is not None else ended_at_us)
+        if cursor >= ended_at_us:
+            return True
+    return False
+
+
+def _flag_at(
+    periods: Sequence[tuple[str, int, int | None]], *, observed_at_us: int
+) -> str | None:
+    active = [
+        (flag, started_at_us)
+        for flag, started_at_us, ended_at_us in periods
+        if started_at_us <= observed_at_us and (ended_at_us is None or ended_at_us > observed_at_us)
+    ]
+    return max(active, key=lambda item: item[1])[0] if active else None
+
+
+def _load_raw_result_last_laps(
+    connection: sqlite3.Connection,
+    *,
+    source_heat_id: int,
+    pits_by_participant: Mapping[str, Sequence[PitStopInput]],
+) -> tuple[dict[str, list[LapInput]], dict[str, int], set[int]]:
+    """Build no-LAPS timing inputs directly from immutable r_c LAST cells."""
+
+    facts = _load_result_last_facts(connection, source_heat_id=source_heat_id)
+    state_by_participant = _load_result_state_facts(connection, source_heat_id=source_heat_id)
+    periods = _load_flag_periods(connection, source_heat_id=source_heat_id)
+    gaps = tuple(
+        (int(row["started_at_us"]), _int(row["ended_at_us"]))
+        for row in connection.execute(
+            """
+            SELECT started_at_us,ended_at_us
+            FROM ingest_gaps
+            WHERE source_heat_id = ?
+               OR (
+                 source_heat_id IS NULL
+                 AND analysis_session_id = (
+                   SELECT analysis_session_id FROM source_heats WHERE id = ?
+                 )
+               )
+            ORDER BY started_at_us,id
+            """,
+            (source_heat_id, source_heat_id),
+        )
+    )
+    grouped: dict[str, list[LapInput]] = defaultdict(list)
+    latest_event_id: dict[str, int] = {}
+    source_cell_ids: set[int] = set()
+    previous_at_us: dict[str, int] = {}
+    capture_sequence: dict[str, int] = defaultdict(int)
+    state_index: dict[str, int] = defaultdict(int)
+    current_state_kind: dict[str, str | None] = {}
+
+    for event in facts:
+        duration_ms = _result_last_duration_ms(event.value_text)
+        if duration_ms is None:
+            continue
+        participant_id = event.participant_id
+        previous = previous_at_us.get(participant_id)
+        state_facts = state_by_participant.get(participant_id, ())
+        index = state_index[participant_id]
+        # Events are ordered by participant/frame/source ordinal. Consume each
+        # STATE cell once rather than rescanning the entire history per LAST.
+        # A frame is atomic, so a later STATE message in the same frame applies
+        # to its LAST too and removes handle-order dependence.
+        while index < len(state_facts) and state_facts[index].frame_id <= event.frame_id:
+            current_state_kind[participant_id] = state_facts[index].state_kind
+            index += 1
+        state_index[participant_id] = index
+        state_kind = current_state_kind.get(participant_id)
+        is_in_lap = state_kind == "IN_PIT"
+        is_out_lap = state_kind == "OUT_LAP"
+        flag = _flag_at(periods, observed_at_us=event.observed_at_us)
+        crosses_pit = is_in_lap
+        has_gap = False
+        if previous is not None:
+            crosses_pit = crosses_pit or any(
+                stop.completed
+                and _interval_overlaps(previous, event.observed_at_us, stop.entered_at_us, stop.exited_at_us)
+                for stop in pits_by_participant.get(participant_id, ())
+            )
+            has_gap = any(
+                _interval_overlaps(previous, event.observed_at_us, gap_started_at_us, gap_ended_at_us)
+                for gap_started_at_us, gap_ended_at_us in gaps
+            )
+        is_clean = bool(
+            previous is not None
+            and state_kind == "ON_TRACK"
+            and not crosses_pit
+            and not has_gap
+            and _green_covers_interval(periods, started_at_us=previous, ended_at_us=event.observed_at_us)
+        )
+        capture_sequence[participant_id] += 1
+        grouped[participant_id].append(
+            LapInput(
+                lap_number=None,
+                completed_at_us=event.observed_at_us,
+                duration_ms=duration_ms,
+                sectors_json=None,
+                flag=flag,
+                is_in_lap=is_in_lap,
+                is_out_lap=is_out_lap,
+                crosses_pit=crosses_pit,
+                is_clean=is_clean,
+                source_message_id=event.source_message_id,
+                source_key=event.source_key,
+                timing_event_id=event.timing_event_id,
+                capture_sequence=capture_sequence[participant_id],
+                timing_eligible=True,
+                source_frame_id=event.frame_id,
+                source_message_ordinal=event.message_ordinal,
+                source_change_ordinal=event.source_change_ordinal,
+            )
+        )
+        previous_at_us[participant_id] = event.observed_at_us
+        latest_event_id[participant_id] = event.timing_event_id
+        source_cell_ids.add(event.timing_event_id)
+    return grouped, latest_event_id, source_cell_ids
+
+
 def _state_input(row: sqlite3.Row) -> ParticipantStateInput | None:
     if row["state_source_key"] is None:
         return None
@@ -546,11 +890,20 @@ def load_heat_metric_input(connection: sqlite3.Connection, source_heat_id: int) 
             """
             SELECT started_at_us,reason,ingest_connection_id
             FROM ingest_gaps
-            WHERE source_heat_id = ? AND ended_at_us IS NULL
+            WHERE ended_at_us IS NULL
+              AND (
+                source_heat_id = ?
+                OR (
+                  source_heat_id IS NULL
+                  AND analysis_session_id = (
+                    SELECT analysis_session_id FROM source_heats WHERE id = ?
+                  )
+                )
+              )
             ORDER BY started_at_us DESC,id DESC
             LIMIT 1
             """,
-            (source_heat_id,),
+            (source_heat_id, source_heat_id),
         ).fetchone()
         open_gap = (
             IngestGapInput(
@@ -582,30 +935,49 @@ def load_heat_metric_input(connection: sqlite3.Connection, source_heat_id: int) 
             (source_heat_id,),
         ).fetchall()
 
-        laps_by_participant: dict[str, list[LapInput]] = defaultdict(list)
+        legacy_laps: list[tuple[str, int | None, bool, bool, LapInput]] = []
         for row in connection.execute(
             """
-            SELECT participant_id,lap_number,completed_at_us,duration_ms,sectors_json,flag,
-                   is_in_lap,is_out_lap,crosses_pit,is_clean,source_message_id,source_key
-            FROM laps
-            WHERE source_heat_id = ?
-            ORDER BY participant_id,lap_number
+            SELECT lap.participant_id,lap.lap_number,lap.completed_at_us,lap.duration_ms,lap.sectors_json,lap.flag,
+                   lap.is_in_lap,lap.is_out_lap,lap.crosses_pit,lap.is_clean,lap.source_message_id,lap.source_key,
+                   lap.duration_source_cell_observation_id,lap.completion_passing_observation_id,
+                   message.frame_id AS source_frame_id,message.ordinal AS source_message_ordinal,
+                   EXISTS (
+                     SELECT 1
+                     FROM result_column_definitions AS explicit_laps
+                     WHERE explicit_laps.layout_version_id = duration_cell.layout_version_id
+                       AND explicit_laps.canonical_key = 'laps'
+                   ) AS duration_from_explicit_laps_layout
+            FROM laps AS lap
+            LEFT JOIN feed_messages AS message ON message.id = lap.source_message_id
+            LEFT JOIN participant_result_cell_observations AS duration_cell
+              ON duration_cell.id = lap.duration_source_cell_observation_id
+            WHERE lap.source_heat_id = ?
+            ORDER BY lap.participant_id,lap.lap_number
             """,
             (source_heat_id,),
         ):
-            laps_by_participant[row["participant_id"]].append(
-                LapInput(
-                    lap_number=int(row["lap_number"]),
-                    completed_at_us=_int(row["completed_at_us"]),
-                    duration_ms=_int(row["duration_ms"]),
-                    sectors_json=row["sectors_json"],
-                    flag=row["flag"],
-                    is_in_lap=bool(row["is_in_lap"]),
-                    is_out_lap=bool(row["is_out_lap"]),
-                    crosses_pit=bool(row["crosses_pit"]),
-                    is_clean=bool(row["is_clean"]),
-                    source_message_id=_int(row["source_message_id"]),
-                    source_key=row["source_key"],
+            legacy_laps.append(
+                (
+                    row["participant_id"],
+                    _int(row["duration_source_cell_observation_id"]),
+                    row["completion_passing_observation_id"] is not None,
+                    bool(row["duration_from_explicit_laps_layout"]),
+                    LapInput(
+                        lap_number=int(row["lap_number"]),
+                        completed_at_us=_int(row["completed_at_us"]),
+                        duration_ms=_int(row["duration_ms"]),
+                        sectors_json=row["sectors_json"],
+                        flag=row["flag"],
+                        is_in_lap=bool(row["is_in_lap"]),
+                        is_out_lap=bool(row["is_out_lap"]),
+                        crosses_pit=bool(row["crosses_pit"]),
+                        is_clean=bool(row["is_clean"]),
+                        source_message_id=_int(row["source_message_id"]),
+                        source_key=row["source_key"],
+                        source_frame_id=_int(row["source_frame_id"]),
+                        source_message_ordinal=_int(row["source_message_ordinal"]),
+                    ),
                 )
             )
 
@@ -637,6 +1009,45 @@ def load_heat_metric_input(connection: sqlite3.Connection, source_heat_id: int) 
                     exited_source_key=row["exited_source_key"],
                 )
             )
+
+        raw_laps_by_participant, latest_timing_event_ids, raw_last_cell_ids = _load_raw_result_last_laps(
+            connection,
+            source_heat_id=source_heat_id,
+            pits_by_participant=pits_by_participant,
+        )
+        laps_by_participant: dict[str, list[LapInput]] = defaultdict(list)
+        for participant_id, duration_source_cell_id, tracker_boundary, explicit_grid_duration, lap in legacy_laps:
+            # A same-frame tracker lap can already link to this r_c LAST cell.
+            # The raw cell is the canonical timing sample, so retain it once.
+            if duration_source_cell_id is not None and duration_source_cell_id in raw_last_cell_ids:
+                continue
+            # A raw no-LAPS LAST stream makes historical derived rows unsafe
+            # timing evidence unless their source cell proves an explicit-LAPS
+            # layout. This includes tracker-only crossings and pre-0009 rows
+            # with no duration provenance. Keep them for tyre/stint chronology
+            # but fail closed for pace, preventing a replayed raw LAST from
+            # being double-counted with an old projection.
+            if participant_id in raw_laps_by_participant and not explicit_grid_duration:
+                lap = LapInput(
+                    lap_number=lap.lap_number,
+                    completed_at_us=lap.completed_at_us,
+                    duration_ms=lap.duration_ms,
+                    sectors_json=lap.sectors_json,
+                    flag=lap.flag,
+                    is_in_lap=lap.is_in_lap,
+                    is_out_lap=lap.is_out_lap,
+                    crosses_pit=lap.crosses_pit,
+                    is_clean=lap.is_clean,
+                    source_message_id=lap.source_message_id,
+                    source_key=lap.source_key,
+                    timing_eligible=False,
+                    source_frame_id=lap.source_frame_id,
+                    source_message_ordinal=lap.source_message_ordinal,
+                    source_change_ordinal=lap.source_change_ordinal,
+                )
+            laps_by_participant[participant_id].append(lap)
+        for participant_id, raw_laps in raw_laps_by_participant.items():
+            laps_by_participant[participant_id].extend(raw_laps)
 
         stints_by_participant: dict[str, list[TireStintInput]] = defaultdict(list)
         for row in connection.execute(
@@ -698,6 +1109,7 @@ def load_heat_metric_input(connection: sqlite3.Connection, source_heat_id: int) 
                     laps=tuple(laps_by_participant[participant_id]),
                     pit_stops=tuple(pits_by_participant[participant_id]),
                     tire_stints=tuple(stints_by_participant[participant_id]),
+                    latest_timing_event_id=latest_timing_event_ids.get(participant_id),
                 )
             )
         participants.sort(key=_participant_sort_key)

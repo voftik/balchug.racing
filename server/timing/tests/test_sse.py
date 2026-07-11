@@ -7,6 +7,7 @@ from timing.db import connect, migrate
 from timing.sse import (
     ResetRequired,
     TimingStreamBroker,
+    _freshness_payload,
     format_sse_comment,
     format_sse_event,
     parse_last_event_id,
@@ -99,6 +100,30 @@ class TimingStreamReadTests(unittest.TestCase):
         body = format_sse_event("state", {"answer": 42}, event_id=7, retry_ms=3000)
         self.assertEqual(body, b'retry: 3000\nid: 7\nevent: state\ndata: {"answer":42}\n\n')
         self.assertEqual(format_sse_comment("a\nb"), b": a b\n\n")
+
+    def test_session_level_open_gap_marks_sse_freshness_offline(self):
+        heat_id = self.connection.execute(
+            "SELECT id FROM source_heats WHERE analysis_session_id = 'session-a'"
+        ).fetchone()[0]
+        self.connection.execute(
+            """
+            INSERT INTO state_ticks(
+              source_heat_id,observed_second,observed_at_us,source_key,state_hash,freshness_ms,created_at_us
+            ) VALUES (?,1,1000000,'tick:1','hash',0,1)
+            """,
+            (heat_id,),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO ingest_gaps(analysis_session_id,source_heat_id,started_at_us,reason,created_at_us)
+            VALUES ('session-a',NULL,1000100,'connection_reset',1000100)
+            """
+        )
+        self.connection.commit()
+
+        freshness = _freshness_payload(self.connection, "session-a", at_us=1_100_000)
+        self.assertEqual(freshness["freshness"]["status"], "OFFLINE")
+        self.assertEqual(freshness["freshness"]["reason"], "source_gap")
 
 
 class TimingStreamBrokerTests(unittest.IsolatedAsyncioTestCase):

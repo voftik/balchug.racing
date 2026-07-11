@@ -36,7 +36,7 @@ provider heat whose display title is not itself called “Race”.
 | `position_in_class` / `PIC` | `participant_state_current.position_class` | Position within class; drives class-only tactical comparisons |
 | `hole` | raw/current gap fields | Semantics are validated before converting to milliseconds |
 | `fastestRoundTime` | `best_lap_ms` | Invalid source sentinel remains raw-only |
-| `lastRoundTime` | `last_lap_ms` | This layout has no separate `LAPS` column |
+| `lastRoundTime` | current `last_lap_ms` plus immutable `LAST` event stream | This layout has no separate `LAPS` column; every changed `r_c` value is retained in source order |
 | `CurrentDriverStintTime` | `current_driver_stint_raw` | Source-specific time representation |
 | `PitTime` | `pit_time_raw`, computed `pit_stops` | Do not call this stationary service time |
 | `pitstops` | `pit_stops` and strategy counters | Reconciles automatic pit cycles |
@@ -51,6 +51,21 @@ a car model from an earlier heat.
 
 Values in sparse `r_c` cells can be prefixed (`E`, `S`, `L`) and must remain raw
 until their per-column semantics are decoded; they are not universally integers.
+
+### LAST without a LAPS column
+
+`LAST` is the source of a lap duration. It is not recomputed from tracker
+timestamps. The archive and live metric input retain each valid changed `r_c`
+`LAST` cell in source order, including two consecutive equal lap times. Its
+horizontal coordinate is the time that the table observation arrived; it is not
+presented as an invented finish-crossing timestamp.
+
+`r_i` can be a reconnect snapshot carrying a stale visible `LAST`, so it is
+shown as an audit baseline rather than counted as a new table-lap event unless
+the exact cell is already linked to a proven lap. Tracker `t_p` and an explicit
+`LAPS` value may attach a lap number to the same source cell, but they never
+replace or suppress the recorded `LAST` duration when that association is
+missing.
 
 ## STATE interpretation contract
 

@@ -49,7 +49,7 @@ from .metrics import (
 )
 
 
-METRIC_ENGINE_VERSION = 2
+METRIC_ENGINE_VERSION = 3
 """Version of the deterministic value schema emitted by this module."""
 
 FRESHNESS_STALE_MS = 3_000
@@ -80,6 +80,7 @@ class ParticipantBoundaryState:
     completed_laps: int | None
     state_kind: str | None
     last_lap_ms: int | None
+    latest_timing_event_id: int | None
     best_lap_ms: int | None
     pits: tuple[tuple[int | None, int | None, int | None, bool | None], ...]
     active_stint: tuple[int | None, int | None, int | None] | None
@@ -120,6 +121,7 @@ def serialize_metric_boundary_state(state: MetricBoundaryState) -> str:
                 "completed_laps": participant.completed_laps,
                 "state_kind": participant.state_kind,
                 "last_lap_ms": participant.last_lap_ms,
+                "latest_timing_event_id": participant.latest_timing_event_id,
                 "best_lap_ms": participant.best_lap_ms,
                 "pits": [list(pit) for pit in participant.pits],
                 "active_stint": list(participant.active_stint) if participant.active_stint is not None else None,
@@ -218,6 +220,7 @@ def deserialize_metric_boundary_state(value: str) -> MetricBoundaryState:
                 completed_laps=optional_integer(item.get("completed_laps")),
                 state_kind=optional_text(item.get("state_kind")),
                 last_lap_ms=optional_integer(item.get("last_lap_ms")),
+                latest_timing_event_id=optional_integer(item.get("latest_timing_event_id")),
                 best_lap_ms=optional_integer(item.get("best_lap_ms")),
                 pits=tuple(pits),
                 active_stint=active_stint,
@@ -316,10 +319,23 @@ def _source_lap_count(participant: ParticipantMetricInput) -> int | None:
     return _lap_count(state.laps) if state is not None else None
 
 
+def _timing_laps(participant: ParticipantMetricInput) -> tuple[LapInput, ...]:
+    """Return only facts that are eligible for timing calculations.
+
+    Eligibility is assigned per normalized row. This is deliberately not a
+    participant-wide "raw-or-legacy" switch: a feed can change layout during
+    one heat, so raw no-LAPS LAST events and later explicit LAPS rows may both
+    be valid timing evidence. Tracker-only rows remain available elsewhere
+    for tyre-age and stint chronology.
+    """
+
+    return tuple(lap for lap in participant.laps if lap.timing_eligible)
+
+
 def _last_lap_ms(participant: ParticipantMetricInput) -> int | None:
     if participant.state is not None and _duration_ms(participant.state.last_lap_ms) is not None:
         return participant.state.last_lap_ms
-    for lap in reversed(tuple(sorted(participant.laps, key=_lap_sort_key))):
+    for lap in reversed(tuple(sorted(_timing_laps(participant), key=_lap_sort_key))):
         if _duration_ms(lap.duration_ms) is not None:
             return lap.duration_ms
     return None
@@ -328,14 +344,29 @@ def _last_lap_ms(participant: ParticipantMetricInput) -> int | None:
 def _best_lap_ms(participant: ParticipantMetricInput) -> int | None:
     if participant.state is not None and _duration_ms(participant.state.best_lap_ms) is not None:
         return participant.state.best_lap_ms
-    values = [lap.duration_ms for lap in participant.laps if _duration_ms(lap.duration_ms) is not None]
+    values = [lap.duration_ms for lap in _timing_laps(participant) if _duration_ms(lap.duration_ms) is not None]
     return min(values) if values else None
 
 
-def _lap_sort_key(lap: LapInput) -> tuple[int, int, int]:
+def _lap_sort_key(lap: LapInput) -> tuple[int, int, int, int, int, int]:
+    # Raw LAST observations intentionally have no provider lap number.  Their
+    # frame/message/change order is authoritative even if receipt timestamps
+    # tie or regress across reconnect/replay.
+    if _is_int(lap.source_frame_id, minimum=1):
+        return (
+            0,
+            lap.source_frame_id,
+            lap.source_message_ordinal if _is_int(lap.source_message_ordinal, minimum=0) else 2_147_483_647,
+            lap.source_change_ordinal if _is_int(lap.source_change_ordinal, minimum=0) else 0,
+            lap.timing_event_id if _is_int(lap.timing_event_id, minimum=1) else 0,
+            lap.lap_number if _lap_count(lap.lap_number) is not None else 2_147_483_647,
+        )
     return (
-        lap.lap_number if _lap_count(lap.lap_number) is not None else 2_147_483_647,
+        1,
         lap.completed_at_us if _is_int(lap.completed_at_us, minimum=0) else 2_147_483_647,
+        lap.capture_sequence if _is_int(lap.capture_sequence, minimum=1) else 2_147_483_647,
+        lap.lap_number if _lap_count(lap.lap_number) is not None else 2_147_483_647,
+        lap.timing_event_id if _is_int(lap.timing_event_id, minimum=1) else 2_147_483_647,
         lap.duration_ms if _duration_ms(lap.duration_ms) is not None else 2_147_483_647,
     )
 
@@ -344,7 +375,7 @@ def _lap_samples(participant: ParticipantMetricInput) -> tuple[LapSample, ...]:
     """Use the normalizer's persisted clean-lap decision without re-guessing it."""
 
     samples: list[LapSample] = []
-    for lap in sorted(participant.laps, key=_lap_sort_key):
+    for lap in sorted(_timing_laps(participant), key=_lap_sort_key):
         # ``is_clean`` already includes the full flag/pit/feed-gap interval.
         # Supplying an explicit feed gap for a rejected row keeps a current
         # Green flag from accidentally promoting historical non-clean laps.
@@ -421,12 +452,14 @@ def _laps_for_stint(participant: ParticipantMetricInput, stint: TireStintInput) 
         if stint.started_at_us is not None and lap.completed_at_us is not None:
             if lap.completed_at_us < stint.started_at_us:
                 continue
-        elif stint.started_lap is not None and lap.lap_number <= stint.started_lap:
-            continue
+        elif stint.started_lap is not None:
+            if lap.lap_number is None or lap.lap_number <= stint.started_lap:
+                continue
         if stint.ended_at_us is not None and lap.completed_at_us is not None and lap.completed_at_us >= stint.ended_at_us:
             continue
-        if stint.ended_lap is not None and lap.lap_number > stint.ended_lap:
-            continue
+        if stint.ended_lap is not None:
+            if lap.lap_number is None or lap.lap_number > stint.ended_lap:
+                continue
         stint_laps.append(lap)
     return tuple(stint_laps)
 
@@ -439,12 +472,14 @@ def _samples_for_stint(samples: Sequence[LapSample], stint: TireStintInput) -> t
         if stint.started_at_us is not None and lap.completed_at_us is not None:
             if lap.completed_at_us < stint.started_at_us:
                 continue
-        elif stint.started_lap is not None and lap.lap_number is not None and lap.lap_number <= stint.started_lap:
-            continue
+        elif stint.started_lap is not None:
+            if lap.lap_number is None or lap.lap_number <= stint.started_lap:
+                continue
         if stint.ended_at_us is not None and lap.completed_at_us is not None and lap.completed_at_us >= stint.ended_at_us:
             continue
-        if stint.ended_lap is not None and lap.lap_number is not None and lap.lap_number > stint.ended_lap:
-            continue
+        if stint.ended_lap is not None:
+            if lap.lap_number is None or lap.lap_number > stint.ended_lap:
+                continue
         result.append(lap)
     return tuple(result)
 
@@ -2013,6 +2048,7 @@ def _participant_boundary_state(participant: ParticipantMetricInput) -> Particip
         completed_laps=_completed_laps(participant),
         state_kind=state.state_kind if state is not None else None,
         last_lap_ms=_last_lap_ms(participant),
+        latest_timing_event_id=participant.latest_timing_event_id,
         best_lap_ms=_best_lap_ms(participant),
         pits=tuple(
             (stop.stop_number, stop.entered_at_us, stop.exited_at_us, stop.completed)
@@ -2114,6 +2150,7 @@ def detect_event_boundaries(
         if (
             left.completed_laps != right.completed_laps
             or left.last_lap_ms != right.last_lap_ms
+            or left.latest_timing_event_id != right.latest_timing_event_id
             or left.best_lap_ms != right.best_lap_ms
         ):
             events.append(f"lap:{participant_id}")
