@@ -97,7 +97,14 @@ class TimingMetricRunner:
         # A server-time-only frame can advance the session clock without
         # changing a participant row, so the metric tick follows this durable
         # frame timestamp rather than the last changed row in the read model.
-        heat = replace(load_heat_metric_input(connection, source_heat_id), observed_at_us=observed_at_us)
+        heat = replace(
+            load_heat_metric_input(
+                connection,
+                source_heat_id,
+                metric_checkpoint_version=METRIC_ENGINE_VERSION,
+            ),
+            observed_at_us=observed_at_us,
+        )
         if replay_active:
             heat = replace(heat, session=replace(heat.session, lifecycle="active"))
         # 180 s is the longest tactical closure window. Keep a small extra

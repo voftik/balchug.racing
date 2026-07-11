@@ -242,6 +242,27 @@ An operator stop or abort is authoritative: the worker observes the lifecycle
 change, closes its connection, persists the final run state, and returns to the
 idle supervisor loop.
 
+### Long-session metric preflight
+
+Before a long race, run the disposable no-LAPS soak on the target host. It
+creates a fresh temporary timing database with 60 cars, source-style LAST and
+STATE cells, and completed source pit events. The same production loader and
+metric engine are measured after 6, 12, and 24 equivalent hours. The command
+does not contact Time Service and cannot write to the configured timing DB:
+
+```bash
+PYTHONPATH=server python3 -m timing.long_session_soak \
+  --participants 60 --stages 6 12 24 --samples 20 \
+  --output /tmp/balchug-timing-soak.json
+```
+
+The preflight fails if a full `load + metric engine` tick reaches 500 ms p95
+or 750 ms p99, if retained Python heap grows beyond 64 MiB, if one source LAST
+does not yield exactly one timing fact, if tracker-local chronology leaks into
+official LAPS, or if a confirmed source pit loses its measured duration. It is
+an empirical gate for the existing normalized pipeline, not a second ingest
+implementation or a synthetic source of dashboard data.
+
 ## Normalized timing facts
 
 The worker keeps the raw grid and then writes a dynamic-layout version plus one
