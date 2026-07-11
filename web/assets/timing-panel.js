@@ -6,6 +6,7 @@
   var ENGINEER_TOKEN_KEY = "balchug_engineer_token";
   var PANEL_STATE_KEY = "balchug_timing_panel";
   var LIVE_HISTORY_OVERLAP_US = 300000000;
+  var SECTOR_KINDS = ["sector_1", "sector_2", "sector_3"];
   var TAB_TITLES = {
     overview: "Тактический обзор",
     pace: "Темп по кругам",
@@ -71,6 +72,9 @@
     var minutes = Math.floor(ms / 60000);
     var seconds = (ms - minutes * 60000) / 1000;
     return minutes + ":" + seconds.toFixed(3).padStart(6, "0");
+  }
+  function formatSector(ms) {
+    return isNumber(ms) && ms > 0 ? (ms / 1000).toFixed(3) + " с" : "—";
   }
   function formatGap(ms) {
     if (!isNumber(ms)) return "—";
@@ -480,12 +484,23 @@
         truncated: false,
         points: laps.reduce(function (result, lapNumber, point) {
           if (pace[participant.id][point] == null) return result;
+          var duration = pace[participant.id][point];
+          var sector1 = Math.round(duration * 0.335 + Math.sin((point + index) / 3.1) * 110);
+          var sector2 = Math.round(duration * 0.315 + Math.cos((point + index) / 4.2) * 90);
+          var sector3 = duration - sector1 - sector2;
+          var sectors = {
+            sector_1: { duration_ms: sector1, source_cell_observation_id: point * 3 + 1 },
+            sector_2: { duration_ms: sector2, source_cell_observation_id: point * 3 + 2 },
+            sector_3: { duration_ms: sector3, source_cell_observation_id: point * 3 + 3 }
+          };
+          if ((point + index) % 23 === 0) sectors.sector_2 = null;
           result.push({
             capture_at_us: captureAt(point),
             completed_at_us: captureAt(point),
             capture_lap_index: lapNumber,
             lap_number: lapNumber,
-            duration_ms: pace[participant.id][point],
+            duration_ms: duration,
+            sectors: sectors,
             flag: "GREEN"
           });
           return result;
@@ -622,7 +637,7 @@
     });
     dom.viewTitle.textContent = TAB_TITLES[tab];
     dom.scroll.scrollTop = 0;
-    renderView(true);
+    renderView(false);
     persistPanelState();
   }
 
@@ -762,15 +777,33 @@
 
   function renderPace(element, force) {
     var view = state.view || emptyView();
-    if (view.lifecycle !== "active") { destroyChart("pace"); element.innerHTML = inactiveMarkup(); return; }
+    if (view.lifecycle !== "active") {
+      ["pace"].concat(SECTOR_KINDS).forEach(destroyChart);
+      element.innerHTML = inactiveMarkup();
+      return;
+    }
     if (!state.viewReady.pace || force) {
-      destroyChart("pace");
-      element.innerHTML = '<div class="panel-section"><div class="section-heading"><h3>Время каждого круга</h3><span>линии разрываются на пропусках</span></div><div class="timing-chart" id="paceChart" tabindex="0" aria-label="График времени каждого круга"><div class="timing-chart-empty">История завершённых кругов загружается из source LAST.</div></div><div class="chart-legend" id="paceLegend"></div></div><div class="panel-section"><div class="section-heading"><h3>Сравнение скользящего темпа</h3><span>без медианного сглаживания кругов</span></div><div id="paceRows"></div></div>';
+      ["pace"].concat(SECTOR_KINDS).forEach(destroyChart);
+      element.innerHTML =
+        '<div class="panel-section"><div class="section-heading"><h3>Время каждого круга</h3><span>линии разрываются на пропусках</span></div>' +
+          '<div class="timing-chart" id="paceChart" tabindex="0" aria-label="График времени каждого круга"><div class="timing-chart-empty">История завершённых кругов загружается из source LAST.</div></div>' +
+          '<div class="chart-legend" id="paceLegend"></div></div>' +
+        '<div class="panel-section sector-comparison" id="sectorComparison" hidden>' +
+          '<div class="section-heading"><h3>Темп по секторам</h3><span>точные SECT 1–3 каждого круга</span></div>' +
+          '<div class="chart-legend" id="sectorLegend"></div>' +
+          '<div class="sector-chart-grid">' +
+            '<div class="sector-chart-block" data-sector-block="sector_1"><h4>Сектор 1</h4><div class="timing-chart sector-chart" id="sector1Chart" tabindex="0" aria-label="График времени первого сектора"><div class="timing-chart-empty">Нет подтверждённых значений SECT 1.</div></div></div>' +
+            '<div class="sector-chart-block" data-sector-block="sector_2"><h4>Сектор 2</h4><div class="timing-chart sector-chart" id="sector2Chart" tabindex="0" aria-label="График времени второго сектора"><div class="timing-chart-empty">Нет подтверждённых значений SECT 2.</div></div></div>' +
+            '<div class="sector-chart-block" data-sector-block="sector_3"><h4>Сектор 3</h4><div class="timing-chart sector-chart" id="sector3Chart" tabindex="0" aria-label="График времени третьего сектора"><div class="timing-chart-empty">Нет подтверждённых значений SECT 3.</div></div></div>' +
+          '</div>' +
+        '</div>' +
+        '<div class="panel-section"><div class="section-heading"><h3>Сравнение скользящего темпа</h3><span>без медианного сглаживания кругов</span></div><div id="paceRows"></div></div>';
       state.viewReady.pace = true;
     }
     renderLegend(byId("paceLegend"));
     byId("paceRows").innerHTML = paceRowsMarkup();
     updateChart("pace", byId("paceChart"), "pace");
+    updateSectorCharts();
   }
 
   function renderIntervals(element, force) {
@@ -799,6 +832,37 @@
       var key = participant.isOurs ? "ours" : state.colors[participant.id] || "blue";
       return '<span class="chart-legend-item"><i class="legend-line" data-series="' + html(key) + '"></i><b>' + html(participantLabel(participant)) + '</b></span>';
     }).join("");
+  }
+
+  function isSectorKind(kind) {
+    return SECTOR_KINDS.indexOf(kind) !== -1;
+  }
+
+  function sectorNumber(kind) {
+    return isSectorKind(kind) ? Number(kind.slice(-1)) : null;
+  }
+
+  function sectorChartElement(kind) {
+    return byId("sector" + sectorNumber(kind) + "Chart");
+  }
+
+  function updateSectorCharts() {
+    var section = byId("sectorComparison");
+    if (!section) return;
+    var visible = false;
+    SECTOR_KINDS.forEach(function (kind) {
+      var available = Boolean(chartData(kind));
+      var block = section.querySelector('[data-sector-block="' + kind + '"]');
+      if (block) block.hidden = !available;
+      if (available) {
+        visible = true;
+        updateChart(kind, sectorChartElement(kind), kind);
+      } else {
+        destroyChart(kind);
+      }
+    });
+    section.hidden = !visible;
+    if (visible) renderLegend(byId("sectorLegend"));
   }
 
   function sourceClockAt(history, captureAtUs) {
@@ -861,6 +925,35 @@
       x.push(point.capture_at_us / 1000000);
       y.push(point.duration_ms);
       meta.push(point);
+      previous = point;
+    });
+    return { participant: participant, x: x, y: y, meta: meta };
+  }
+
+  function sourceSectorDuration(point, kind) {
+    var sector = point && point.sectors && point.sectors[kind];
+    if (isNumber(sector)) return sector;
+    return sector && isNumber(sector.duration_ms) ? sector.duration_ms : null;
+  }
+
+  function liveSectorSeries(history, participant, kind) {
+    var payload = history.lap_series && history.lap_series[participant.id];
+    var points = payload && Array.isArray(payload.points) ? payload.points : [];
+    var x = [];
+    var y = [];
+    var meta = [];
+    var previous = null;
+    points.forEach(function (point) {
+      if (!isNumber(point.capture_at_us)) return;
+      if (lapLineBreaks(history, participant.id, previous, point)) {
+        x.push((previous.capture_at_us + point.capture_at_us) / 2000000);
+        y.push(null);
+        meta.push(null);
+      }
+      var duration = sourceSectorDuration(point, kind);
+      x.push(point.capture_at_us / 1000000);
+      y.push(duration);
+      meta.push(isNumber(duration) ? point : null);
       previous = point;
     });
     return { participant: participant, x: x, y: y, meta: meta };
@@ -992,10 +1085,15 @@
     var series;
     var timeBased = Boolean(liveHistory);
     if (liveHistory) {
-      series = kind === "pace"
-        ? participants.map(function (participant) { return livePaceSeries(history, participant); })
-        : liveIntervalSeries(history, participants);
+      if (kind === "pace") {
+        series = participants.map(function (participant) { return livePaceSeries(history, participant); });
+      } else if (isSectorKind(kind)) {
+        series = participants.map(function (participant) { return liveSectorSeries(history, participant, kind); });
+      } else {
+        series = liveIntervalSeries(history, participants);
+      }
     } else {
+      if (isSectorKind(kind)) return null;
       var source = kind === "pace" ? history.pace : history.intervals;
       series = participants.map(function (participant) {
         var values = source[participant.id] || history.laps.map(function () { return null; });
@@ -1169,7 +1267,7 @@
         axes: [
           { scale: "x", stroke: "#6E7E98", grid: { stroke: "#E4E9F0", width: 1 }, label: payload.timeBased ? "Время табло" : "Пройдено кругов", labelSize: 18, font: "10px sans-serif", size: 42, values: function (plot, values) { return values.map(function (value) { return payload.timeBased ? chartClockLabel(state.chartPayloads[name].history, value) : String(Math.round(value)); }); } },
           { show: payload.timeBased, scale: "x", side: 2, stroke: "#6E7E98", grid: { show: false }, ticks: { show: true, size: 4, width: 1, stroke: "#A9B4C5" }, label: "Пройдено кругов", labelSize: 18, font: "10px sans-serif", size: 38, space: 1, splits: function (plot, axisIndex, minimum, maximum) { return lapAxisSplits(name, minimum, maximum); }, values: function (plot, values) { return lapAxisValues(name, values, plot.width); } },
-          { stroke: "#6E7E98", grid: { stroke: "#E4E9F0", width: 1 }, font: "10px sans-serif", size: 58, values: kind === "pace" ? function (plot, values) { return values.map(function (value) { return formatLap(value); }); } : function (plot, values) { return values.map(function (value) { return (value / 1000).toFixed(1) + "с"; }); } }
+          { stroke: "#6E7E98", grid: { stroke: "#E4E9F0", width: 1 }, font: "10px sans-serif", size: 58, values: kind === "pace" ? function (plot, values) { return values.map(function (value) { return formatLap(value); }); } : function (plot, values) { return values.map(function (value) { return (value / 1000).toFixed(isSectorKind(kind) ? 2 : 1) + "с"; }); } }
         ],
         series: series,
         plugins: [chartTimelinePlugin(name)],
@@ -1193,7 +1291,7 @@
   }
 
   function renderChartPointTooltip(plot, tooltip, payload, kind, container) {
-    if (!plot.cursor || !isNumber(plot.cursor.left) || plot.cursor.left < 0) {
+    if (!container.matches(":hover") || !plot.cursor || !isNumber(plot.cursor.left) || plot.cursor.left < 0) {
       tooltip.hidden = true;
       return;
     }
@@ -1216,12 +1314,13 @@
     var captureAtUs = point.capture_at_us || closest.series.x[closest.index] * 1000000;
     var lap = point.lap_number;
     var captureLapIndex = point.capture_lap_index;
-    var formatted = kind === "pace" ? formatLap(value) :
+    var formatted = kind === "pace" ? formatLap(value) : isSectorKind(kind) ? formatSector(value) :
       value === 0 ? "Базовая линия BALCHUG" : Math.abs(value / 1000).toFixed(3) + " с · " + (value > 0 ? "впереди" : "сзади");
     tooltip.innerHTML = '<span class="chart-tooltip-kicker">Время табло</span>' +
       '<strong>' + html(payload.timeBased ? chartClockLabel(payload.history, captureAtUs / 1000000) : "Круг " + lap) + '</strong>' +
       '<b class="chart-tooltip-team">' + html(participantLabel(participant)) + '</b>' +
       '<span class="chart-tooltip-value">' + html(formatted) + '</span>' +
+      (isSectorKind(kind) ? '<span>Сектор ' + html(sectorNumber(kind)) + '</span>' : '') +
       (isNumber(lap) ? '<span>Круг ' + html(lap) + '</span>' :
         (isNumber(captureLapIndex) ? '<span>Подтверждённое событие LAST №' + html(captureLapIndex) + ' · номер круга не передан</span>' : '<span>Номер круга не передан табло</span>')) +
       (point.driver_name ? '<span>' + html(point.driver_name) + '</span>' : '') +
@@ -1463,8 +1562,8 @@
   }
 
   function resetComparisonViews() {
-    ["pace", "intervals"].forEach(function (name) {
-      state.viewReady[name] = false;
+    ["pace", "intervals"].concat(SECTOR_KINDS).forEach(function (name) {
+      if (name === "pace" || name === "intervals") state.viewReady[name] = false;
       destroyChart(name);
     });
     scheduleHistoryRefresh(true);

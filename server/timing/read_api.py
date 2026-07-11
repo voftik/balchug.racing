@@ -2336,6 +2336,10 @@ def read_dashboard_history(
             "barrier": {"stream_event_id": cursor},
             "semantics": {
                 "lap_series": "every confirmed sparse result-grid LAST event; values are neither averaged nor interpolated",
+                "lap_series_sectors": (
+                    "SECT 1-3 durations are emitted only with their immutable result-grid source cell; "
+                    "missing sector values remain null and break the chart line"
+                ),
                 "capture_lap_index": "participant-local sequence of confirmed LAST events; lap_number remains null unless source-linked",
                 "interval_series": "source interval facts for the current class neighbour; invalid, lapped, non-racing and target-change states are explicit null line breaks",
                 "missing_values": "null values are never converted to zero or joined across an ingest gap",
