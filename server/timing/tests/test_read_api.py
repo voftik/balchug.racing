@@ -391,7 +391,7 @@ class TimingReadModelTests(unittest.TestCase):
         self.connection.execute(
             """
             UPDATE participant_state_current
-            SET state_source_key = 'state:9', state_observed_at_us = 9_000_000
+            SET state_source_key = 'state:9', state_observed_at_us = 9000000
             WHERE source_heat_id = ? AND participant_id = 'ours'
             """,
             (self.heat_id,),
@@ -409,8 +409,8 @@ class TimingReadModelTests(unittest.TestCase):
         self.connection.execute(
             """
             UPDATE participant_state_current
-            SET gap_ms = 99_999,gap_raw = '99.999',gap_kind = 'TIME',
-                diff_ms = 88_888,diff_raw = '88.888',diff_kind = 'TIME'
+            SET gap_ms = 99999,gap_raw = '99.999',gap_kind = 'TIME',
+                diff_ms = 88888,diff_raw = '88.888',diff_kind = 'TIME'
             WHERE source_heat_id = ? AND participant_id = 'ours'
             """,
             (self.heat_id,),
