@@ -213,6 +213,59 @@ class RawIngestStoreTests(unittest.TestCase):
         with self.assertRaises(IngestStoreError):
             RawIngestStore(self.connection, analysis_session_id=self.session.id).start_run()
 
+    def test_new_worker_recovers_orphan_run_and_closes_restart_gap_on_first_frame(self):
+        crashed = RawIngestStore(self.connection, analysis_session_id=self.session.id)
+        crashed_run_id = crashed.start_run(started_at_us=3_500_000)
+        crashed_connection = crashed.open_connection(
+            Bootstrap("https://example.test/igora", "old-timekeeper", None),
+            connected_at_us=3_500_001,
+        )
+        crashed.persist_raw_frame(
+            crashed_connection,
+            sequence=1,
+            raw_text='{"M":[]}',
+            received_at_us=3_500_010,
+            monotonic_ns=1,
+        )
+
+        restarted = RawIngestStore(self.connection, analysis_session_id=self.session.id)
+        restarted.start_run(started_at_us=3_600_000)
+        self.assertIsNotNone(restarted.recovered_gap_id)
+        orphan_run = self.connection.execute(
+            "SELECT stopped_at_us,stop_reason FROM ingest_runs WHERE id = ?", (crashed_run_id,)
+        ).fetchone()
+        orphan_connection = self.connection.execute(
+            "SELECT disconnected_at_us,disconnect_reason FROM ingest_connections WHERE id = ?",
+            (crashed_connection.id,),
+        ).fetchone()
+        restart_gap = self.connection.execute(
+            "SELECT started_at_us,ended_at_us,reason FROM ingest_gaps WHERE id = ?",
+            (restarted.recovered_gap_id,),
+        ).fetchone()
+        self.assertEqual(tuple(orphan_run), (3_600_000, "worker_restart_recovered"))
+        self.assertEqual(tuple(orphan_connection), (3_600_000, "worker_restart"))
+        self.assertEqual(tuple(restart_gap), (3_500_010, None, "worker_restart"))
+
+        fresh_connection = restarted.open_connection(
+            Bootstrap("https://example.test/igora", "new-timekeeper", None),
+            connected_at_us=3_600_100,
+        )
+        restarted.close_gap(restarted.recovered_gap_id, ended_at_us=3_600_100)
+        restarted.persist_raw_frame(
+            fresh_connection,
+            sequence=1,
+            raw_text='{"M":[]}',
+            received_at_us=3_600_101,
+            monotonic_ns=2,
+        )
+        closed_gap = self.connection.execute(
+            "SELECT ended_at_us FROM ingest_gaps WHERE id = ?", (restarted.recovered_gap_id,)
+        ).fetchone()
+        self.assertEqual(closed_gap["ended_at_us"], 3_600_100)
+        self.assertEqual(
+            self.connection.execute("SELECT COUNT(*) FROM feed_frames").fetchone()[0], 2
+        )
+
     def test_duplicate_frame_sequence_is_rejected_without_overwriting_evidence(self):
         store = RawIngestStore(self.connection, analysis_session_id=self.session.id)
         store.start_run()

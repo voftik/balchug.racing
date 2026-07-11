@@ -144,6 +144,7 @@ class TimingIngestSupervisor:
         try:
             store.start_run()
             run_started = True
+            pending_gap_id = store.recovered_gap_id
             # A process may have died after decoded messages committed but
             # before derived facts and ``processed_at_us`` committed. Replay
             # those rows before accepting newer source frames, preserving the
@@ -260,6 +261,12 @@ class TimingIngestSupervisor:
                 await asyncio.sleep(delay)
         except asyncio.CancelledError:
             if run_started:
+                if pending_gap_id is None and store.is_session_active():
+                    pending_gap_id = store.record_gap(
+                        ingest_connection=None,
+                        reason="worker_restart",
+                        started_at_us=now_us(),
+                    )
                 store.finish_run(reason="supervisor_cancelled")
             raise
         except Exception as error:

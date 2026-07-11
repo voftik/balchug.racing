@@ -90,11 +90,13 @@ class RawIngestStore:
         self.connection = connection
         self.analysis_session_id = analysis_session_id
         self.ingest_run_id: str | None = None
+        self.recovered_gap_id: int | None = None
 
     def start_run(self, *, reducer_version: str = RAW_REDUCER_VERSION, started_at_us: int | None = None) -> str:
         """Create one worker-run record after confirming the session is active."""
         timestamp_us = now_us() if started_at_us is None else started_at_us
         run_id = str(uuid.uuid4())
+        self.recovered_gap_id = None
         with _write_transaction(self.connection):
             row = self.connection.execute(
                 "SELECT lifecycle FROM analysis_sessions WHERE id = ?", (self.analysis_session_id,)
@@ -105,6 +107,80 @@ class RawIngestStore:
                 raise IngestStoreError(
                     f"Cannot start timing ingest for a {row['lifecycle']} analysis session"
                 )
+            orphan = self.connection.execute(
+                """
+                SELECT run.id AS run_id,run.started_at_us,upstream.id AS connection_id,
+                       upstream.connected_at_us,
+                       (SELECT MAX(frame.received_at_us)
+                        FROM feed_frames AS frame
+                        WHERE frame.ingest_connection_id = upstream.id) AS last_frame_at_us
+                FROM ingest_runs AS run
+                LEFT JOIN ingest_connections AS upstream
+                  ON upstream.ingest_run_id = run.id AND upstream.disconnected_at_us IS NULL
+                WHERE run.analysis_session_id = ? AND run.stopped_at_us IS NULL
+                ORDER BY run.started_at_us DESC,upstream.ordinal DESC
+                LIMIT 1
+                """,
+                (self.analysis_session_id,),
+            ).fetchone()
+            existing_gap = self.connection.execute(
+                """
+                SELECT id FROM ingest_gaps
+                WHERE analysis_session_id = ? AND ended_at_us IS NULL
+                ORDER BY started_at_us DESC,id DESC LIMIT 1
+                """,
+                (self.analysis_session_id,),
+            ).fetchone()
+            if orphan is not None:
+                self.connection.execute(
+                    """
+                    UPDATE ingest_connections
+                    SET disconnected_at_us = COALESCE(disconnected_at_us, ?),
+                        disconnect_reason = COALESCE(disconnect_reason, 'worker_restart')
+                    WHERE ingest_run_id IN (
+                      SELECT id FROM ingest_runs
+                      WHERE analysis_session_id = ? AND stopped_at_us IS NULL
+                    ) AND disconnected_at_us IS NULL
+                    """,
+                    (timestamp_us, self.analysis_session_id),
+                )
+                self.connection.execute(
+                    """
+                    UPDATE ingest_runs
+                    SET stopped_at_us = COALESCE(stopped_at_us, ?),
+                        stop_reason = COALESCE(stop_reason, 'worker_restart_recovered')
+                    WHERE analysis_session_id = ? AND stopped_at_us IS NULL
+                    """,
+                    (timestamp_us, self.analysis_session_id),
+                )
+                if existing_gap is None:
+                    gap_started_at_us = min(
+                        timestamp_us,
+                        int(
+                            orphan["last_frame_at_us"]
+                            or orphan["connected_at_us"]
+                            or orphan["started_at_us"]
+                        ),
+                    )
+                    cursor = self.connection.execute(
+                        """
+                        INSERT INTO ingest_gaps(
+                          analysis_session_id,ingest_connection_id,started_at_us,reason,created_at_us
+                        ) VALUES (?,?,?,?,?)
+                        """,
+                        (
+                            self.analysis_session_id,
+                            orphan["connection_id"],
+                            gap_started_at_us,
+                            "worker_restart",
+                            timestamp_us,
+                        ),
+                    )
+                    self.recovered_gap_id = int(cursor.lastrowid)
+                else:
+                    self.recovered_gap_id = int(existing_gap["id"])
+            elif existing_gap is not None:
+                self.recovered_gap_id = int(existing_gap["id"])
             self.connection.execute(
                 """
                 INSERT INTO ingest_runs(id,analysis_session_id,reducer_version,started_at_us)

@@ -5,6 +5,7 @@ from pathlib import Path
 
 from timing.db import connect, migrate
 from timing.ingest import IngestSettings, TimingIngestSupervisor
+from timing.ingest_store import RawIngestStore
 from timing.lifecycle import create_session, start_session, stop_session
 from timing.normalizer_writer import TimingNormalizerRegistry
 from timing.protocol import Bootstrap
@@ -215,6 +216,90 @@ class IngestSupervisorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(reader.execute("SELECT COUNT(*) FROM track_flag_periods WHERE flag='RED'").fetchone()[0], 1)
         finally:
             reader.close()
+
+    async def test_hard_restart_replays_pending_raw_before_new_frames_and_closes_gap(self):
+        raw = (
+            '{"M":[["s_i",1000000],["h_i",{"n":"Practice","s":1000000,"f":2}],'
+            '["t_i",{"l":[[0,false,0]],"d":[]}],'
+            '["r_i",{"l":{"h":[{"n":"NR"},{"n":"TEAM"},{"n":"CLS"},{"n":"STATE"}]},'
+            '"r":[[0,0,"21"],[0,1,"BALCHUG Racing"],[0,2,"CN PRO"],[0,3,"E1000000"]]}],'
+            '["t_p",[[42,"21",0,500,0,47000,false,1000100]]]]}'
+        )
+        crashed_connection = connect(self.path)
+        crashed = RawIngestStore(crashed_connection, analysis_session_id=self.session.id)
+        crashed.start_run(started_at_us=1_500_000)
+        upstream = crashed.open_connection(
+            Bootstrap("https://example.test/igora", "crashed", None),
+            connected_at_us=1_500_001,
+        )
+        pending = crashed.persist_raw_frame(
+            upstream,
+            sequence=1,
+            raw_text=raw,
+            received_at_us=1_500_002,
+            monotonic_ns=1,
+        )
+        crashed.decode_frame(pending)
+        crashed_connection.close()  # Simulate SIGKILL: no run/connection close is written.
+
+        class RestartClient:
+            async def raw_frames(self):
+                yield Bootstrap("https://example.test/igora", "restarted", None), raw
+                await asyncio.sleep(10)
+
+        class RecordingRegistry(TimingNormalizerRegistry):
+            def __init__(self, path, session_id):
+                super().__init__()
+                self.path = path
+                self.session_id = session_id
+                self.frame_ids = []
+
+            def __call__(self, connection, frame, messages):
+                self.frame_ids.append(frame.id)
+                super().__call__(connection, frame, messages)
+                if len(self.frame_ids) == 2:
+                    writable = connect(self.path)
+                    try:
+                        stop_session(
+                            writable,
+                            session_id=self.session_id,
+                            idempotency_key="stop-hard-restart",
+                        )
+                    finally:
+                        writable.close()
+
+        registry = RecordingRegistry(self.path, self.session.id)
+        supervisor = TimingIngestSupervisor(
+            self.path,
+            client_factory=lambda _url: RestartClient(),
+            frame_processor=registry,
+            settings=IngestSettings(reconnect_backoff_s=(0,), active_poll_s=0.01),
+        )
+        await supervisor.run_session(self.session)
+
+        reader = connect(self.path, readonly=True)
+        try:
+            frame_rows = reader.execute(
+                "SELECT id,processed_at_us FROM feed_frames ORDER BY id"
+            ).fetchall()
+            gaps = reader.execute(
+                "SELECT reason,started_at_us,ended_at_us FROM ingest_gaps ORDER BY id"
+            ).fetchall()
+            old_run = reader.execute(
+                "SELECT stop_reason FROM ingest_runs ORDER BY started_at_us LIMIT 1"
+            ).fetchone()
+            passings = reader.execute(
+                "SELECT COUNT(*) FROM tracker_passing_observations"
+            ).fetchone()[0]
+        finally:
+            reader.close()
+        self.assertEqual(registry.frame_ids, [frame_rows[0]["id"], frame_rows[1]["id"]])
+        self.assertTrue(all(row["processed_at_us"] is not None for row in frame_rows))
+        self.assertEqual(len(gaps), 1)
+        self.assertEqual(gaps[0]["reason"], "worker_restart")
+        self.assertIsNotNone(gaps[0]["ended_at_us"])
+        self.assertEqual(old_run["stop_reason"], "worker_restart_recovered")
+        self.assertEqual(passings, 1)
 
 
 if __name__ == "__main__":
