@@ -139,6 +139,18 @@ class ResultTableNormalizationTests(unittest.TestCase):
         self.assertIsNone(columns[11].key)
         self.assertEqual(columns[11].source_parameter, "x")
 
+    def test_dynamic_header_can_fall_back_to_an_explicit_display_caption(self):
+        headers = self.current_provider_headers()
+        headers.append({"n": "completedLapCounterV2", "c": "LAPS"})
+        columns = result_columns({"l": {"h": headers}})
+        validation = validate_current_result_schema(columns)
+
+        self.assertEqual(columns[len(headers) - 1].key, "laps")
+        self.assertIn("laps", validation.present_keys)
+        self.assertEqual(validation.status, "DEGRADED")
+        mismatch = next(item for item in validation.binding_mismatches if item["key"] == "laps")
+        self.assertEqual(mismatch["observed"][0]["source_name"], "completedLapCounterV2")
+
     def test_sector_times_uses_live_header_parameter_as_its_sector_index(self):
         """The production table emits `SectorTimes` with ordinal in `p`."""
 

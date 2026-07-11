@@ -1986,6 +1986,84 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         self.assertEqual(tuple(ledger[:2]), ("CONFIRMED_LAP", "DIRECT_VALUE_CHANGED"))
         self.assertEqual(ledger["schema_baseline_id"], anchors[-1]["id"])
 
+    def test_layout_removal_clears_removed_laps_and_gap_without_moving_last(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 68_000_000
+        self.apply(
+            [
+                [
+                    "r_i",
+                    {
+                        "l": {
+                            "h": [
+                                {"n": "NR"},
+                                {"n": "TEAM"},
+                                {"n": "CLS"},
+                                {"n": "STATE"},
+                                {"n": "completedLapCounterV2", "c": "LAPS"},
+                                {"n": "GAP"},
+                                {"n": "LAST"},
+                            ]
+                        },
+                        "r": [
+                            [0, 0, "21"],
+                            [0, 1, "BALCHUG Racing"],
+                            [0, 2, "CN PRO"],
+                            [0, 3, "E68000000"],
+                            [0, 4, "12"],
+                            [0, 5, "2.567"],
+                            [0, 6, "110000000"],
+                        ],
+                    },
+                ]
+            ],
+            received_at_us=received,
+        )
+
+        before = self.connection.execute(
+            """
+            SELECT state.laps,state.gap_ms,state.gap_interval_fact_id,state.last_lap_ms
+            FROM participant_state_current AS state
+            JOIN participants AS participant ON participant.id = state.participant_id
+            WHERE participant.is_ours = 1
+            """
+        ).fetchone()
+        self.assertEqual(tuple(before), (12, 2_567, before["gap_interval_fact_id"], 110_000))
+        self.assertIsNotNone(before["gap_interval_fact_id"])
+
+        # Both fields disappear and LAST moves to index 4. The next sparse
+        # update must not reinterpret index 4 as the removed LAPS value or
+        # continue exposing a GAP source fact from the previous layout.
+        self.apply(
+            [["r_l", {"h": [{"n": "NR"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "STATE"}, {"n": "LAST"}]}]],
+            received_at_us=received + 1_000_000,
+        )
+        self.apply(
+            [["r_c", [[0, 4, "109000000"]]]],
+            received_at_us=received + 2_000_000,
+        )
+
+        after = self.connection.execute(
+            """
+            SELECT state.laps,state.gap_ms,state.gap_interval_fact_id,state.last_lap_ms
+            FROM participant_state_current AS state
+            JOIN participants AS participant ON participant.id = state.participant_id
+            WHERE participant.is_ours = 1
+            """
+        ).fetchone()
+        self.assertEqual(tuple(after), (None, None, None, 109_000))
+        definition = self.connection.execute(
+            """
+            SELECT definition.canonical_key
+            FROM participant_result_cell_observations AS observation
+            JOIN result_column_definitions AS definition
+              ON definition.layout_version_id = observation.layout_version_id
+             AND definition.column_index = observation.column_index
+            JOIN feed_messages AS message ON message.id = observation.source_message_id
+            WHERE message.handle = 'r_c'
+            """
+        ).fetchone()
+        self.assertEqual(definition["canonical_key"], "last_lap")
+
     def test_canonical_tracker_chronology_preserves_equal_laps_sectors_and_pit_boundary(self):
         green = 70_000_000
         received = TIME_SERVICE_EPOCH_UNIX_US + green
