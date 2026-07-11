@@ -181,6 +181,27 @@
       ? snapshot.computed.metrics : [];
   }
 
+  function sessionClock(snapshot, sessionMetric, flag) {
+    var session = snapshot.session || {};
+    var duration = session.race_duration_s;
+    var metricElapsed = sessionMetric.session_elapsed_s;
+    if (session.mode === "race" && isNumber(duration)) {
+      var maximumElapsed = duration + 6 * 60 * 60;
+      var elapsed = isNumber(metricElapsed) && metricElapsed >= 0 && metricElapsed <= maximumElapsed
+        ? metricElapsed
+        : flag === "READY"
+          ? 0
+          : Math.max(0, ((snapshot.freshness && snapshot.freshness.computed_at_us) || Date.now() * 1000) / 1000000 - session.started_at_us / 1000000);
+      return { elapsed: elapsed, remaining: Math.max(0, duration - elapsed) };
+    }
+    return {
+      elapsed: isNumber(metricElapsed)
+        ? metricElapsed
+        : Math.max(0, ((snapshot.freshness && snapshot.freshness.computed_at_us) || Date.now() * 1000) / 1000000 - session.started_at_us / 1000000),
+      remaining: sessionMetric.session_remaining_s
+    };
+  }
+
   function snapshotToView(snapshot) {
     if (!snapshot || !snapshot.session) return emptyView();
     var entries = metricEntries(snapshot);
@@ -244,6 +265,7 @@
       sessionMetric.track_flag ||
       (snapshot.measured && snapshot.measured.track_flag && snapshot.measured.track_flag.flag)
     );
+    var clock = sessionClock(snapshot, sessionMetric, flag);
     if (flag !== "UNKNOWN") {
       events.push({ kind: "flag", atUs: snapshot.freshness && snapshot.freshness.observed_at_us, text: "Флаг трассы: " + flag });
     }
@@ -260,10 +282,8 @@
       mode: snapshot.session.mode,
       heat: snapshot.heat && snapshot.heat.external_name,
       freshness: snapshot.freshness && snapshot.freshness.status || sessionMetric.channel_status || "OFFLINE",
-      elapsedS: isNumber(sessionMetric.session_elapsed_s)
-        ? sessionMetric.session_elapsed_s
-        : Math.max(0, ((snapshot.freshness && snapshot.freshness.computed_at_us) || Date.now() * 1000) / 1000000 - snapshot.session.started_at_us / 1000000),
-      remainingS: sessionMetric.session_remaining_s,
+      elapsedS: clock.elapsed,
+      remainingS: clock.remaining,
       requiredPits: snapshot.session.required_pits,
       flag: flag,
       flagElapsedS: sessionMetric.flag_phase_elapsed_s,

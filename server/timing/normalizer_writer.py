@@ -68,6 +68,13 @@ FLAG_RECONCILIATION_WINDOW_US = 120 * 1_000_000
 RESULT_EVENT_TIMESTAMP_WINDOW_US = 26 * 60 * 60 * 1_000_000
 
 
+def _heat_boundary_ts(value: Any) -> int | None:
+    """Return an actual heat boundary; provider zero means not started/finished."""
+
+    parsed = parse_ts_time(value)
+    return parsed if parsed not in {None, 0} else None
+
+
 class NormalizerError(RuntimeError):
     """A normalized write cannot be safely committed."""
 
@@ -568,6 +575,8 @@ class TimingNormalizer:
         provider_start = source_heat.get("provider_heat_start_ts")
         if provider_start is not None:
             provider_start = _checkpoint_integer(provider_start, "source_heat.provider_heat_start_ts")
+            if provider_start == 0:
+                provider_start = None
         heat_row = connection.execute(
             """
             SELECT generation FROM source_heats
@@ -972,7 +981,7 @@ class TimingNormalizer:
                 return
             old_flag = canonical_flag(self.heat.get("f")) if "f" in self.heat else None
             if handle == "h_i":
-                next_start = parse_ts_time(patch.get("s"))
+                next_start = _heat_boundary_ts(patch.get("s"))
                 is_new_heat = (
                     next_start is not None
                     and self._provider_heat_start_ts is not None
@@ -1068,7 +1077,9 @@ class TimingNormalizer:
     def _start_new_heat(self, connection: sqlite3.Connection, context: FrameMessage) -> None:
         """Close an observed provider heat reset without treating a reconnect as one."""
         previous_id = self.heat_id
-        previous_finish = self._clock(context.connection_id).to_utc_us(parse_ts_time(self.heat.get("e")))
+        previous_finish = self._calibrated_result_event_at_us(
+            context, _heat_boundary_ts(self.heat.get("e"))
+        )
         if previous_finish is not None:
             connection.execute(
                 """
@@ -1142,10 +1153,10 @@ class TimingNormalizer:
         )
 
     def _write_heat(self, connection: sqlite3.Connection, context: FrameMessage) -> None:
-        provider_start = parse_ts_time(self.heat.get("s"))
-        provider_finish = parse_ts_time(self.heat.get("e"))
-        calibrated_start = self._clock(context.connection_id).to_utc_us(provider_start)
-        calibrated_finish = self._clock(context.connection_id).to_utc_us(provider_finish)
+        provider_start = _heat_boundary_ts(self.heat.get("s"))
+        provider_finish = _heat_boundary_ts(self.heat.get("e"))
+        calibrated_start = self._calibrated_result_event_at_us(context, provider_start)
+        calibrated_finish = self._calibrated_result_event_at_us(context, provider_finish)
         connection.execute(
             """
             UPDATE source_heats

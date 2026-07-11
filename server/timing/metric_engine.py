@@ -1667,12 +1667,18 @@ def _flag_start_at_us(heat: HeatMetricInput) -> int | None:
 
 def _session_values(heat: HeatMetricInput, *, observed_at_us: int) -> dict[str, Any]:
     flag = heat.current_flag
-    session_start = (
-        heat.provider_started_at_us
-        if heat.provider_started_at_us is not None
-        else heat.session.started_at_us
-    )
-    elapsed = _elapsed_s(observed_at_us, session_start)
+    provider_start = heat.provider_started_at_us
+    maximum_age_s = (heat.session.race_duration_s or 24 * 60 * 60) + 6 * 60 * 60
+    if provider_start is not None and not (
+        observed_at_us - maximum_age_s * 1_000_000
+        <= provider_start
+        <= observed_at_us + 6 * 60 * 60 * 1_000_000
+    ):
+        provider_start = None
+    if heat.session.mode == "race" and provider_start is None and flag is not None and flag.flag == "READY":
+        elapsed = 0.0
+    else:
+        elapsed = _elapsed_s(observed_at_us, provider_start or heat.session.started_at_us)
     remaining = None
     if heat.session.mode == "race" and heat.session.race_duration_s is not None and elapsed is not None:
         remaining = max(0.0, heat.session.race_duration_s - elapsed)

@@ -58,6 +58,37 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         )
         return frame
 
+    def test_prestart_zero_and_duration_are_not_heat_clock_boundaries(self):
+        provider_now = 837_104_000_000_000
+        duration = 14_400_000_000
+        offset = 946_674_000_000_000
+        received = TIME_SERVICE_EPOCH_UNIX_US + provider_now + offset
+        self.apply(
+            [
+                ["h_i", {"n": "Race - REC", "s": 0, "e": duration, "f": 1}],
+                ["s_i", provider_now],
+            ],
+            received_at_us=received,
+        )
+        prestart = self.connection.execute(
+            "SELECT provider_started_at_us,provider_finished_at_us FROM source_heats"
+        ).fetchone()
+        self.assertEqual(tuple(prestart), (None, None))
+
+        provider_start = provider_now + 3_000_000
+        provider_finish = provider_start + duration
+        self.apply(
+            [["h_h", {"s": provider_start, "e": provider_finish, "f": 6}]],
+            received_at_us=received + 3_000_000,
+        )
+        started = self.connection.execute(
+            "SELECT provider_started_at_us,provider_finished_at_us FROM source_heats"
+        ).fetchone()
+        self.assertEqual(
+            tuple(started),
+            (received + 3_000_000, received + 3_000_000 + duration),
+        )
+
     def test_runtime_checkpoint_restores_sparse_grid_and_replays_only_unanchored_tail(self):
         base = TIME_SERVICE_EPOCH_UNIX_US + 1_000_000
         checkpoint_frame = self.apply(
