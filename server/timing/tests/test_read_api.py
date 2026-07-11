@@ -1622,6 +1622,47 @@ class TimingReadModelTests(unittest.TestCase):
         self.assertEqual(sparse["source"]["classification"], "CONFIRMED_LAP")
         self.assertIn("REFRESH_REPEAT table refreshes", manifest["semantics"]["capture_lap_events"])
 
+    def test_dashboard_history_returns_each_confirmed_last_without_refresh_repeats(self):
+        baseline_cell, confirmed_cell, repeat_cell, sparse_cell = self._add_result_last_cells(
+            (
+                ("r_i", "108000000", 10_500_000),
+                ("r_c", "107200000", 12_000_000),
+                ("r_c", "107200000", 12_250_000),
+                ("r_c", "106900000", 12_750_000),
+            )
+        )
+        self._add_last_cell_ledger(baseline_cell, classification="UNCONFIRMED")
+        self._add_last_cell_ledger(
+            confirmed_cell,
+            classification="CONFIRMED_LAP",
+            linked_lap_id="lap-12",
+        )
+        self._add_last_cell_ledger(
+            repeat_cell,
+            classification="REFRESH_REPEAT",
+            linked_lap_id="lap-12",
+        )
+        self._add_last_cell_ledger(sparse_cell, classification="CONFIRMED_LAP")
+        self.connection.commit()
+
+        dashboard = self.model.dashboard_history(
+            "session-1",
+            participant_ids=["ours", "ours"],
+            max_points=12,
+        )
+
+        self.assertEqual([item["duration_ms"] for item in dashboard["lap_series"]["ours"]["points"]], [107_200, 106_900])
+        self.assertEqual([item["capture_lap_index"] for item in dashboard["lap_series"]["ours"]["points"]], [1, 2])
+        self.assertEqual([item["lap_number"] for item in dashboard["lap_series"]["ours"]["points"]], [12, None])
+        self.assertEqual(dashboard["participants"][0]["team_name"], "BALCHUG Racing")
+        self.assertEqual(dashboard["pit_stops"][0]["pit_lane_ms"], 30_000)
+        self.assertFalse(dashboard["lap_series"]["ours"]["truncated"])
+        self.assertIn("time_axes", dashboard)
+
+    def test_dashboard_history_requires_a_bounded_participant_selection(self):
+        with self.assertRaises(ReadValidationError):
+            self.model.dashboard_history("session-1", participant_ids=[])
+
     def test_archive_fallback_lap_sectors_require_result_grid_last_provenance(self):
         [source_cell] = self._add_result_last_cells((("r_c", "107200000", 12_000_000),))
         sectors_json = json.dumps(
