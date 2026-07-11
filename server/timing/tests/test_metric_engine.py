@@ -2,6 +2,7 @@ from dataclasses import replace
 from time import perf_counter
 import unittest
 
+from timing import metric_engine
 from timing.metric_engine import (
     CHANNEL_LIVE,
     CHANNEL_OFFLINE,
@@ -462,6 +463,42 @@ class MetricEngineTests(unittest.TestCase):
         self.assertIsNone(session["ours_identity"])
         self.assertIsNone(session["position_overall"])
         self.assertIsNone(session["pits_required"])
+
+    def test_reusing_normalized_laps_preserves_the_full_metric_payload(self):
+        durations = tuple(107_000 + lap for lap in range(12))
+        ours = participant(
+            "ours",
+            number="21",
+            overall=1,
+            position_class=1,
+            lap_count=12,
+            gap_ms=0,
+            diff_ms=None,
+            durations=durations,
+            ours=True,
+        )
+        scope = ClassScopeInput(
+            key="cn pro",
+            display_name="CN PRO",
+            class_best_lap_ms=107_000,
+            class_best_start_number="21",
+            participants=(ours,),
+        )
+        heat = replace(heat_input(), participants=(ours,), class_scopes=(scope,))
+
+        reused = evaluate_heat_metrics(heat)
+        p10_p90_values = metric_engine._p10_p90_values
+
+        def legacy_p10_p90(participant, pace, *, lap_samples=None):
+            return p10_p90_values(participant, pace)
+
+        metric_engine._p10_p90_values = legacy_p10_p90
+        try:
+            baseline = evaluate_heat_metrics(heat)
+        finally:
+            metric_engine._p10_p90_values = p10_p90_values
+
+        self.assertEqual(reused, baseline)
 
     def test_evaluates_a_sixty_car_class_well_within_a_live_second(self):
         # 720 laps is an intentionally conservative 24-hour-class fixture;

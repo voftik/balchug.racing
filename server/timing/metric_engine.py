@@ -731,7 +731,7 @@ def _participant_values(
                 "spread_ms": pace.p10_p90_range_ms,
             }
             if pace.p10_p90_range_ms is None
-            else _p10_p90_values(participant, pace)
+            else _p10_p90_values(participant, pace, lap_samples=samples)
         ),
         "clean_lap_count": pace.clean_lap_count,
         "observed_lap_count": pace.observed_lap_count,
@@ -959,8 +959,16 @@ def _history_values(scope_kind: str, values: Mapping[str, Any]) -> dict[str, Any
     }
 
 
-def _p10_p90_values(participant: ParticipantMetricInput, pace: PaceMetrics) -> dict[str, float | None]:
-    durations = [float(lap.duration_ms) for lap in _lap_samples(participant) if is_clean_lap(lap)][-10:]
+def _p10_p90_values(
+    participant: ParticipantMetricInput,
+    pace: PaceMetrics,
+    *,
+    lap_samples: Sequence[LapSample] | None = None,
+) -> dict[str, float | None]:
+    """Return the tail distribution from the caller's normalized lap stream."""
+
+    samples = lap_samples if lap_samples is not None else _lap_samples(participant)
+    durations = [float(lap.duration_ms) for lap in samples if is_clean_lap(lap)][-10:]
     if len(durations) != 10:
         return {"p10_ms": None, "p90_ms": None, "spread_ms": None}
     ordered = sorted(durations)
