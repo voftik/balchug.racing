@@ -461,13 +461,36 @@ def _load_result_last_facts(
 
     rows = connection.execute(
         """
-        SELECT observation.id AS timing_event_id,observation.participant_id,observation.value_text,
+        WITH initial_last_snapshots AS MATERIALIZED (
+          SELECT snapshot_cell.participant_id,snapshot_cell.layout_version_id,
+                 snapshot_frame.ingest_connection_id,snapshot_frame.id AS frame_id,
+                 snapshot_message.ordinal AS message_ordinal
+          FROM result_column_definitions AS snapshot_definition
+          CROSS JOIN participant_result_cell_observations AS snapshot_cell
+          JOIN feed_messages AS snapshot_message ON snapshot_message.id = snapshot_cell.source_message_id
+          JOIN feed_frames AS snapshot_frame ON snapshot_frame.id = snapshot_message.frame_id
+          WHERE snapshot_definition.canonical_key = 'last_lap'
+            AND snapshot_cell.source_heat_id = ?
+            AND snapshot_cell.participant_id IS NOT NULL
+            AND snapshot_cell.layout_version_id = snapshot_definition.layout_version_id
+            AND snapshot_cell.column_index = snapshot_definition.column_index
+            AND snapshot_message.handle = 'r_i'
+        )
+        SELECT DISTINCT observation.id AS timing_event_id,observation.participant_id,observation.value_text,
                observation.source_message_id,observation.source_key,observation.source_change_ordinal,
                observation.observed_at_us,frame.id AS frame_id,message.ordinal AS message_ordinal
         FROM result_column_definitions AS definition
         CROSS JOIN participant_result_cell_observations AS observation
         JOIN feed_messages AS message ON message.id = observation.source_message_id
         JOIN feed_frames AS frame ON frame.id = message.frame_id
+        JOIN initial_last_snapshots AS snapshot
+          ON snapshot.participant_id = observation.participant_id
+         AND snapshot.layout_version_id = observation.layout_version_id
+         AND snapshot.ingest_connection_id = frame.ingest_connection_id
+         AND (
+           snapshot.frame_id < frame.id
+           OR (snapshot.frame_id = frame.id AND snapshot.message_ordinal < message.ordinal)
+         )
         WHERE definition.canonical_key = 'last_lap'
           AND observation.source_heat_id = ?
           AND observation.participant_id IS NOT NULL
@@ -487,32 +510,10 @@ def _load_result_last_facts(
               AND duplicate_last.canonical_key = 'last_lap'
               AND duplicate_last.column_index <> observation.column_index
           )
-          AND EXISTS (
-            SELECT 1
-            FROM participant_result_cell_observations AS snapshot_cell
-            JOIN feed_messages AS snapshot_message ON snapshot_message.id = snapshot_cell.source_message_id
-            JOIN feed_frames AS snapshot_frame ON snapshot_frame.id = snapshot_message.frame_id
-            JOIN result_column_definitions AS snapshot_definition
-              ON snapshot_definition.layout_version_id = snapshot_cell.layout_version_id
-             AND snapshot_definition.column_index = snapshot_cell.column_index
-            WHERE snapshot_cell.source_heat_id = observation.source_heat_id
-              AND snapshot_cell.participant_id = observation.participant_id
-              AND snapshot_cell.layout_version_id = observation.layout_version_id
-              AND snapshot_definition.canonical_key = 'last_lap'
-              AND snapshot_message.handle = 'r_i'
-              -- A reconnect needs its own authoritative grid snapshot. An
-              -- r_i from a previous socket cannot make an early r_c from the
-              -- new connection a trustworthy timing event.
-              AND snapshot_frame.ingest_connection_id = frame.ingest_connection_id
-              AND (
-                snapshot_frame.id < frame.id
-                OR (snapshot_frame.id = frame.id AND snapshot_message.ordinal < message.ordinal)
-              )
-          )
         ORDER BY observation.participant_id,frame.id,message.ordinal,
                  observation.source_change_ordinal,observation.id
         """,
-        (source_heat_id,),
+        (source_heat_id, source_heat_id),
     ).fetchall()
     return tuple(
         _ResultLastFact(
