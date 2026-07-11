@@ -2262,12 +2262,13 @@
     var clock = timelineClockAt(point.atUs);
     var color = point.isOurs ? "#F0143D" : competitorColor(point.participantId);
     var team = point.isOurs ? "BALCHUG Racing" : (point.teamName || "Соперник");
-    var crew = (point.startNumber ? "#" + point.startNumber + " · " : "") + team;
+    var crew = point.startNumber ? "Экипаж #" + point.startNumber : "Номер экипажа не передан";
     tooltip.style.setProperty("--ta-tooltip-accent", color);
     tooltip.replaceChildren();
     appendTooltipText(tooltip, "ta-tooltip-kicker", clock.source ? "Время табло" : "Время записи");
     appendTooltipText(tooltip, "ta-tooltip-time", formatAbsolute(clock.atUs));
     appendTooltipText(tooltip, "ta-tooltip-primary", point.value === null ? "Время не передано" : formatLap(point.value));
+    appendTooltipText(tooltip, "ta-tooltip-team", team);
     appendTooltipText(tooltip, "ta-tooltip-detail", archiveLapCaption(point.lapNumber, point.atUs) + " · " + crew);
     appendTooltipText(tooltip, "ta-tooltip-context", rawLapStatus(point));
     var anchor = state.chartTooltipAnchor || rawLapTooltipAnchor(point, geometry);
