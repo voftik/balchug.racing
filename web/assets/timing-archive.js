@@ -1092,7 +1092,6 @@
     cell.className = "ta-benchmark-metric" + (changed ? " is-changed" : "") + (className ? " " + className : "");
     var result = document.createElement("b");
     result.textContent = valueOrDash(value);
-    result.title = result.textContent;
     var caption = document.createElement("span");
     caption.textContent = label;
     cell.dataset.metric = key;
@@ -1139,22 +1138,22 @@
     updateSnapshotTiming(effectiveAtUs);
 
     var values = [
-      { id: "pos", label: "POS", value: session.position_overall !== null && session.position_overall !== undefined ? "P" + session.position_overall : oursState.position_overall !== null && oursState.position_overall !== undefined ? "P" + oursState.position_overall : "—" },
-      { id: "class_leader_gap", label: "До лидера класса", value: formatArchiveRelationDistance(effectiveAtUs, snapshot, "class_leader") },
-      { id: "laps", label: lapCountScope === "capture_tracker" ? "Круги в записи" : "Круги", value: lapsValue },
-      { id: "state", label: "Состояние", value: firstDefined(session.current_state, oursState.state_kind, oursState.state) },
-      { id: "last", label: "Последний по табло", value: formatLap(firstDefined(session.last_lap_ms, oursState.last_lap_ms)) },
-      { id: "last_to_best", label: "К лучшему кругу", value: formatGap(
+      { id: "pos", label: "POS", tooltip: "Абсолютная позиция BALCHUG Racing в момент выбранного среза", value: session.position_overall !== null && session.position_overall !== undefined ? "P" + session.position_overall : oursState.position_overall !== null && oursState.position_overall !== undefined ? "P" + oursState.position_overall : "—" },
+      { id: "class_leader_gap", label: "До лидера класса", tooltip: "Временной интервал до лидера CN PRO по данным выбранного среза", value: formatArchiveRelationDistance(effectiveAtUs, snapshot, "class_leader") },
+      { id: "laps", label: lapCountScope === "capture_tracker" ? "Круги в записи" : "Круги", tooltip: lapCountScope === "capture_tracker" ? "Количество crossing, зафиксированных после начала записи" : "Количество кругов по данным табло", value: lapsValue },
+      { id: "state", label: "Состояние", tooltip: "Последнее подтверждённое состояние экипажа по полю STATE", value: firstDefined(session.current_state, oursState.state_kind, oursState.state) },
+      { id: "last", label: "Последний по табло", tooltip: "Последнее значение LAST, переданное табло; это не расчёт из timestamp", value: formatLap(firstDefined(session.last_lap_ms, oursState.last_lap_ms)) },
+      { id: "last_to_best", label: "К лучшему кругу", tooltip: "Разница последнего времени LAST и лучшего времени BEST по табло", value: formatGap(
         numericValue(firstDefined(session.last_lap_ms, oursState.last_lap_ms)) !== null &&
         numericValue(firstDefined(session.best_lap_ms, oursState.best_lap_ms)) !== null ?
           numericValue(firstDefined(session.last_lap_ms, oursState.last_lap_ms)) - numericValue(firstDefined(session.best_lap_ms, oursState.best_lap_ms)) : null
       ) },
-      { id: "ahead", label: "До соперника впереди", value: formatArchiveRelationDistance(effectiveAtUs, snapshot, "class_ahead") },
-      { id: "behind", label: "До соперника сзади", value: formatBehindDistance(effectiveAtUs, snapshot) },
-      { id: "tyres", label: "Возраст шин", value: tyresValue },
-      { id: "pits", label: lapCountScope === "capture_tracker" ? "Питы в записи" : "Пит-стопы", value: firstDefined(session.pits_completed, oursState.provider_pit_count) },
-      { id: "best", label: "Лучший по табло", value: formatLap(firstDefined(session.best_lap_ms, oursState.best_lap_ms)) },
-      { id: "driver", label: "Пилот", value: firstDefined(oursState.driver_name, ours.current_driver_name, session.ours_identity && session.ours_identity.driver_name) }
+      { id: "ahead", label: "До соперника впереди", tooltip: "Временной интервал до ближайшего соперника впереди в классе", value: formatArchiveRelationDistance(effectiveAtUs, snapshot, "class_ahead") },
+      { id: "behind", label: "До соперника сзади", tooltip: "Временной интервал до ближайшего соперника сзади в классе", value: formatBehindDistance(effectiveAtUs, snapshot) },
+      { id: "tyres", label: "Возраст шин", tooltip: "Количество кругов в текущем стинте после последнего подтверждённого выезда из pit", value: tyresValue },
+      { id: "pits", label: lapCountScope === "capture_tracker" ? "Питы в записи" : "Пит-стопы", tooltip: "Количество подтверждённых pit cycle в доступном интервале записи", value: firstDefined(session.pits_completed, oursState.provider_pit_count) },
+      { id: "best", label: "Лучший по табло", tooltip: "Лучшее значение BEST, переданное табло", value: formatLap(firstDefined(session.best_lap_ms, oursState.best_lap_ms)) },
+      { id: "driver", label: "Пилот", tooltip: "Пилот, указанный в поле DRIVER IN CAR для выбранного среза", value: firstDefined(oursState.driver_name, ours.current_driver_name, session.ours_identity && session.ours_identity.driver_name) }
     ];
     var nextValues = Object.create(null);
     elements.kpis.replaceChildren();
@@ -1164,9 +1163,9 @@
       var cell = document.createElement("div");
       var changed = state.kpiValues !== null && state.kpiValues[item.id] !== displayValue;
       cell.className = "ta-kpi" + (changed ? " is-changed" : "");
+      cell.dataset.tooltip = item.tooltip;
       var value = document.createElement("b");
       value.textContent = displayValue;
-      value.title = value.textContent;
       var label = document.createElement("span");
       label.textContent = item.label;
       cell.appendChild(value);
@@ -1318,7 +1317,7 @@
     drawTimelineFlags(context, xAt, width, height, range, left, right);
     if (!visual.pits.length) {
       context.fillStyle = "#6E7E98";
-      context.font = "11px Arial";
+      context.font = "12px Arial";
       context.fillText("В сохранённой части нет подтверждённых пит-стопов выбранных машин", left, headerHeight + 19);
     }
     var compactLabels = width < 440;
@@ -1330,7 +1329,7 @@
       context.lineWidth = 1;
       context.beginPath(); context.moveTo(0, top + rowHeight - 0.5); context.lineTo(width, top + rowHeight - 0.5); context.stroke();
       context.fillStyle = "#1B365D";
-      context.font = "10px Arial";
+      context.font = "11px Arial";
       var teamName = String(participant.team_name || "Машина");
       var compactTeam = teamName.trim().split(/\s+/)[0].slice(0, 10);
       var label = (participant.start_number ? "#" + participant.start_number + " " : "") + (compactLabels ? compactTeam : teamName);
@@ -1364,7 +1363,7 @@
         }
         if (barWidth > 44 && pit.pit_lane_ms !== null && pit.pit_lane_ms !== undefined) {
           context.fillStyle = "#fff";
-          context.font = "9px Arial";
+          context.font = "10px Arial";
           context.fillText(formatLap(pit.pit_lane_ms), x + 4, top + 18);
         }
       });
@@ -1933,7 +1932,7 @@
     context.lineWidth = 2;
     context.beginPath(); context.arc(x, y, 5, 0, Math.PI * 2); context.fill(); context.stroke();
     var label = prefix + formatLap(point.value);
-    context.font = "10px Arial";
+    context.font = "11px Arial";
     var labelWidth = Math.ceil(context.measureText(label).width) + 8;
     var labelX = Math.max(geometry.left, Math.min(geometry.width - geometry.right - labelWidth, x + 7));
     var labelY = Math.max(12, Math.min(geometry.height - 4, y + offset));
@@ -1960,7 +1959,7 @@
     benchmark.forEach(function (point) { if (point.p25 !== null) values.push(point.p25); if (point.p75 !== null) values.push(point.p75); });
     if (!values.length) {
       context.fillStyle = "#6E7E98";
-      context.font = "11px Arial";
+      context.font = "12px Arial";
       context.fillText("Нет подтверждённых чистых кругов в выбранном сравнении", left, height / 2);
       return { left: left, right: right, range: range, width: width, height: height, xAt: xAt, yAt: null, own: own, benchmark: benchmark, aggregate: aggregate };
     }
@@ -1969,7 +1968,7 @@
     if (min === max) { min -= 1; max += 1; }
     var yAt = function (value) { return 16 + (value - min) / (max - min) * (height - 32); };
     context.fillStyle = "#6E7E98";
-    context.font = "10px Arial";
+    context.font = "11px Arial";
     context.fillText("Время", 2, 26);
     context.fillText(formatLap(min), width - right - 48, 26);
     context.fillText(formatLap(max), width - right - 48, height - 16);
@@ -2121,7 +2120,7 @@
 
     function drawLabels(label, top, bandHeight, bounds, formatter) {
       context.fillStyle = "#6E7E98";
-      context.font = "10px Arial";
+      context.font = "11px Arial";
       context.fillText(label, 2, top + 10);
       if (!bounds) return;
       context.fillText(formatter(bounds.min), width - padding.right - 48, top + 10);
@@ -2363,7 +2362,7 @@
     });
     if (!domain) {
       context.fillStyle = "#6E7E98";
-      context.font = "11px Arial";
+      context.font = "12px Arial";
       context.fillText("В сохранённой части нет кругов с переданным временем", left, Math.round(height / 2));
       return {
         left: left, right: right, range: range, width: width, height: height, top: top, bottom: bottom,
@@ -2373,11 +2372,11 @@
     }
     var yAt = function (value) { return top + (value - domain.min) / (domain.max - domain.min) * (bottom - top); };
     context.fillStyle = "#6E7E98";
-    context.font = "10px Arial";
+    context.font = "11px Arial";
     context.fillText("Темп", 2, top + 10);
     context.fillText(formatLap(domain.min), width - right - 48, top + 10);
     context.fillText(formatLap(domain.max), width - right - 48, bottom);
-    context.font = "8.5px Arial";
+    context.font = "10px Arial";
     context.fillText("x", 4, untimedY + 3);
     var geometry = {
       left: left, right: right, range: range, width: width, height: height, top: top, bottom: bottom,
@@ -2558,7 +2557,8 @@
     events.forEach(function (event) {
       var node = document.createElement("button");
       node.type = "button";
-      node.className = "ta-event" + (Math.abs(event.atUs - state.atUs) < 2_000_000 ? " active" : "");
+      node.className = "ta-event ta-tooltip-anchor" + (Math.abs(event.atUs - state.atUs) < 2_000_000 ? " active" : "");
+      node.dataset.tooltip = "Перейти к событию: " + event.title;
       var time = document.createElement("time");
       time.textContent = formatElapsed((event.atUs - state.manifest.range.first_at_us) / 1000000);
       var content = document.createElement("div");
@@ -2580,7 +2580,7 @@
     state.raf = 0;
     elements.play.innerHTML = "&#9654;";
     elements.play.setAttribute("aria-label", "Воспроизвести");
-    elements.play.title = "Воспроизвести";
+    elements.play.dataset.tooltip = "Воспроизвести запись с выбранной скоростью";
     state.visualsLastDrawMs = 0;
     if (wasPlaying && state.modalOpen && state.manifest) drawChart();
     if (wasPlaying && state.pendingSnapshotAtUs !== null && !state.snapshotInFlight && state.manifest) {
@@ -2611,7 +2611,7 @@
     state.lastAnimationMs = performance.now();
     elements.play.innerHTML = "&#10074;&#10074;";
     elements.play.setAttribute("aria-label", "Пауза");
-    elements.play.title = "Пауза";
+    elements.play.dataset.tooltip = "Пауза воспроизведения";
     state.raf = window.requestAnimationFrame(playTick);
   }
 
