@@ -2070,6 +2070,20 @@
     return sectorLapLabel(point) + " · " + formatSectorValue(value) + source;
   }
 
+  function appendSectorTooltipPrimary(parent, title, delta, deltaClass) {
+    var line = document.createElement("span");
+    line.className = "ta-tooltip-primary ta-tooltip-sector-primary is-" + deltaClass;
+    var label = document.createElement("span");
+    label.className = "ta-tooltip-sector-label";
+    label.textContent = title;
+    var value = document.createElement("b");
+    value.className = "ta-tooltip-sector-delta";
+    value.textContent = sectorDeltaText(delta);
+    line.append(label, value);
+    parent.appendChild(line);
+    return line;
+  }
+
   function renderSectorTooltip(cell, geometry, sample, anchor) {
     var tooltip = cell.tooltip;
     if (!tooltip || !geometry || !sample) {
@@ -2087,7 +2101,7 @@
     tooltip.replaceChildren();
     appendTooltipText(tooltip, "ta-tooltip-kicker", clock.source ? "Время табло" : "Время записи");
     appendTooltipText(tooltip, "ta-tooltip-time", formatAbsolute(clock.atUs));
-    appendTooltipText(tooltip, "ta-tooltip-primary", cell.title + " · " + sectorDeltaText(sample.delta));
+    appendSectorTooltipPrimary(tooltip, cell.title, sample.delta, deltaClass);
     appendTooltipText(tooltip, "ta-tooltip-team", sectorTooltipTeam(sample.ownPoint, "BALCHUG Racing"));
     appendTooltipText(tooltip, "ta-tooltip-detail", sectorTooltipValueLine(sample.ownPoint, sample.ownValue, cell.key));
     if (geometry.configuration.competitor) {
