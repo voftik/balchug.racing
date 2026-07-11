@@ -177,6 +177,31 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(tuple(restore), ("FALLBACK", 1))
 
+    def test_finished_participant_state_keeps_raw_provider_spelling(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 2_500_000
+        self.apply(
+            [
+                ["s_i", 2_500_000],
+                [
+                    "r_i",
+                    {
+                        "l": {"h": [{"n": "NR"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "STATE"}]},
+                        "r": [[0, 0, "21"], [0, 1, "BALCHUG Racing"], [0, 2, "CN PRO"], [0, 3, "SFinshd"]],
+                    },
+                ],
+            ],
+            received_at_us=received,
+        )
+
+        current = self.connection.execute(
+            "SELECT state,state_raw,state_kind FROM participant_state_current"
+        ).fetchone()
+        observation = self.connection.execute(
+            "SELECT state_raw,state_kind FROM participant_state_observations"
+        ).fetchone()
+        self.assertEqual(tuple(current), ("FINISHED", "SFinshd", "FINISHED"))
+        self.assertEqual(tuple(observation), ("SFinshd", "FINISHED"))
+
     def test_retention_floor_rejects_an_older_checkpoint_when_receive_times_regress(self):
         """A retained old anchor cannot bridge RAW deleted later in frame order."""
 

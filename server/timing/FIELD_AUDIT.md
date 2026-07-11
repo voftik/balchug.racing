@@ -41,7 +41,7 @@ implementation never relies on the displayed column index.
 |---|---|---|---|
 | `position` | `POS` | `participant_state_current.position_overall` | Absolute overall position; never substituted for class position |
 | `startnumber` | `NR` | `participants.start_number` | `21` is the known Balchug entry number; a conflicting team/number observation is an identity conflict, not a silent match |
-| `State` | `STATE` | `participant_state_current.state_raw/state_kind` | Raw source value plus canonical state; source may show a running timer, `In Pit`, `OutLap` or future tokens |
+| `State` | `STATE` | `participant_state_current.state_raw/state_kind` | Raw source value plus canonical state; source may show a running timer, `In Pit`, `OutLap`, final `Finshd` or future tokens |
 | `Team name` | `TEAM` | participant + identity segment `team_name` | `BALCHUG Racing` identifies our car |
 | `CurrentDriver` | `DRIVER IN CAR` | current state + identity segment `driver_name_raw` | A change opens a new automatic driver segment |
 | `class` | `CLS` | participant + identity segment `class_name` | `CN PRO` scopes tactics and competitor selection |
@@ -137,7 +137,7 @@ silently converts a lap marker to zero milliseconds.
 `state_raw` and maps only recognized status forms to `state_kind`:
 
 - `S<literal>` is a source literal: `SIn Pit` -> `IN_PIT`, `SOutLap` ->
-  `OUT_LAP`, and another literal stays `UNKNOWN` until mapped;
+  `OUT_LAP`, and the observed final `SFinshd` -> `FINISHED`;
 - `E<TsTime>` is an on-track timer target, not a lap/pit duration ->
   `ON_TRACK` when the TsTime is valid;
 - a new or unrecognized token -> `UNKNOWN`, never a guessed pit or zero time.

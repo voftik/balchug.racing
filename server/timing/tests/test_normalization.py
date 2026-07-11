@@ -182,6 +182,11 @@ class ResultTableNormalizationTests(unittest.TestCase):
 
         self.assertEqual(parse_result_state("SIn Pit").kind, "IN_PIT")
         self.assertEqual(parse_result_state("OutLap").kind, "OUT_LAP")
+        for raw in ("SFinshd", "Finshd", "SFinished", "Finished"):
+            with self.subTest(raw=raw):
+                finished = parse_result_state(raw)
+                self.assertEqual(finished.kind, "FINISHED")
+                self.assertEqual(finished.raw, raw)
         unknown = parse_result_state("SStopped")
         self.assertEqual(unknown.kind, "UNKNOWN")
         self.assertEqual(unknown.literal, "Stopped")
