@@ -451,6 +451,13 @@
     for (var lap = 1; lap <= pointCount; lap += 1) laps.push(lap);
     var pace = {};
     var intervals = {};
+    var lapSeries = {};
+    var intervalPoints = [];
+    var firstAtUs = 1783765946000000;
+    var lastAtUs = 1783772140000000;
+    function captureAt(point) {
+      return Math.round(firstAtUs + (lastAtUs - firstAtUs) * point / Math.max(1, pointCount - 1));
+    }
     participants.forEach(function (participant, index) {
       pace[participant.id] = laps.map(function (lapNumber, point) {
         if ((point + index * 2) % 17 === 0) return null;
@@ -463,9 +470,47 @@
         var start = participant.id === "demo-9" ? 13200 : participant.id === "demo-29" ? 7200 : 14800;
         return sign * Math.max(900, start - point * (participant.id === "demo-9" ? 210 : 90));
       });
+      lapSeries[participant.id] = {
+        source_point_count: pointCount,
+        truncated: false,
+        points: laps.reduce(function (result, lapNumber, point) {
+          if (pace[participant.id][point] == null) return result;
+          result.push({
+            capture_at_us: captureAt(point),
+            completed_at_us: captureAt(point),
+            capture_lap_index: lapNumber,
+            lap_number: lapNumber,
+            duration_ms: pace[participant.id][point],
+            flag: "GREEN"
+          });
+          return result;
+        }, [])
+      };
+      if (!participant.isOurs) {
+        laps.forEach(function (lapNumber, point) {
+          var observedAtUs = captureAt(point);
+          var relation = intervals[participant.id][point] >= 0 ? "ahead" : "behind";
+          var explicitBreak = point > 0 && point % 53 === 0;
+          intervalPoints.push({
+            observed_at_us: observedAtUs,
+            source_observed_at_us: explicitBreak ? null : observedAtUs,
+            participant_id: participant.id,
+            signed_ms: explicitBreak ? null : intervals[participant.id][point],
+            relation: relation,
+            status: explicitBreak ? "LAPPED" : "VALID",
+            relation_kind: explicitBreak ? null : "GAP_PAIR_COMMON_OVERALL_LEADER",
+            ours_laps: lapNumber,
+            target_laps: lapNumber + (explicitBreak ? 1 : 0),
+            ours_state_kind: "ON_TRACK",
+            target_state_kind: "ON_TRACK",
+            flag: "GREEN"
+          });
+        });
+      }
     });
-    var firstAtUs = 1783765946000000;
-    var lastAtUs = 1783772140000000;
+    intervalPoints.sort(function (left, right) {
+      return left.observed_at_us - right.observed_at_us || left.participant_id.localeCompare(right.participant_id);
+    });
     var pitStops = [];
     participants.forEach(function (participant) {
       (participant.pitHistory || []).forEach(function (pit) {
@@ -492,6 +537,12 @@
       pace: pace,
       intervals: intervals,
       range: { first_at_us: firstAtUs, last_at_us: lastAtUs, max_points: pointCount },
+      lap_series: lapSeries,
+      interval_series: {
+        source_point_count: intervalPoints.length,
+        downsampled: false,
+        points: intervalPoints
+      },
       pit_stops: pitStops,
       flags: [
         { flag: "GREEN", started_at_us: firstAtUs, ended_at_us: 1783768200000000 },
@@ -810,26 +861,69 @@
     return { participant: participant, x: x, y: y, meta: meta };
   }
 
+  function intervalLineBreaks(history, oursId, participantId, previous, current) {
+    if (!previous || !current) return false;
+    var previousHasLapPair = isNumber(previous.ours_laps) && isNumber(previous.target_laps);
+    var currentHasLapPair = isNumber(current.ours_laps) && isNumber(current.target_laps);
+    if (previousHasLapPair !== currentHasLapPair) return true;
+    if (previousHasLapPair && currentHasLapPair &&
+        previous.ours_laps - previous.target_laps !== current.ours_laps - current.target_laps) return true;
+    var leftAtUs = previous.capture_at_us;
+    var rightAtUs = current.capture_at_us;
+    var gaps = Array.isArray(history.ingest_gaps) ? history.ingest_gaps : [];
+    if (gaps.some(function (gap) {
+      return intervalOverlaps(gap.started_at_us, gap.ended_at_us, leftAtUs, rightAtUs);
+    })) return true;
+    var pits = Array.isArray(history.pit_stops) ? history.pit_stops : [];
+    return pits.some(function (pit) {
+      return (pit.participant_id === participantId || pit.participant_id === oursId) &&
+        intervalOverlaps(pit.entered_at_us, pit.exited_at_us, leftAtUs, rightAtUs);
+    });
+  }
+
   function liveIntervalSeries(history, participants) {
     var points = history.interval_series && Array.isArray(history.interval_series.points)
       ? history.interval_series.points : [];
     var byParticipant = {};
     participants.forEach(function (participant) {
-      byParticipant[participant.id] = { participant: participant, x: [], y: [], meta: [] };
+      byParticipant[participant.id] = { participant: participant, x: [], y: [], meta: [], previous: null };
     });
+    var ours = participants.find(function (participant) { return participant.isOurs; });
+    var oursId = ours && ours.id;
     points.forEach(function (point) {
-      if (point.participant_id && isNumber(point.signed_ms)) {
+      if (point.participant_id) {
         var exactSeries = byParticipant[point.participant_id];
         if (!exactSeries) return;
-        exactSeries.x.push(point.observed_at_us / 1000000);
-        exactSeries.y.push(point.signed_ms);
-        exactSeries.meta.push({
+        if (!isNumber(point.signed_ms)) {
+          if (isNumber(point.observed_at_us)) {
+            exactSeries.x.push(point.observed_at_us / 1000000);
+            exactSeries.y.push(null);
+            exactSeries.meta.push(null);
+          }
+          exactSeries.previous = null;
+          return;
+        }
+        var exactMeta = {
           capture_at_us: point.observed_at_us,
           lap_number: point.ours_laps,
           capture_lap_index: point.ours_laps,
+          target_laps: point.target_laps,
+          ours_laps: point.ours_laps,
           flag: point.flag,
-          interval_relation: point.relation
-        });
+          interval_relation: point.relation,
+          interval_status: point.status,
+          ours_state_kind: point.ours_state_kind,
+          target_state_kind: point.target_state_kind
+        };
+        if (intervalLineBreaks(history, oursId, point.participant_id, exactSeries.previous, exactMeta)) {
+          exactSeries.x.push((exactSeries.previous.capture_at_us + point.observed_at_us) / 2000000);
+          exactSeries.y.push(null);
+          exactSeries.meta.push(null);
+        }
+        exactSeries.x.push(point.observed_at_us / 1000000);
+        exactSeries.y.push(point.signed_ms);
+        exactSeries.meta.push(exactMeta);
+        exactSeries.previous = exactMeta;
         return;
       }
       var targetId = null;
@@ -866,14 +960,15 @@
       }
     });
     var competitorSeries = participants.filter(function (participant) { return !participant.isOurs; }).map(function (participant) {
-      return byParticipant[participant.id];
+      var series = byParticipant[participant.id];
+      delete series.previous;
+      return series;
     });
     var referenceX = [];
     competitorSeries.forEach(function (series) {
       series.x.forEach(function (value) { if (referenceX.indexOf(value) === -1) referenceX.push(value); });
     });
     referenceX.sort(function (left, right) { return left - right; });
-    var ours = participants.find(function (participant) { return participant.isOurs; });
     var oursSeries = {
       participant: ours,
       x: referenceX,
@@ -923,6 +1018,22 @@
     };
   }
 
+  function intervalEmptyMessage(history) {
+    var points = history && history.interval_series && Array.isArray(history.interval_series.points)
+      ? history.interval_series.points : [];
+    var statuses = points.map(function (point) { return point.status; });
+    if (statuses.indexOf("LAPPED") !== -1) {
+      return "Секундный интервал недоступен: машины находятся на разных кругах.";
+    }
+    if (statuses.indexOf("NON_RACING_STATE") !== -1) {
+      return "Секундная линия прервана: одна из машин находится вне гоночного состояния.";
+    }
+    if (points.length) {
+      return "Нет согласованного секундного интервала для выбранных машин.";
+    }
+    return "Ожидается первый подтверждённый секундный интервал.";
+  }
+
   function nearestIndex(values, target) {
     if (!values.length) return -1;
     var low = 0;
@@ -944,15 +1055,22 @@
     }).map(function (point) { return point.capture_at_us / 1000000; });
   }
 
-  function lapAxisValues(name, values) {
+  function lapAxisValues(name, values, chartWidth) {
     var payload = state.chartPayloads[name];
     if (!payload) return values.map(function () { return ""; });
-    return values.map(function (value) {
+    var laps = values.map(function (value) {
       var point = payload.oursPoints.find(function (candidate) {
         return Math.abs(candidate.capture_at_us / 1000000 - value) < 0.0001;
       });
-      var lap = point && point.lap_number;
-      return isNumber(lap) && lap % 5 === 0 ? String(lap) : "";
+      return point && point.lap_number;
+    });
+    var numericLaps = laps.filter(isNumber);
+    var labelBudget = Math.max(2, Math.floor((chartWidth || 320) / 42));
+    var lapSpan = numericLaps.length ? Math.max.apply(Math, numericLaps) - Math.min.apply(Math, numericLaps) : 0;
+    var labelStep = Math.max(5, Math.ceil(lapSpan / labelBudget / 5) * 5);
+    return values.map(function (value, index) {
+      var lap = laps[index];
+      return isNumber(lap) && lap % labelStep === 0 ? String(lap) : "";
     });
   }
 
@@ -1007,7 +1125,10 @@
     var payload = chartData(kind);
     var empty = container.querySelector(".timing-chart-empty");
     if (!payload || typeof window.uPlot !== "function") {
-      if (empty) empty.hidden = false;
+      if (empty) {
+        empty.hidden = false;
+        if (kind === "intervals") empty.textContent = intervalEmptyMessage(state.view && state.view.history);
+      }
       destroyChart(name);
       return;
     }
@@ -1042,7 +1163,7 @@
         scales: { x: { time: false }, y: { auto: true } },
         axes: [
           { scale: "x", stroke: "#6E7E98", grid: { stroke: "#E4E9F0", width: 1 }, label: payload.timeBased ? "Время табло" : "Пройдено кругов", labelSize: 18, font: "10px sans-serif", size: 42, values: function (plot, values) { return values.map(function (value) { return payload.timeBased ? chartClockLabel(state.chartPayloads[name].history, value) : String(Math.round(value)); }); } },
-          { show: payload.timeBased, scale: "x", side: 2, stroke: "#6E7E98", grid: { show: false }, ticks: { show: true, size: 4, width: 1, stroke: "#A9B4C5" }, label: "Пройдено кругов", labelSize: 18, font: "10px sans-serif", size: 38, space: 1, splits: function (plot, axisIndex, minimum, maximum) { return lapAxisSplits(name, minimum, maximum); }, values: function (plot, values) { return lapAxisValues(name, values); } },
+          { show: payload.timeBased, scale: "x", side: 2, stroke: "#6E7E98", grid: { show: false }, ticks: { show: true, size: 4, width: 1, stroke: "#A9B4C5" }, label: "Пройдено кругов", labelSize: 18, font: "10px sans-serif", size: 38, space: 1, splits: function (plot, axisIndex, minimum, maximum) { return lapAxisSplits(name, minimum, maximum); }, values: function (plot, values) { return lapAxisValues(name, values, plot.width); } },
           { stroke: "#6E7E98", grid: { stroke: "#E4E9F0", width: 1 }, font: "10px sans-serif", size: 58, values: kind === "pace" ? function (plot, values) { return values.map(function (value) { return formatLap(value); }); } : function (plot, values) { return values.map(function (value) { return (value / 1000).toFixed(1) + "с"; }); } }
         ],
         series: series,

@@ -2106,6 +2106,47 @@ def _dashboard_interval_points(
         max_points=max_points,
     )
     points_by_source: dict[tuple[Any, ...], dict[str, Any]] = {}
+    previous_target_by_relation: dict[str, str | None] = {"ahead": None, "behind": None}
+    active_break_by_relation: dict[str, tuple[Any, ...] | None] = {"ahead": None, "behind": None}
+
+    def add_break(
+        *,
+        relation_name: str,
+        participant_id: str,
+        observed_at_us: int,
+        status: str,
+        values: Mapping[str, Any],
+        relation: Mapping[str, Any] | None,
+    ) -> None:
+        ours_laps = _comparison_number(relation.get("ours_laps")) if relation is not None else None
+        target_laps = _comparison_number(relation.get("target_laps")) if relation is not None else None
+        signature = (
+            participant_id,
+            status,
+            ours_laps,
+            target_laps,
+            relation.get("ours_state_kind") if relation is not None else None,
+            relation.get("target_state_kind") if relation is not None else None,
+        )
+        if active_break_by_relation[relation_name] == signature:
+            return
+        active_break_by_relation[relation_name] = signature
+        key = ("break", relation_name, participant_id, observed_at_us, status)
+        points_by_source[key] = {
+            "observed_at_us": observed_at_us,
+            "source_observed_at_us": None,
+            "participant_id": participant_id,
+            "signed_ms": None,
+            "relation": relation_name,
+            "status": status,
+            "relation_kind": relation.get("relation_kind") if relation is not None else None,
+            "ours_laps": ours_laps,
+            "target_laps": target_laps,
+            "ours_state_kind": relation.get("ours_state_kind") if relation is not None else None,
+            "target_state_kind": relation.get("target_state_kind") if relation is not None else None,
+            "flag": values.get("track_flag"),
+        }
+
     for row in rows:
         values = _json_object(row["values_json"], context="dashboard session metric")
         relations = values.get("relation_intervals")
@@ -2117,31 +2158,68 @@ def _dashboard_interval_points(
             relation = relations.get(relation_key)
             relation = relation if isinstance(relation, Mapping) else None
             if relation is not None:
+                status = relation.get("status") if isinstance(relation.get("status"), str) else "UNAVAILABLE"
                 value_ms = _comparison_number(relation.get("value_ms"))
                 target_id = relation.get("target_participant_id")
                 source_at_us = _comparison_number(relation.get("source_observed_at_us"))
-                if relation.get("status") != "VALID" or value_ms is None or source_at_us is None:
-                    continue
                 ours_laps = _comparison_number(relation.get("ours_laps"))
+                target_laps = _comparison_number(relation.get("target_laps"))
             else:
                 value_ms = _comparison_number(values.get(f"gap_to_{relation_name}_ms"))
                 target_id = values.get(f"class_{relation_name}_id")
                 source_at_us = int(row["observed_at_us"])
                 ours_laps = _comparison_number(values.get("observed_lap_count"))
-            if not isinstance(target_id, str) or not target_id or value_ms is None:
+                target_laps = None
+                status = "VALID" if value_ms is not None else "UNAVAILABLE"
+            target_id = target_id if isinstance(target_id, str) and target_id else None
+            previous_target = previous_target_by_relation[relation_name]
+            if previous_target is not None and previous_target != target_id:
+                add_break(
+                    relation_name=relation_name,
+                    participant_id=previous_target,
+                    observed_at_us=int(row["observed_at_us"]),
+                    status="TARGET_CHANGED" if target_id is not None else status,
+                    values=values,
+                    relation=relation,
+                )
+            previous_target_by_relation[relation_name] = target_id
+            if target_id is None:
+                active_break_by_relation[relation_name] = None
                 continue
+            if status != "VALID" or value_ms is None or source_at_us is None:
+                add_break(
+                    relation_name=relation_name,
+                    participant_id=target_id,
+                    observed_at_us=int(row["observed_at_us"]),
+                    status=status,
+                    values=values,
+                    relation=relation,
+                )
+                continue
+            active_break_by_relation[relation_name] = None
             key = (relation_name, target_id, int(source_at_us), value_ms)
             points_by_source[key] = {
                 "observed_at_us": int(source_at_us),
+                "source_observed_at_us": int(source_at_us),
                 "participant_id": target_id,
                 "signed_ms": sign * value_ms,
                 "relation": relation_name,
+                "status": "VALID",
+                "relation_kind": relation.get("relation_kind") if relation is not None else None,
                 "ours_laps": ours_laps,
+                "target_laps": target_laps,
+                "ours_state_kind": relation.get("ours_state_kind") if relation is not None else None,
+                "target_state_kind": relation.get("target_state_kind") if relation is not None else None,
                 "flag": values.get("track_flag"),
             }
     points = sorted(
         points_by_source.values(),
-        key=lambda point: (point["observed_at_us"], point["participant_id"], point["relation"]),
+        key=lambda point: (
+            point["observed_at_us"],
+            point["participant_id"],
+            point["relation"],
+            point["signed_ms"] is not None,
+        ),
     )
     return points, source_count
 
@@ -2259,7 +2337,7 @@ def read_dashboard_history(
             "semantics": {
                 "lap_series": "every confirmed sparse result-grid LAST event; values are neither averaged nor interpolated",
                 "capture_lap_index": "participant-local sequence of confirmed LAST events; lap_number remains null unless source-linked",
-                "interval_series": "computed only where source interval facts resolve the current class neighbour; null stays null",
+                "interval_series": "source interval facts for the current class neighbour; invalid, lapped, non-racing and target-change states are explicit null line breaks",
                 "missing_values": "null values are never converted to zero or joined across an ingest gap",
             },
             "provenance_contract": _provenance_contract(),
