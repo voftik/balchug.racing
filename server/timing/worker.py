@@ -8,6 +8,7 @@ import signal
 
 from .ingest import TimingIngestSupervisor
 from .normalizer_writer import TimingNormalizerRegistry
+from .worker_heartbeat import WorkerHeartbeat
 
 
 async def run() -> None:
@@ -15,7 +16,14 @@ async def run() -> None:
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(signum, stop_event.set)
-    await TimingIngestSupervisor(frame_processor=TimingNormalizerRegistry()).run_forever(stop_event=stop_event)
+    supervisor = TimingIngestSupervisor(frame_processor=TimingNormalizerRegistry())
+    heartbeat = WorkerHeartbeat()
+    async with asyncio.TaskGroup() as tasks:
+        tasks.create_task(supervisor.run_forever(stop_event=stop_event), name="timing-supervisor")
+        tasks.create_task(
+            heartbeat.run(stop_event, active_session_count=lambda: len(supervisor.active_sessions())),
+            name="timing-heartbeat",
+        )
 
 
 def main() -> int:

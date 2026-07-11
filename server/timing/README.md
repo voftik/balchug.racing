@@ -227,6 +227,13 @@ upstream connection only for each session whose durable lifecycle state is
 provider polling. Starting, stopping, or aborting a session remains an API
 operation; the worker never creates or changes session intent on its own.
 
+The service is `Type=notify`, sends `READY=1`, and refreshes the systemd
+watchdog inside half of its 20-second timeout. Its unit uses `Restart=always`;
+an explicit `systemctl stop` remains authoritative and is not restarted by
+systemd. A one-row `timing_worker_heartbeats` record exposes only process
+identity, PID, state, active-session count and timestamps. It never contains a
+SignalR token, source payload, team, driver or other racing data.
+
 Each source frame is committed to SQLite before it is decoded or normalized.
 The worker records connection attempts, clean closes, failures, and explicit
 source gaps. On a disconnect it obtains a new bootstrap and SignalR token, then
@@ -234,6 +241,14 @@ reconnects with bounded backoff (`1, 2, 5, 10, 30` seconds). It never fills a
 gap with inferred telemetry. On process restart it discovers durable active
 sessions and replays decoded-but-unprocessed frames in receive order before
 accepting newer frames, so a restart cannot skip the raw source record.
+
+A hard process loss can leave an ingest run and provider connection without a
+closing write. The next worker atomically closes those orphan rows as
+`worker_restart_recovered`, opens a `worker_restart` source gap at the last
+durable frame, replays every decoded-but-unprocessed frame, and only then opens
+a fresh provider connection. The first frame on that connection closes the
+gap. A graceful service restart also opens the gap while the analysis session
+is still active; an operator session stop does not create a false crash.
 
 Deploy runs database migrations before enabling or restarting this unit. Its
 working database is `/var/lib/balchug/timing.db`; it has no archive-catalogue
