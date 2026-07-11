@@ -28,9 +28,12 @@ from .metric_store import (
 from .normalization import OPEN_ENDED_TS_TIME
 from .metrics import (
     GREEN_FLAG,
+    GAP_DIRECTION_BEING_CAUGHT,
+    GAP_DIRECTION_CLOSING,
     GAP_DIRECTION_LABEL_RU,
     GAP_RELATION_AHEAD,
     GAP_RELATION_BEHIND,
+    GAP_LAP_WINDOWS,
     GAP_WINDOWS_S,
     GapSample,
     LapSample,
@@ -38,6 +41,7 @@ from .metrics import (
     PitStop,
     RacePlan,
     calculate_catch_range,
+    calculate_gap_lap_trends,
     calculate_gap_trends,
     calculate_pace_metrics,
     calculate_pit_obligations,
@@ -49,7 +53,7 @@ from .metrics import (
 )
 
 
-METRIC_ENGINE_VERSION = 5
+METRIC_ENGINE_VERSION = 6
 """Version of the deterministic value schema emitted by this module."""
 
 FRESHNESS_STALE_MS = 3_000
@@ -1864,6 +1868,33 @@ def _trend_record(trend: Any) -> dict[str, Any] | None:
     }
 
 
+def _lap_trend_record(trend: Any, current: GapSample) -> dict[str, Any] | None:
+    if trend is None:
+        return None
+    rate = trend.closure_ms_per_lap
+    catching_rate = (
+        rate
+        if trend.relation == GAP_RELATION_AHEAD and trend.direction == GAP_DIRECTION_CLOSING and rate > 0
+        else -rate
+        if trend.relation == GAP_RELATION_BEHIND and trend.direction == GAP_DIRECTION_BEING_CAUGHT and rate < 0
+        else None
+    )
+    catch_laps = (
+        current.gap_ms / catching_rate
+        if current.gap_ms is not None and catching_rate is not None and catching_rate > 0
+        else None
+    )
+    return {
+        "window_laps": trend.window_laps,
+        "started_gap_ms": trend.started_gap_ms,
+        "ended_gap_ms": trend.ended_gap_ms,
+        "closure_ms_per_lap": rate,
+        "direction": trend.direction,
+        "label": GAP_DIRECTION_LABEL_RU[trend.direction],
+        "catch_laps": catch_laps,
+    }
+
+
 def _catch_record(catch: Any) -> dict[str, Any] | None:
     if catch is None:
         return None
@@ -2030,6 +2061,7 @@ def _battle_values(
     empty = {
         "closure_ahead": None,
         "closure_behind": None,
+        "battle_lap_trend": {"ahead": None, "behind": None},
         "catch_range": {"ahead": None, "behind": None},
         "required_pace_to_catch_ahead_ms": None,
         "required_pace_to_defend_behind_ms": None,
@@ -2051,6 +2083,7 @@ def _battle_values(
         return empty
     samples_by_relation: dict[str, tuple[GapSample, ...]] = {}
     trends_by_relation: dict[str, dict[int, Any]] = {}
+    lap_trends_by_relation: dict[str, dict[int, Any]] = {}
     for relation in (GAP_RELATION_AHEAD, GAP_RELATION_BEHIND):
         samples = tuple(
             _gap_sample_from_values(point.observed_at_us, point.values, relation=relation)
@@ -2058,6 +2091,9 @@ def _battle_values(
         ) + (_gap_sample_from_values(observed_at_us, current_values, relation=relation),)
         samples_by_relation[relation] = samples
         trends_by_relation[relation] = calculate_gap_trends(samples, relation=relation, windows_s=GAP_WINDOWS_S)
+        lap_trends_by_relation[relation] = calculate_gap_lap_trends(
+            samples, relation=relation, windows_laps=GAP_LAP_WINDOWS
+        )
     ahead_trends = trends_by_relation[GAP_RELATION_AHEAD]
     behind_trends = trends_by_relation[GAP_RELATION_BEHIND]
     current_ahead = samples_by_relation[GAP_RELATION_AHEAD][-1]
@@ -2088,6 +2124,18 @@ def _battle_values(
         },
         "closure_behind": {
             str(window): _trend_record(behind_trends[window]) for window in GAP_WINDOWS_S
+        },
+        "battle_lap_trend": {
+            "ahead": _lap_trend_record(
+                lap_trends_by_relation[GAP_RELATION_AHEAD].get(5)
+                or lap_trends_by_relation[GAP_RELATION_AHEAD].get(3),
+                current_ahead,
+            ),
+            "behind": _lap_trend_record(
+                lap_trends_by_relation[GAP_RELATION_BEHIND].get(5)
+                or lap_trends_by_relation[GAP_RELATION_BEHIND].get(3),
+                current_behind,
+            ),
         },
         "catch_range": {
             "ahead": _catch_record(

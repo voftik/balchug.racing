@@ -13,6 +13,8 @@ from timing.metrics import (
     RacePlan,
     calculate_catch_range,
     calculate_gap_trend,
+    calculate_gap_lap_trend,
+    calculate_gap_lap_trends,
     calculate_gap_trends,
     calculate_pace_metrics,
     calculate_pit_obligations,
@@ -103,6 +105,43 @@ class CleanLapAndPaceTests(unittest.TestCase):
 
 
 class GapMetricsTests(unittest.TestCase):
+    def test_lap_window_prefers_exact_five_and_falls_back_to_three(self):
+        samples = tuple(
+            green_gap(index * 100_000_000, 10_000 - index * 500, 10 + index)
+            for index in range(6)
+        )
+        trends = calculate_gap_lap_trends(samples, relation=GAP_RELATION_AHEAD)
+        self.assertEqual(trends[5].window_laps, 5)
+        self.assertEqual(trends[5].closure_ms_per_lap, 500.0)
+        self.assertEqual(trends[3].window_laps, 3)
+        self.assertEqual(trends[3].closure_ms_per_lap, 500.0)
+
+    def test_lap_window_has_relation_specific_signs(self):
+        shrinking = tuple(
+            green_gap(index * 100_000_000, 10_000 - index * 1_000, 20 + index)
+            for index in range(4)
+        )
+        ahead = calculate_gap_lap_trend(shrinking, relation=GAP_RELATION_AHEAD, window_laps=3)
+        behind = calculate_gap_lap_trend(shrinking, relation=GAP_RELATION_BEHIND, window_laps=3)
+        self.assertEqual((ahead.direction, ahead.closure_ms_per_lap), (GAP_DIRECTION_CLOSING, 1_000.0))
+        self.assertEqual((behind.direction, behind.closure_ms_per_lap), (GAP_DIRECTION_BEING_CAUGHT, -1_000.0))
+
+    def test_lap_window_resets_on_every_safety_gate(self):
+        base = [green_gap(index * 100_000_000, 10_000 - index * 500, 30 + index) for index in range(4)]
+        interruptions = (
+            green_gap(150_000_000, 9_250, 31, flag="RED"),
+            green_gap(150_000_000, 9_250, 31, target_id="new-target"),
+            green_gap(150_000_000, 9_250, 31, target_lap=30),
+            GapSample(**{**base[1].__dict__, "observed_at_us": 150_000_000, "has_feed_gap": True}),
+            GapSample(**{**base[1].__dict__, "observed_at_us": 150_000_000, "our_state_kind": "IN_PIT"}),
+        )
+        for interruption in interruptions:
+            with self.subTest(interruption=interruption):
+                samples = tuple(base[:2]) + (interruption,) + tuple(base[2:])
+                self.assertIsNone(
+                    calculate_gap_lap_trend(samples, relation=GAP_RELATION_AHEAD, window_laps=3)
+                )
+
     def test_target_change_breaks_the_gap_window(self):
         samples = (
             green_gap(0, 10_000, 10, target_id="leader"),
