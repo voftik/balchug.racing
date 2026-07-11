@@ -48,6 +48,12 @@ OUR_TEAM_KEY = " ".join(OUR_TEAM_NAME.casefold().split())
 # arrive seconds apart. Older history must be inserted as its own event rather
 # than being attached to the current live period.
 FLAG_RECONCILIATION_WINDOW_US = 120 * 1_000_000
+# Result-grid event timestamps can legitimately describe a point earlier in a
+# long endurance race or a near-future state timer.  They must still be close
+# to the source observation: a malformed low TsTime otherwise calibrates to
+# the year 2000 and corrupts an otherwise valid state/pit record.  The two-hour
+# reserve covers transport delay and a provider target around a 24-hour race.
+RESULT_EVENT_TIMESTAMP_WINDOW_US = 26 * 60 * 60 * 1_000_000
 
 
 class NormalizerError(RuntimeError):
@@ -479,6 +485,26 @@ class TimingNormalizer:
 
     def _clock(self, connection_id: str) -> ConnectionClockCalibrator:
         return self._calibrators.setdefault(connection_id, ConnectionClockCalibrator())
+
+    def _calibrated_result_event_at_us(
+        self,
+        context: FrameMessage,
+        provider_ts_time: int | None,
+    ) -> int | None:
+        """Return a plausible calibrated grid-event time for its source frame.
+
+        The raw provider cell and its typed TsTime stay durable even when this
+        returns ``None``.  This only prevents a malformed value such as
+        ``120000000`` from becoming a claimed 2000-era UTC instant after a
+        perfectly valid per-connection clock calibration.
+        """
+
+        calibrated = self._clock(context.connection_id).to_utc_us(provider_ts_time)
+        if calibrated is None:
+            return None
+        lower = context.received_at_us - RESULT_EVENT_TIMESTAMP_WINDOW_US
+        upper = context.received_at_us + RESULT_EVENT_TIMESTAMP_WINDOW_US
+        return calibrated if lower <= calibrated <= upper else None
 
     def _latest_calibration_id(self, connection: sqlite3.Connection, connection_id: str) -> int | None:
         row = connection.execute(
@@ -1903,8 +1929,22 @@ class TimingNormalizer:
             )
             else None
         )
-        clock = self._clock(context.connection_id)
-        timer_at_us = clock.to_utc_us(current_state.timer_target_ts_time)
+        timer_at_us = self._calibrated_result_event_at_us(context, current_state.timer_target_ts_time)
+        event_timer_at_us = (
+            self._calibrated_result_event_at_us(context, event_state.timer_target_ts_time)
+            if event_state is not None
+            else None
+        )
+        event_driver_stint_at_us = (
+            self._calibrated_result_event_at_us(context, event_driver_stint.provider_ts_time)
+            if event_driver_stint is not None and event_driver_stint.provider_ts_time is not None
+            else None
+        )
+        current_driver_stint_at_us = (
+            self._calibrated_result_event_at_us(context, current_driver_stint.provider_ts_time)
+            if current_driver_stint.provider_ts_time is not None
+            else None
+        )
         calibration_id = self._latest_calibration_id(connection, context.connection_id)
         sectors = {
             key: row[key]
@@ -1935,10 +1975,8 @@ class TimingNormalizer:
                     "state_kind": event_state.kind if event_state is not None else current_state.kind,
                     "state_timer_target_raw": event_state.timer_target_raw if event_state is not None else None,
                     "state_timer_target_provider_us": event_state.timer_target_ts_time if event_state is not None else None,
-                    "state_timer_target_at_us": clock.to_utc_us(event_state.timer_target_ts_time)
-                    if event_state is not None
-                    else None,
-                    "state_timer_calibration_id": calibration_id if event_state is not None else None,
+                    "state_timer_target_at_us": event_timer_at_us,
+                    "state_timer_calibration_id": calibration_id if event_timer_at_us is not None else None,
                     "provider_pit_count_raw": pit_count_cell.value_text if pit_count_cell is not None else None,
                     "provider_pit_count": event_pit_count,
                     "state_cell_observation_id": state_cell.id if state_cell is not None else None,
@@ -1950,12 +1988,8 @@ class TimingNormalizer:
                     "driver_stint_provider_ts_time": event_driver_stint.provider_ts_time
                     if event_driver_stint is not None
                     else None,
-                    "driver_stint_at_us": clock.to_utc_us(event_driver_stint.provider_ts_time)
-                    if event_driver_stint is not None and event_driver_stint.provider_ts_time is not None
-                    else None,
-                    "driver_stint_calibration_id": calibration_id
-                    if event_driver_stint is not None and event_driver_stint.provider_ts_time is not None
-                    else None,
+                    "driver_stint_at_us": event_driver_stint_at_us,
+                    "driver_stint_calibration_id": calibration_id if event_driver_stint_at_us is not None else None,
                     "driver_stint_duration_ms": event_driver_stint.duration_ms if event_driver_stint is not None else None,
                     "driver_stint_cell_observation_id": driver_stint_cell.id if driver_stint_cell is not None else None,
                     "source_message_id": context.id,
@@ -2011,8 +2045,8 @@ class TimingNormalizer:
                 if state_source is not None
                 else (old["state_timer_target_at_us"] if old is not None else None),
                 "state_timer_calibration_id": calibration_id
-                if state_source is not None
-                else (old["state_timer_calibration_id"] if old is not None else None),
+                if state_source is not None and timer_at_us is not None
+                else (None if state_source is not None else (old["state_timer_calibration_id"] if old is not None else None)),
                 "state_timer_source_message_id": context.id
                 if state_source is not None
                 else (old["state_timer_source_message_id"] if old is not None else None),
@@ -2066,12 +2100,16 @@ class TimingNormalizer:
                 "driver_stint_provider_ts_time": current_driver_stint.provider_ts_time
                 if driver_stint_source is not None
                 else (old["driver_stint_provider_ts_time"] if old is not None else None),
-                "driver_stint_at_us": clock.to_utc_us(current_driver_stint.provider_ts_time)
-                if driver_stint_source is not None and current_driver_stint.provider_ts_time is not None
+                "driver_stint_at_us": current_driver_stint_at_us
+                if driver_stint_source is not None
                 else (old["driver_stint_at_us"] if old is not None else None),
                 "driver_stint_calibration_id": calibration_id
-                if driver_stint_source is not None and current_driver_stint.provider_ts_time is not None
-                else (old["driver_stint_calibration_id"] if old is not None else None),
+                if driver_stint_source is not None and current_driver_stint_at_us is not None
+                else (
+                    None
+                    if driver_stint_source is not None
+                    else (old["driver_stint_calibration_id"] if old is not None else None)
+                ),
                 "driver_stint_duration_ms": current_driver_stint.duration_ms
                 if driver_stint_source is not None
                 else (old["driver_stint_duration_ms"] if old is not None else None),
@@ -2571,8 +2609,8 @@ class TimingNormalizer:
 
     def _pit_entered_at_us(self, pit_time_raw: str | None, context: FrameMessage) -> int:
         if pit_time_raw and pit_time_raw[:1].upper() == "S":
-            provider_time = parse_ts_time(pit_time_raw[1:])
-            calibrated = self._clock(context.connection_id).to_utc_us(provider_time)
+            provider_time = _event_ts_time(pit_time_raw[1:])
+            calibrated = self._calibrated_result_event_at_us(context, provider_time)
             if calibrated is not None:
                 return calibrated
         # The observation itself is durable provenance when the provider does
@@ -2580,17 +2618,20 @@ class TimingNormalizer:
         # claimed source timestamp.
         return context.received_at_us
 
-    @staticmethod
-    def _pit_entry_time_source(fact: ResultCellFact | None) -> ResultCellFact | None:
+    def _pit_entry_time_source(
+        self,
+        fact: ResultCellFact | None,
+        context: FrameMessage,
+    ) -> ResultCellFact | None:
         """Return a valid source L-PIT S<TsTime> cell, never a cached L value."""
 
         if fact is None or fact.value_text is None or fact.value_text[:1].upper() != "S":
             return None
-        # `0` and Int64.MaxValue are provider sentinels, not pit-entry
-        # instants. Treating either as a calibrated timestamp would place an
-        # observed pit in 2000 or far beyond the session and contaminate the
-        # timeline and mandatory-stop ledger.
-        return fact if _event_ts_time(fact.value_text[1:]) is not None else None
+        # `0`, Int64.MaxValue and a numerically valid but implausible TsTime
+        # are not source pit-entry instants. The state transition itself is
+        # still recorded at the observed frame boundary.
+        provider_time = _event_ts_time(fact.value_text[1:])
+        return fact if self._calibrated_result_event_at_us(context, provider_time) is not None else None
 
     @staticmethod
     def _pit_duration_ms(pit_time_raw: str | None) -> int | None:
@@ -2603,7 +2644,7 @@ class TimingNormalizer:
 
         entry_sources_by_participant: dict[str, list[ResultCellFact]] = {}
         for event in self._pending_pit_events:
-            source = self._pit_entry_time_source(event.pit_time_event)
+            source = self._pit_entry_time_source(event.pit_time_event, event.context)
             if source is not None:
                 entry_sources_by_participant.setdefault(event.participant_id, []).append(source)
         for event in self._pending_pit_events:
@@ -2695,7 +2736,7 @@ class TimingNormalizer:
             stop_number = source_stop_number if source_stop_number is not None else max_stop + 1
             if stop_number <= max_stop:
                 stop_number = max_stop + 1
-            entry_time_source = self._pit_entry_time_source(pit_time_event)
+            entry_time_source = self._pit_entry_time_source(pit_time_event, context)
             entered_at_us = self._pit_entered_at_us(
                 entry_time_source.value_text if entry_time_source is not None else None,
                 context,

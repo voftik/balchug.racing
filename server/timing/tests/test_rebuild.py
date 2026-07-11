@@ -3,10 +3,12 @@ import gzip
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from timing.db import connect
 from timing.importer import import_recording
+from timing.normalization import TIME_SERVICE_EPOCH_UNIX_US
 from timing.read_api import TimingReadModel
 from timing.rebuild import RebuildError, plan_rebuild, rebuild_session
 from timing.sse import read_cursor_window
@@ -141,6 +143,63 @@ class TimingRebuildTests(unittest.TestCase):
             )
         path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
 
+    def _write_anomalous_timestamp_recording(self, path):
+        """A stopped capture with a valid clock and a low numeric grid TsTime."""
+
+        provider_now = 837_026_446_926_000
+        received = TIME_SERVICE_EPOCH_UNIX_US + provider_now
+        headers = [
+            {"n": "NR"}, {"n": "STATE"}, {"n": "TEAM"}, {"n": "CLS"},
+            {"n": "LAPS"}, {"n": "PIT"}, {"n": "L-PIT"}, {"n": "STINT"},
+        ]
+        frames = [
+            {
+                "M": [
+                    ["s_i", provider_now],
+                    [
+                        "r_i",
+                        {
+                            "l": {"h": headers},
+                            "r": [
+                                [0, 0, "77"], [0, 1, f"E{provider_now}"],
+                                [0, 2, "Anomaly Racing"], [0, 3, "CN PRO"],
+                                [0, 4, "5"], [0, 5, "0"], [0, 6, "L0"], [0, 7, f"S{provider_now}"],
+                            ],
+                        },
+                    ],
+                ]
+            },
+            {
+                "M": [
+                    ["s_t", provider_now + 1_000_000],
+                    ["r_c", [[0, 1, "E120000000"], [0, 7, "S120000000"]]],
+                ]
+            },
+            {
+                "M": [
+                    ["s_t", provider_now + 2_000_000],
+                    ["r_c", [[0, 1, "SIn Pit"], [0, 5, "1"], [0, 6, "S120000000"]]],
+                ]
+            },
+        ]
+
+        def received_at(offset_us):
+            return datetime.fromtimestamp((received + offset_us) / 1_000_000, timezone.utc).isoformat().replace("+00:00", "Z")
+
+        records = [{"v": 1, "kind": "connected", "received_at": received_at(0), "monotonic_ns": 1}]
+        for index, frame in enumerate(frames):
+            records.append(
+                {
+                    "v": 1,
+                    "kind": "frame",
+                    "received_at": received_at(index * 1_000_000),
+                    "monotonic_ns": index + 2,
+                    "sequence": index + 1,
+                    "text_b64": base64.b64encode(json.dumps(frame, separators=(",", ":")).encode()).decode(),
+                }
+            )
+        path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+
     def test_rebuilds_stopped_session_from_unchanged_raw_frames(self):
         reader = connect(self.database, readonly=True)
         try:
@@ -192,6 +251,80 @@ class TimingRebuildTests(unittest.TestCase):
             )
             self.assertEqual(reader.execute("PRAGMA integrity_check").fetchone()[0], "ok")
             self.assertIsNone(reader.execute("PRAGMA foreign_key_check").fetchone())
+        finally:
+            reader.close()
+
+    def test_rebuild_keeps_anomalous_raw_timestamps_and_rejects_false_utc(self):
+        events = self.root / "anomalous-events.ndjson"
+        database = self.root / "anomalous-timing.db"
+        self._write_anomalous_timestamp_recording(events)
+        session_id = import_recording(database, events)
+
+        reader = connect(database, readonly=True)
+        try:
+            raw_before = reader.execute("SELECT id,raw_payload FROM feed_frames ORDER BY id").fetchall()
+            state = reader.execute(
+                """
+                SELECT state_raw,state_kind,state_timer_target_provider_us,state_timer_target_at_us
+                FROM participant_state_observations
+                WHERE state_raw = 'E120000000'
+                """
+            ).fetchone()
+            self.assertEqual(tuple(state), ("E120000000", "ON_TRACK", 120_000_000, None))
+            stint = reader.execute(
+                """
+                SELECT driver_stint_raw,driver_stint_kind,driver_stint_provider_ts_time,driver_stint_at_us
+                FROM participant_state_observations
+                WHERE driver_stint_raw = 'S120000000'
+                ORDER BY id LIMIT 1
+                """
+            ).fetchone()
+            self.assertEqual(tuple(stint), ("S120000000", "START_TS", 120_000_000, None))
+            pit = reader.execute(
+                """
+                SELECT pit.entered_at_us,frame.received_at_us,pit.entered_at_source_kind
+                FROM pit_stops AS pit
+                JOIN feed_messages AS message ON message.id = pit.entered_source_message_id
+                JOIN feed_frames AS frame ON frame.id = message.frame_id
+                """
+            ).fetchone()
+            self.assertEqual((pit[0], pit[1], pit[2]), (pit[1], pit[1], None))
+        finally:
+            reader.close()
+
+        result = rebuild_session(database, session_id)
+        self.assertEqual(result.frames_replayed, 3)
+
+        reader = connect(database, readonly=True)
+        try:
+            self.assertEqual(reader.execute("SELECT id,raw_payload FROM feed_frames ORDER BY id").fetchall(), raw_before)
+            state = reader.execute(
+                """
+                SELECT state_raw,state_kind,state_timer_target_provider_us,state_timer_target_at_us
+                FROM participant_state_observations
+                WHERE state_raw = 'E120000000'
+                """
+            ).fetchone()
+            self.assertEqual(tuple(state), ("E120000000", "ON_TRACK", 120_000_000, None))
+            stint = reader.execute(
+                """
+                SELECT driver_stint_raw,driver_stint_kind,driver_stint_provider_ts_time,driver_stint_at_us
+                FROM participant_state_observations
+                WHERE driver_stint_raw = 'S120000000'
+                ORDER BY id LIMIT 1
+                """
+            ).fetchone()
+            self.assertEqual(tuple(stint), ("S120000000", "START_TS", 120_000_000, None))
+            pit = reader.execute(
+                """
+                SELECT pit.entered_at_us,frame.received_at_us,pit.entered_at_source_kind
+                FROM pit_stops AS pit
+                JOIN feed_messages AS message ON message.id = pit.entered_source_message_id
+                JOIN feed_frames AS frame ON frame.id = message.frame_id
+                """
+            ).fetchone()
+            self.assertEqual((pit[0], pit[1], pit[2]), (pit[1], pit[1], None))
+            self.assertEqual(reader.execute("PRAGMA foreign_key_check").fetchall(), [])
         finally:
             reader.close()
 

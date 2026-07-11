@@ -937,6 +937,180 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         )
         self.assertIsNotNone(current["driver_stint_source_cell_observation_id"])
 
+    def test_anomalous_result_event_timestamps_keep_raw_and_use_observed_pit_boundary(self):
+        """A numerically valid low TsTime must never become a 2000-era fact."""
+
+        provider_now = 837_026_446_926_000
+        received = TIME_SERVICE_EPOCH_UNIX_US + provider_now
+        headers = [
+            {"n": "NR"}, {"n": "STATE"}, {"n": "TEAM"}, {"n": "CLS"},
+            {"n": "LAPS"}, {"n": "PIT"}, {"n": "L-PIT"}, {"n": "STINT"},
+        ]
+        entries = (
+            ("21", "BALCHUG Racing"),
+            ("22", "Benchmark Racing"),
+            ("77", "Anomaly Racing"),
+            ("29", "Control Racing"),
+            ("31", "Point Racing"),
+        )
+        initial_cells = []
+        for row_index, (number, team) in enumerate(entries):
+            values = (number, f"E{provider_now}", team, "CN PRO", "5", "0", "L0", f"S{provider_now}")
+            initial_cells.extend([row_index, column_index, value] for column_index, value in enumerate(values))
+        self.apply(
+            [
+                ["s_i", provider_now],
+                ["r_i", {"l": {"h": headers}, "r": initial_cells}],
+            ],
+            received_at_us=received,
+        )
+
+        state_received = received + 1_000_000
+        self.apply(
+            [
+                [
+                    "r_c",
+                    [
+                        [0, 1, "E0"],
+                        [1, 1, f"E{OPEN_ENDED_TS_TIME}"],
+                        [2, 1, "E120000000"],
+                        [3, 1, f"E{provider_now + 2_000_000}"],
+                    ],
+                ]
+            ],
+            received_at_us=state_received,
+        )
+        states = {
+            row["start_number"]: row
+            for row in self.connection.execute(
+                """
+                SELECT participant.start_number,current.state_raw,current.state_kind,
+                       current.state_timer_target_raw,current.state_timer_target_provider_us,
+                       current.state_timer_target_at_us,current.state_timer_calibration_id
+                FROM participant_state_current AS current
+                JOIN participants AS participant ON participant.id = current.participant_id
+                """
+            )
+        }
+        self.assertEqual(
+            tuple(states["21"]),
+            ("21", "E0", "ON_TRACK", "0", 0, None, None),
+        )
+        self.assertEqual(
+            tuple(states["22"]),
+            ("22", f"E{OPEN_ENDED_TS_TIME}", "UNKNOWN", str(OPEN_ENDED_TS_TIME), None, None, None),
+        )
+        self.assertEqual(
+            tuple(states["77"]),
+            ("77", "E120000000", "ON_TRACK", "120000000", 120_000_000, None, None),
+        )
+        self.assertEqual(states["29"]["state_timer_target_at_us"], received + 2_000_000)
+        self.assertIsNotNone(states["29"]["state_timer_calibration_id"])
+        anomaly_observation = self.connection.execute(
+            """
+            SELECT observation.state_raw,observation.state_kind,
+                   observation.state_timer_target_provider_us,observation.state_timer_target_at_us,
+                   observation.state_timer_calibration_id
+            FROM participant_state_observations AS observation
+            JOIN participants AS participant ON participant.id = observation.participant_id
+            WHERE participant.start_number = '77' AND observation.state_raw = 'E120000000'
+            """
+        ).fetchone()
+        self.assertEqual(tuple(anomaly_observation), ("E120000000", "ON_TRACK", 120_000_000, None, None))
+
+        stint_received = received + 2_000_000
+        self.apply(
+            [
+                [
+                    "r_c",
+                    [
+                        [0, 7, "S0"],
+                        [1, 7, f"P{OPEN_ENDED_TS_TIME}"],
+                        [2, 7, "S120000000"],
+                        [3, 7, f"P{provider_now + 3_000_000}"],
+                        [4, 7, "P120000000"],
+                    ],
+                ]
+            ],
+            received_at_us=stint_received,
+        )
+        stints = {
+            row["start_number"]: row
+            for row in self.connection.execute(
+                """
+                SELECT participant.start_number,current.current_driver_stint_raw,current.driver_stint_kind,
+                       current.driver_stint_provider_ts_time,current.driver_stint_at_us,
+                       current.driver_stint_calibration_id
+                FROM participant_state_current AS current
+                JOIN participants AS participant ON participant.id = current.participant_id
+                """
+            )
+        }
+        self.assertEqual(tuple(stints["21"]), ("21", "S0", "UNKNOWN", None, None, None))
+        self.assertEqual(
+            tuple(stints["22"]),
+            ("22", f"P{OPEN_ENDED_TS_TIME}", "UNKNOWN", None, None, None),
+        )
+        self.assertEqual(tuple(stints["77"]), ("77", "S120000000", "START_TS", 120_000_000, None, None))
+        self.assertEqual(tuple(stints["31"]), ("31", "P120000000", "POINT_TS", 120_000_000, None, None))
+        self.assertEqual(stints["29"]["driver_stint_at_us"], received + 3_000_000)
+        self.assertIsNotNone(stints["29"]["driver_stint_calibration_id"])
+        self.assertEqual(
+            tuple(
+                self.connection.execute(
+                    """
+                    SELECT driver_stint_raw,driver_stint_kind,driver_stint_provider_ts_time,
+                           driver_stint_at_us,driver_stint_calibration_id
+                    FROM participant_state_observations AS observation
+                    JOIN participants AS participant ON participant.id = observation.participant_id
+                    WHERE participant.start_number = '77' AND driver_stint_raw = 'S120000000'
+                    """
+                ).fetchone()
+            ),
+            ("S120000000", "START_TS", 120_000_000, None, None),
+        )
+
+        pit_received = received + 3_000_000
+        self.apply(
+            [
+                [
+                    "r_c",
+                    [
+                        [0, 1, "SIn Pit"], [0, 5, "1"], [0, 6, "S0"],
+                        [1, 1, "SIn Pit"], [1, 5, "1"], [1, 6, f"S{OPEN_ENDED_TS_TIME}"],
+                        [2, 1, "SIn Pit"], [2, 5, "1"], [2, 6, "S120000000"],
+                        [3, 1, "SIn Pit"], [3, 5, "1"], [3, 6, f"S{provider_now + 4_000_000}"],
+                    ],
+                ]
+            ],
+            received_at_us=pit_received,
+        )
+        pits = {
+            row["start_number"]: row
+            for row in self.connection.execute(
+                """
+                SELECT participant.start_number,pit.entered_at_us,pit.entered_at_source_cell_observation_id,
+                       pit.entered_at_source_message_id,pit.entered_at_source_key,pit.entered_at_source_kind,
+                       current.pit_time_raw
+                FROM pit_stops AS pit
+                JOIN participants AS participant ON participant.id = pit.participant_id
+                JOIN participant_state_current AS current
+                  ON current.participant_id = participant.id AND current.source_heat_id = pit.source_heat_id
+                """
+            )
+        }
+        for number, raw in (("21", "S0"), ("22", f"S{OPEN_ENDED_TS_TIME}"), ("77", "S120000000")):
+            self.assertEqual(pits[number]["entered_at_us"], pit_received)
+            self.assertIsNone(pits[number]["entered_at_source_cell_observation_id"])
+            self.assertIsNone(pits[number]["entered_at_source_message_id"])
+            self.assertIsNone(pits[number]["entered_at_source_key"])
+            self.assertIsNone(pits[number]["entered_at_source_kind"])
+            self.assertEqual(pits[number]["pit_time_raw"], raw)
+        self.assertEqual(pits["29"]["entered_at_us"], received + 4_000_000)
+        self.assertIsNotNone(pits["29"]["entered_at_source_cell_observation_id"])
+        self.assertIsNotNone(pits["29"]["entered_at_source_message_id"])
+        self.assertEqual(pits["29"]["entered_at_source_kind"], "RESULT_L_PIT_S")
+
     def test_current_provider_layout_persists_a_current_contract_and_alias_drift(self):
         received = TIME_SERVICE_EPOCH_UNIX_US + 22_600_000
         headers = [

@@ -109,6 +109,14 @@ the system never presents epoch arithmetic as a guessed UTC timestamp.
 `E<TsTime>` is retained separately as a state timer target so it cannot be
 confused with `LAST`, `BEST` or `L-PIT`.
 
+For `STATE=E<TsTime>`, `STINT=S/P<TsTime>` and `L-PIT=S<TsTime>`, a calibrated
+instant is published only when it lies within 26 hours of the source frame
+receive time (24 hours of race duration plus a two-hour reserve). The raw cell
+and parsed provider TsTime remain unchanged when that guard rejects a value;
+the derived `*_at_us` and its calibration reference are `NULL`. An invalid
+`L-PIT` source timestamp therefore uses the observed STATE/PIT boundary rather
+than inventing a pit entry in 2000.
+
 Pit entry/exit is recorded from observed `STATE` transitions and the source
 `PIT` count, while `t_p` passings are stored independently as corroborating raw
 track evidence. The original STATE observation remains available for replay;

@@ -67,7 +67,7 @@ class TimingDatabaseTests(unittest.TestCase):
             path = Path(temporary) / "timing.db"
             self.assertEqual(
                 migrate(path),
-                ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013"],
+                ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014"],
             )
             self.assertEqual(migrate(path), [])
             connection = connect(path)
@@ -472,7 +472,7 @@ class TimingDatabaseTests(unittest.TestCase):
 
             self.assertEqual(
                 migrate(path),
-                ["0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013"],
+                ["0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014"],
             )
             connection = connect(path)
             try:
@@ -492,7 +492,7 @@ class TimingDatabaseTests(unittest.TestCase):
             legacy_migrations = root / "legacy-migrations"
             legacy_migrations.mkdir()
             for migration in sorted((Path(__file__).parent.parent / "migrations").glob("00[0-1][0-9]_*.sql")):
-                if migration.name.startswith("0013_"):
+                if migration.name.startswith(("0013_", "0014_")):
                     continue
                 shutil.copyfile(migration, legacy_migrations / migration.name)
             self.assertEqual(
@@ -588,7 +588,7 @@ class TimingDatabaseTests(unittest.TestCase):
             finally:
                 connection.close()
 
-            self.assertEqual(migrate(path), ["0013"])
+            self.assertEqual(migrate(path), ["0013", "0014"])
             connection = connect(path)
             try:
                 current = connection.execute(
@@ -611,6 +611,127 @@ class TimingDatabaseTests(unittest.TestCase):
                         (layout_id,),
                     ).fetchone()[0],
                     "sector_1",
+                )
+                self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+            finally:
+                connection.close()
+
+    def test_event_timestamp_guard_migration_clears_only_unsafe_derived_times(self):
+        """0014 must retain raw source facts while removing prior false UTC."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "timing.db"
+            legacy_migrations = root / "legacy-migrations"
+            legacy_migrations.mkdir()
+            for migration in sorted((Path(__file__).parent.parent / "migrations").glob("00[0-1][0-9]_*.sql")):
+                if migration.name.startswith("0014_"):
+                    continue
+                shutil.copyfile(migration, legacy_migrations / migration.name)
+            self.assertEqual(
+                migrate(path, directory=legacy_migrations),
+                ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013"],
+            )
+
+            received_at_us = 1_783_697_986_978_444
+            false_at_us = received_at_us - 100_000_000_000
+            connection = connect(path)
+            try:
+                source_id = self.insert_source(connection)
+                heat_id = self.insert_session(connection, "pre-0014", source_id)
+                _frame_id, message_id = self.insert_frame(
+                    connection,
+                    "pre-0014",
+                    received_at_us=received_at_us,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO participants(
+                      id,source_heat_id,external_key,start_number,team_name,class_name,first_seen_at_us,last_seen_at_us
+                    ) VALUES ('car-77',?,'77','77','Anomaly Racing','CN PRO',?,?)
+                    """,
+                    (heat_id, received_at_us, received_at_us),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO participant_state_observations(
+                      source_heat_id,participant_id,provider_row_index,state_raw,state_kind,
+                      state_timer_target_raw,state_timer_target_provider_us,state_timer_target_at_us,
+                      driver_stint_raw,driver_stint_kind,driver_stint_provider_ts_time,driver_stint_at_us,
+                      source_message_id,source_key,source_event_key,observed_at_us,created_at_us
+                    ) VALUES (?, 'car-77', 0, 'E120000000', 'ON_TRACK',
+                              '120000000', 120000000, ?, 'S120000000', 'START_TS', 120000000, ?,
+                              ?, 'pre-0014:1:0', 'pre-0014:state', ?, ?)
+                    """,
+                    (heat_id, false_at_us, false_at_us, message_id, received_at_us, received_at_us),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO participant_state_current(
+                      source_heat_id,participant_id,state,state_raw,state_kind,
+                      state_timer_target_raw,state_timer_target_provider_us,state_timer_target_at_us,
+                      state_timer_observed_at_us,driver_stint_kind,driver_stint_provider_ts_time,
+                      driver_stint_at_us,driver_stint_observed_at_us,source_key,updated_at_us
+                    ) VALUES (?, 'car-77', 'ON_TRACK', 'E120000000', 'ON_TRACK',
+                              '120000000', 120000000, ?, ?, 'START_TS', 120000000, ?, ?,
+                              'pre-0014:1:0', ?)
+                    """,
+                    (
+                        heat_id,
+                        false_at_us,
+                        received_at_us,
+                        false_at_us,
+                        received_at_us,
+                        received_at_us,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO pit_stops(
+                      id,source_heat_id,participant_id,stop_number,entered_at_us,completed,
+                      entered_source_message_id,entered_source_key,entered_at_source_message_id,
+                      entered_at_source_key,entered_at_source_kind,created_at_us,updated_at_us
+                    ) VALUES ('pit-77',?,'car-77',1,?,0,?,'pre-0014:1:0',?,
+                              'pre-0014:1:0','RESULT_L_PIT_S',?,?)
+                    """,
+                    (heat_id, false_at_us, message_id, message_id, received_at_us, received_at_us),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            self.assertEqual(migrate(path), ["0014"])
+            connection = connect(path)
+            try:
+                observation = connection.execute(
+                    """
+                    SELECT state_raw,state_timer_target_provider_us,state_timer_target_at_us,
+                           driver_stint_raw,driver_stint_provider_ts_time,driver_stint_at_us
+                    FROM participant_state_observations
+                    """
+                ).fetchone()
+                self.assertEqual(
+                    tuple(observation),
+                    ("E120000000", 120_000_000, None, "S120000000", 120_000_000, None),
+                )
+                current = connection.execute(
+                    """
+                    SELECT state_raw,state_timer_target_provider_us,state_timer_target_at_us,
+                           driver_stint_provider_ts_time,driver_stint_at_us
+                    FROM participant_state_current
+                    """
+                ).fetchone()
+                self.assertEqual(tuple(current), ("E120000000", 120_000_000, None, 120_000_000, None))
+                pit = connection.execute(
+                    """
+                    SELECT entered_at_us,entered_source_message_id,entered_at_source_cell_observation_id,
+                           entered_at_source_message_id,entered_at_source_key,entered_at_source_kind
+                    FROM pit_stops
+                    """
+                ).fetchone()
+                self.assertEqual(
+                    tuple(pit),
+                    (received_at_us, message_id, None, None, None, None),
                 )
                 self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
             finally:
