@@ -1202,6 +1202,9 @@
       var capturedLapCount = captureRecordedLapCount(captureRecordedLaps(), state.atUs);
       lapsValue = capturedLapCount === null ? "—" : formatLapCount(capturedLapCount) + " с начала записи";
     }
+    var classLeaderRelation = archiveRelationPresentation(effectiveAtUs, snapshot, "class_leader");
+    var aheadRelation = archiveRelationPresentation(effectiveAtUs, snapshot, "class_ahead");
+    var behindRelation = archiveRelationPresentation(effectiveAtUs, snapshot, "class_behind");
     var tyresValue = formatLapCount(visibleTyreAge);
     if (lapCountScope === "capture_tracker" && currentStint === 1 && numericValue(visibleTyreAge) !== null) {
       tyresValue = "не менее " + tyresValue;
@@ -1215,7 +1218,7 @@
 
     var values = [
       { id: "pos", label: "POS", tooltip: "Абсолютная позиция BALCHUG Racing в момент выбранного среза", value: session.position_overall !== null && session.position_overall !== undefined ? "P" + session.position_overall : oursState.position_overall !== null && oursState.position_overall !== undefined ? "P" + oursState.position_overall : "—" },
-      { id: "class_leader_gap", label: "До лидера класса", tooltip: "Временной интервал до лидера CN PRO по данным выбранного среза", value: formatArchiveRelationDistance(effectiveAtUs, snapshot, "class_leader") },
+      { id: "class_leader_gap", label: "До лидера класса", tooltip: classLeaderRelation.tooltip, value: classLeaderRelation.value },
       { id: "laps", label: lapCountScope === "capture_tracker" ? "Круги в записи" : "Круги", tooltip: lapCountScope === "capture_tracker" ? "Количество новых значений LAST, зафиксированных после начала записи" : "Количество кругов по данным табло", value: lapsValue },
       { id: "state", label: "Состояние", tooltip: "Последнее подтверждённое состояние экипажа по полю STATE", value: firstDefined(session.current_state, oursState.state_kind, oursState.state) },
       { id: "last", label: "Последний по табло", tooltip: "Последнее значение LAST, переданное табло; это не расчёт из timestamp", value: formatLap(firstDefined(session.last_lap_ms, oursState.last_lap_ms)) },
@@ -1224,8 +1227,8 @@
         numericValue(firstDefined(session.best_lap_ms, oursState.best_lap_ms)) !== null ?
           numericValue(firstDefined(session.last_lap_ms, oursState.last_lap_ms)) - numericValue(firstDefined(session.best_lap_ms, oursState.best_lap_ms)) : null
       ) },
-      { id: "ahead", label: "До соперника впереди", tooltip: "Временной интервал до ближайшего соперника впереди в классе", value: formatArchiveRelationDistance(effectiveAtUs, snapshot, "class_ahead") },
-      { id: "behind", label: "До соперника сзади", tooltip: "Временной интервал до ближайшего соперника сзади в классе", value: formatBehindDistance(effectiveAtUs, snapshot) },
+      { id: "ahead", label: "До соперника впереди", tooltip: aheadRelation.tooltip, value: aheadRelation.value },
+      { id: "behind", label: "До соперника сзади", tooltip: behindRelation.tooltip, value: behindRelation.value },
       { id: "tyres", label: "Возраст шин", tooltip: "Количество кругов в текущем стинте после последнего подтверждённого выезда из pit", value: tyresValue },
       { id: "pits", label: lapCountScope === "capture_tracker" ? "Питы в записи" : "Пит-стопы", tooltip: "Количество подтверждённых pit cycle в доступном интервале записи", value: firstDefined(session.pits_completed, oursState.provider_pit_count) },
       { id: "best", label: "Лучший по табло", tooltip: "Лучшее значение BEST, переданное табло", value: formatLap(firstDefined(session.best_lap_ms, oursState.best_lap_ms)) },
@@ -2239,67 +2242,6 @@
     return (scope === "capture_tracker" ? "Зафиксированный круг #" : "Круг #") + valueOrDash(lapNumber);
   }
 
-  function archiveSourceTime(entry, field) {
-    var item = asObject(entry);
-    var computed = asObject(item.computed);
-    var measured = asObject(item.measured);
-    var measuredState = asObject(measured.state);
-    var measuredValue = numericValue(measuredState[field + "_ms"]);
-    var measuredKind = measuredState[field + "_kind"];
-    if (measuredValue !== null && measuredKind === "TIME") return measuredValue;
-    return numericValue(computed["source_" + field + "_ms"]);
-  }
-
-  function archiveExplicitLaps(entry) {
-    var state = asObject(asObject(entry).measured).state;
-    var laps = numericValue(asObject(state).laps);
-    return laps !== null && laps >= 0 ? laps : null;
-  }
-
-  function archiveSourceRelationGap(snapshot, relation) {
-    var payload = asObject(snapshot);
-    var session = asObject(asObject(payload.computed).session);
-    var targetId = session[relation + "_id"];
-    var oursId = session.ours_participant_id;
-    var participants = Array.isArray(payload.class_participants) ? payload.class_participants : [];
-    if (!targetId || !oursId || !participants.length) return null;
-    var ours = null;
-    var target = null;
-    participants.forEach(function (entry) {
-      var item = asObject(entry);
-      var computed = asObject(item.computed);
-      var measured = asObject(item.measured);
-      var id = computed.participant_id || measured.participant_id;
-      if (id === oursId) ours = item;
-      if (id === targetId) target = item;
-    });
-    if (!ours || !target) return null;
-    if (oursId === targetId) return 0;
-    var oursLaps = archiveExplicitLaps(ours);
-    var targetLaps = archiveExplicitLaps(target);
-    if (oursLaps !== null && targetLaps !== null && oursLaps !== targetLaps) return null;
-    var oursComputed = asObject(ours.computed);
-    var targetComputed = asObject(target.computed);
-    var oursGap = archiveSourceTime(ours, "gap");
-    var targetGap = archiveSourceTime(target, "gap");
-    if (oursGap !== null && targetGap !== null) return Math.abs(oursGap - targetGap);
-    var oursPos = numericValue(oursComputed.position_overall);
-    var targetPos = numericValue(targetComputed.position_overall);
-    if (oursPos === 1 && targetGap !== null) return targetGap;
-    if (targetPos === 1 && oursGap !== null) return oursGap;
-    // DIFF is source-provided only for absolute neighbours.  It is safe only
-    // in that exact relationship and is never synthesized from lap times.
-    if (oursPos !== null && targetPos === oursPos - 1) return archiveSourceTime(ours, "diff");
-    if (oursPos !== null && targetPos === oursPos + 1) return archiveSourceTime(target, "diff");
-    return null;
-  }
-
-  function archiveIntervalKeys(relation) {
-    if (relation === "class_leader") return { gap: "gap_to_class_leader_ms", lap: "lap_delta_to_class_leader" };
-    if (relation === "class_ahead") return { gap: "gap_to_ahead_ms", lap: "lap_delta_to_ahead" };
-    return { gap: "gap_to_behind_ms", lap: "lap_delta_to_behind" };
-  }
-
   function archiveRelationTargetState(snapshot, relation) {
     var payload = asObject(snapshot);
     var session = asObject(asObject(payload.computed).session);
@@ -2317,25 +2259,92 @@
     return null;
   }
 
-  function formatArchiveRelationDistance(atUs, snapshot, relation) {
-    var payload = snapshot || historicalSnapshot(atUs);
-    var session = asObject(asObject(payload.computed).session);
-    var keys = archiveIntervalKeys(relation);
-    var archiveIntervals = payload.archive_intervals;
-    var hasArchiveIntervals = archiveIntervals && typeof archiveIntervals === "object" && !Array.isArray(archiveIntervals);
-    if (hasArchiveIntervals) {
-      var derivedGap = numericValue(archiveIntervals[keys.gap]);
-      if (derivedGap !== null) return formatGap(derivedGap);
-      return archiveRelationTargetState(payload, relation) === "IN_PIT" ? "В PIT" : "—";
-    }
-    var gap = archiveSourceRelationGap(payload, relation);
-    if (gap === null) gap = numericValue(session[keys.gap]);
-    if (gap !== null) return formatGap(gap);
-    return "—";
+  function normalizedArchiveState(value) {
+    return typeof value === "string" ? value.trim().toUpperCase().replace(/\s+/g, "_") : null;
   }
 
-  function formatBehindDistance(atUs, snapshot) {
-    return formatArchiveRelationDistance(atUs, snapshot, "class_behind");
+  function archiveRelationTooltipLabel(relation) {
+    if (relation === "class_leader") return "до лидера класса";
+    if (relation === "class_ahead") return "до соперника впереди";
+    return "до соперника сзади";
+  }
+
+  function archiveRelationSourceDescription(provenance) {
+    var interval = asObject(provenance);
+    var facts = Array.isArray(interval.source_facts) ? interval.source_facts.filter(function (fact) {
+      return fact && typeof fact === "object";
+    }) : [];
+    if (!facts.length) return "";
+    var fields = facts.map(function (fact) {
+      return typeof fact.field_kind === "string" ? fact.field_kind : null;
+    }).filter(Boolean).filter(function (field, index, values) { return values.indexOf(field) === index; });
+    var sourceAtUs = numericValue(interval.source_observed_at_us);
+    var clock = sourceAtUs === null ? null : timelineClockAt(sourceAtUs);
+    var parts = ["Источник табло"];
+    if (fields.length) parts.push(fields.join(" + "));
+    if (facts.length > 1) parts.push(formatNounCount(facts.length, "ячейка", "ячейки", "ячеек") + " одного расчёта");
+    if (clock) parts.push((clock.source ? "время табло " : "время записи ") + formatAbsolute(clock.atUs));
+    return parts.join(" · ") + ".";
+  }
+
+  function archiveRelationPresentation(atUs, snapshot, relation) {
+    var payload = snapshot || historicalSnapshot(atUs);
+    var archiveIntervals = payload.archive_intervals;
+    var hasArchiveIntervals = archiveIntervals && typeof archiveIntervals === "object" && !Array.isArray(archiveIntervals);
+    var relations = hasArchiveIntervals && archiveIntervals.relations;
+    var hasProvenance = relations && typeof relations === "object" && !Array.isArray(relations);
+    var provenance = hasProvenance ? relations[relation] : null;
+    var label = archiveRelationTooltipLabel(relation);
+
+    if (provenance && typeof provenance === "object" && !Array.isArray(provenance)) {
+      var status = typeof provenance.status === "string" ? provenance.status.trim().toUpperCase() : "";
+      var value = numericValue(provenance.value_ms);
+      if ((status === "VALID" || status === "SELF") && value !== null && value >= 0) {
+        var source = archiveRelationSourceDescription(provenance);
+        return {
+          value: formatGap(value),
+          tooltip: "Подтверждённый интервал " + label + "." + (source ? " " + source : "")
+        };
+      }
+      var oursState = normalizedArchiveState(provenance.ours_state_kind);
+      var targetState = normalizedArchiveState(provenance.target_state_kind);
+      if (oursState === "IN_PIT" || targetState === "IN_PIT") {
+        return {
+          value: "В PIT",
+          tooltip: "Интервал " + label + " неактуален: один из экипажей находится в pit."
+        };
+      }
+      return {
+        value: "нет актуального интервала",
+        tooltip: "Нет подтверждённого актуального интервала " + label + " для выбранного среза."
+      };
+    }
+
+    if (hasProvenance) {
+      if (archiveRelationTargetState(payload, relation) === "IN_PIT") {
+        return {
+          value: "В PIT",
+          tooltip: "Интервал " + label + " неактуален: соперник находится в pit."
+        };
+      }
+      return {
+        value: "нет актуального интервала",
+        tooltip: "Нет подтверждённого актуального интервала " + label + " для выбранного среза."
+      };
+    }
+
+    // Flat archive scalars have no target/source provenance and do not
+    // qualify for numeric display.
+    if (hasArchiveIntervals && archiveRelationTargetState(payload, relation) === "IN_PIT") {
+      return {
+        value: "В PIT",
+        tooltip: "Интервал " + label + " неактуален: соперник находится в pit."
+      };
+    }
+    return {
+      value: "нет актуального интервала",
+      tooltip: "Для этого архивного среза не сохранён подтверждённый источник интервала " + label + "."
+    };
   }
 
   function rawLapTooltipAnchor(point, geometry) {

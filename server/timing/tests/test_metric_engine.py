@@ -7,7 +7,9 @@ from timing.metric_engine import (
     CHANNEL_LIVE,
     CHANNEL_OFFLINE,
     METRIC_ENGINE_VERSION,
+    deserialize_metric_boundary_state,
     evaluate_heat_metrics,
+    serialize_metric_boundary_state,
 )
 from timing.metric_store import (
     ClassScopeInput,
@@ -154,6 +156,76 @@ def participant(
     )
 
 
+def attach_interval_facts(participants, *, source_message_id=1, observed_at_us=6_000_000, observation_kind="DELTA"):
+    """Attach the additive GAP/DIFF provenance expected by the new evaluator.
+
+    ``ParticipantStateInput`` gains these fields in the storage migration. The
+    present fixture intentionally uses dynamic attributes so this engine-only
+    test can exercise the contract before that migration lands.
+    """
+
+    by_position = {
+        item.state.position_overall: item
+        for item in participants
+        if item.state is not None and isinstance(item.state.position_overall, int)
+    }
+    leader = by_position.get(1)
+    for index, item in enumerate(participants, 1):
+        state_value = item.state
+        assert state_value is not None
+        position = state_value.position_overall
+        common = {
+            "id": index,
+            "source_message_id": source_message_id,
+            "source_key": "result:" + str(source_message_id),
+            "source_change_ordinal": index,
+            "observed_at_us": observed_at_us,
+            "source_handle": "r_c",
+            "observation_kind": observation_kind,
+            "subject_position_overall": position,
+            "subject_state_kind": state_value.state_kind,
+            "subject_laps": state_value.laps,
+        }
+        if state_value.gap_ms is not None and leader is not None and leader.state is not None:
+            object.__setattr__(
+                state_value,
+                "gap_interval_fact",
+                {
+                    **common,
+                    "field_kind": "GAP",
+                    "raw_value": state_value.gap_raw,
+                    "value_ms": state_value.gap_ms,
+                    "value_kind": state_value.gap_kind,
+                    "cell_observation_id": 100 + index,
+                    "target_participant_id": leader.id,
+                    "target_position_overall": leader.state.position_overall,
+                    "target_state_kind": leader.state.state_kind,
+                    "target_laps": leader.state.laps,
+                    "relation_kind": "OVERALL_LEADER",
+                },
+            )
+        ahead = by_position.get(position - 1) if isinstance(position, int) else None
+        if state_value.diff_ms is not None and ahead is not None and ahead.state is not None:
+            object.__setattr__(
+                state_value,
+                "diff_interval_fact",
+                {
+                    **common,
+                    "field_kind": "DIFF",
+                    "raw_value": state_value.diff_raw,
+                    "value_ms": state_value.diff_ms,
+                    "value_kind": state_value.diff_kind,
+                    "cell_observation_id": 200 + index,
+                    "target_participant_id": ahead.id,
+                    "target_position_overall": ahead.state.position_overall,
+                    "target_state_kind": ahead.state.state_kind,
+                    "target_laps": ahead.state.laps,
+                    "relation_kind": "OVERALL_AHEAD",
+                },
+            )
+    return participants
+
+
 def heat_input(*, flag="RED", ours_laps=12, ours_pic=2, with_tick=True, identity_state="resolved"):
     leader = participant(
         "leader",
@@ -186,6 +258,7 @@ def heat_input(*, flag="RED", ours_laps=12, ours_pic=2, with_tick=True, identity
         diff_ms=1_750,
         durations=(108_000, 108_100, 108_200, 108_300, 108_400),
     )
+    attach_interval_facts((leader, ours, follower))
     scope = ClassScopeInput(
         key="cn pro",
         display_name="CN PRO",
@@ -280,6 +353,47 @@ def candidate(result, scope_kind, scope_key):
     )
 
 
+def delta_relation_interval(
+    *,
+    target_participant_id,
+    value_ms,
+    observed_at_us,
+    ours_laps,
+    target_laps,
+    source_message_id,
+    fact_id=None,
+):
+    """One source-proven DELTA relation as persisted in metric history."""
+
+    source_fact_id = source_message_id if fact_id is None else fact_id
+    return {
+        "target_participant_id": target_participant_id,
+        "status": "VALID",
+        "value_ms": value_ms,
+        "source_observed_at_us": observed_at_us,
+        "ours_state_kind": "ON_TRACK",
+        "target_state_kind": "ON_TRACK",
+        "ours_laps": ours_laps,
+        "target_laps": target_laps,
+        "source_facts": [
+            {
+                "id": source_fact_id,
+                "field_kind": "GAP",
+                "raw_value": f"{value_ms / 1_000:.3f}",
+                "value_ms": value_ms,
+                "value_kind": "TIME",
+                "cell_observation_id": 10_000 + source_fact_id,
+                "source_message_id": source_message_id,
+                "source_key": f"result:{source_message_id}",
+                "source_change_ordinal": 0,
+                "observed_at_us": observed_at_us,
+                "source_handle": "r_c",
+                "observation_kind": "DELTA",
+            }
+        ],
+    }
+
+
 def with_ours_pit_stop(heat, stop):
     """Keep the immutable participant list and its class scope coherent."""
 
@@ -300,6 +414,26 @@ def with_ours_pit_stop(heat, stop):
         )
         if scope.key == updated_ours.class_key
         else scope
+        for scope in heat.class_scopes
+    )
+    return replace(heat, participants=participants, class_scopes=scopes)
+
+
+def with_participant(heat, updated):
+    """Replace one immutable participant in both the heat and class scopes."""
+
+    participants = tuple(
+        updated if participant.id == updated.id else participant
+        for participant in heat.participants
+    )
+    scopes = tuple(
+        replace(
+            scope,
+            participants=tuple(
+                updated if participant.id == updated.id else participant
+                for participant in scope.participants
+            ),
+        )
         for scope in heat.class_scopes
     )
     return replace(heat, participants=participants, class_scopes=scopes)
@@ -370,6 +504,202 @@ class MetricEngineTests(unittest.TestCase):
         self.assertNotIn("ours_identity", session_candidate.history_values)
         self.assertIn("pit_history", participant_candidate.values)
         self.assertNotIn("pit_history", participant_candidate.history_values)
+
+    def test_relation_intervals_expose_exact_direct_and_pair_provenance(self):
+        session = candidate_values(evaluate_heat_metrics(heat_input(flag="GREEN")), "session", "session-1")
+
+        leader = session["relation_intervals"]["class_leader"]
+        self.assertEqual(leader["status"], "VALID")
+        self.assertEqual(leader["value_ms"], 1_250)
+        self.assertEqual(leader["target_participant_id"], "leader")
+        self.assertEqual(leader["relation_kind"], "GAP_TO_OVERALL_LEADER")
+        self.assertEqual(leader["source_facts"][0]["field_kind"], "GAP")
+        self.assertEqual(leader["source_facts"][0]["raw_value"], "1250")
+        self.assertEqual(leader["source_facts"][0]["cell_observation_id"], 102)
+        self.assertEqual(leader["source_facts"][0]["observed_at_us"], 6_000_000)
+
+        behind = session["relation_intervals"]["class_behind"]
+        self.assertEqual(behind["status"], "VALID")
+        self.assertEqual(behind["value_ms"], 1_750)
+        self.assertEqual(behind["relation_kind"], "GAP_PAIR_COMMON_OVERALL_LEADER")
+        self.assertEqual(len(behind["source_facts"]), 2)
+        self.assertEqual({fact["source_message_id"] for fact in behind["source_facts"]}, {1})
+
+    def test_gap_pair_requires_one_atomic_source_message(self):
+        heat = heat_input(flag="GREEN")
+        leader, ours, follower = heat.participants
+        fact = dict(getattr(follower.state, "gap_interval_fact"))
+        fact["source_message_id"] = 2
+        fact["source_key"] = "result:2"
+        object.__setattr__(follower.state, "gap_interval_fact", fact)
+
+        session = candidate_values(evaluate_heat_metrics(heat), "session", "session-1")
+        relation = session["relation_intervals"]["class_behind"]
+        self.assertEqual(relation["status"], "NO_COHERENT_SOURCE_PAIR")
+        self.assertIsNone(relation["value_ms"])
+        self.assertIsNone(session["gap_to_behind_ms"])
+
+    def test_interval_fact_pointer_has_its_own_boundary_and_scoped_history(self):
+        initial = heat_input(flag="GREEN")
+        first = evaluate_heat_metrics(initial)
+        ours = initial.our_participant
+        assert ours is not None and ours.state is not None
+        gap_fact = dict(ours.state.gap_interval_fact)
+        gap_fact.update(
+            id=902,
+            cell_observation_id=1202,
+            source_message_id=2,
+            source_key="result:2",
+            source_change_ordinal=0,
+            observed_at_us=7_000_000,
+        )
+        diff_fact = {
+            **gap_fact,
+            "id": 903,
+            "field_kind": "DIFF",
+            "cell_observation_id": 1203,
+        }
+        changed_ours = replace(
+            ours,
+            state=replace(
+                ours.state,
+                gap_interval_fact=gap_fact,
+                diff_interval_fact=diff_fact,
+            ),
+        )
+        changed = replace(with_participant(initial, changed_ours), observed_at_us=7_000_000)
+
+        result = evaluate_heat_metrics(changed, previous=first)
+
+        self.assertEqual(result.event_keys, ("interval_fact:ours:GAP", "interval_fact:ours:DIFF"))
+        self.assertTrue(candidate_event_boundary(result, "session", "session-1"))
+        self.assertTrue(candidate_event_boundary(result, "class", "cn pro"))
+        self.assertTrue(candidate_event_boundary(result, "participant", "ours"))
+        self.assertFalse(candidate_event_boundary(result, "participant", "leader"))
+        self.assertFalse(candidate_event_boundary(result, "participant", "follower"))
+
+        restored = deserialize_metric_boundary_state(serialize_metric_boundary_state(result.boundary_state))
+        restored_ours = next(item for item in restored.participants if item.participant_id == "ours")
+        self.assertEqual(restored_ours.gap_interval_fact_pointer, (902, 1202, 2, "result:2", 0, "GAP"))
+        self.assertEqual(restored_ours.diff_interval_fact_pointer, (903, 1203, 2, "result:2", 0, "DIFF"))
+
+        # A row-level state/timestamp refresh must retain the exact GAP cell
+        # cursor and must not manufacture another interval event.
+        refreshed_state = replace(
+            changed_ours.state,
+            state_raw="E70001000",
+            source_key="frame:state-only",
+            updated_at_us=8_000_000,
+        )
+        refreshed = replace(
+            with_participant(changed, replace(changed_ours, state=refreshed_state)),
+            observed_at_us=8_000_000,
+        )
+        no_interval = evaluate_heat_metrics(refreshed, previous=result)
+        self.assertNotIn("interval_fact:ours:GAP", no_interval.event_keys)
+        self.assertNotIn("interval_fact:ours:DIFF", no_interval.event_keys)
+        self.assertEqual(no_interval.event_keys, ())
+
+    def test_out_lap_accepts_a_source_proven_interval(self):
+        base = heat_input(flag="GREEN")
+        ours = base.our_participant
+        assert ours is not None and ours.state is not None
+        gap_fact = dict(ours.state.gap_interval_fact)
+        gap_fact["subject_state_kind"] = "OUT_LAP"
+        out_lap_ours = replace(
+            ours,
+            state=replace(
+                ours.state,
+                state="OUT_LAP",
+                state_raw="SOutLap",
+                state_kind="OUT_LAP",
+                gap_interval_fact=gap_fact,
+            ),
+        )
+        session = candidate_values(
+            evaluate_heat_metrics(with_participant(base, out_lap_ours)),
+            "session",
+            "session-1",
+        )
+
+        relation = session["relation_intervals"]["class_leader"]
+        self.assertEqual(relation["status"], "VALID")
+        self.assertEqual(relation["value_ms"], 1_250)
+        self.assertEqual(session["gap_to_class_leader_ms"], 1_250)
+
+    def test_direct_diff_requires_the_stored_absolute_ahead_target(self):
+        leader = participant(
+            "leader",
+            number="9",
+            overall=1,
+            position_class=1,
+            lap_count=12,
+            gap_ms=None,
+            diff_ms=None,
+            durations=(106_500, 106_600, 106_700, 106_800, 106_900),
+        )
+        ours = participant(
+            "ours",
+            number="21",
+            overall=2,
+            position_class=2,
+            lap_count=12,
+            gap_ms=None,
+            diff_ms=840,
+            durations=(107_500, 107_400, 107_300, 107_200, 107_100),
+            ours=True,
+        )
+        follower = participant(
+            "follower",
+            number="35",
+            overall=3,
+            position_class=3,
+            lap_count=12,
+            gap_ms=None,
+            diff_ms=920,
+            durations=(108_000, 108_100, 108_200, 108_300, 108_400),
+        )
+        attach_interval_facts((leader, ours, follower))
+        scope = ClassScopeInput(
+            key="cn pro",
+            display_name="CN PRO",
+            class_best_lap_ms=106_500,
+            class_best_start_number="9",
+            participants=(leader, ours, follower),
+        )
+        heat = replace(heat_input(flag="GREEN"), participants=(leader, ours, follower), class_scopes=(scope,))
+
+        session = candidate_values(evaluate_heat_metrics(heat), "session", "session-1")
+        relation = session["relation_intervals"]["class_leader"]
+        self.assertEqual(relation["status"], "VALID")
+        self.assertEqual(relation["value_ms"], 840)
+        self.assertEqual(relation["relation_kind"], "DIFF_TO_OVERALL_AHEAD")
+        self.assertEqual(relation["source_facts"][0]["field_kind"], "DIFF")
+
+    def test_relation_invalidates_when_current_or_source_state_is_not_on_track(self):
+        base = heat_input(flag="GREEN")
+        leader, ours, follower = base.participants
+        source_fact = dict(getattr(ours.state, "gap_interval_fact"))
+        source_fact["subject_state_kind"] = "IN_PIT"
+        object.__setattr__(ours.state, "gap_interval_fact", source_fact)
+        source_invalid = candidate_values(evaluate_heat_metrics(base), "session", "session-1")
+        self.assertEqual(
+            source_invalid["relation_intervals"]["class_leader"]["status"],
+            "SOURCE_STATE_MISMATCH",
+        )
+        self.assertIsNone(source_invalid["gap_to_class_leader_ms"])
+
+        current_state = replace(ours.state, state="IN_PIT", state_raw="SIn Pit", state_kind="IN_PIT")
+        object.__setattr__(current_state, "gap_interval_fact", getattr(ours.state, "gap_interval_fact"))
+        stopped_ours = replace(ours, state=current_state)
+        scope = replace(base.class_scopes[0], participants=(leader, stopped_ours, follower))
+        stopped = replace(base, participants=(leader, stopped_ours, follower), class_scopes=(scope,))
+        current_invalid = candidate_values(evaluate_heat_metrics(stopped), "session", "session-1")
+        self.assertEqual(
+            current_invalid["relation_intervals"]["class_leader"]["status"],
+            "NON_RACING_STATE",
+        )
+        self.assertIsNone(current_invalid["gap_to_class_leader_ms"])
 
     def test_live_frame_without_preceding_state_tick_is_live(self):
         result = evaluate_heat_metrics(heat_input(with_tick=False))
@@ -468,6 +798,7 @@ class MetricEngineTests(unittest.TestCase):
             # not a source LAPS column for the whole heat.
             laps=laps((108_000, 108_100), first_lap=1),
         )
+        attach_interval_facts((partial_ours, partial_follower))
         partial_scope = replace(base.class_scopes[0], participants=(partial_ours, partial_follower))
         partial = replace(base, participants=(partial_ours, partial_follower), class_scopes=(partial_scope,))
         partial_session = candidate_values(evaluate_heat_metrics(partial), "session", "session-1")
@@ -480,6 +811,7 @@ class MetricEngineTests(unittest.TestCase):
 
         explicit_follower = replace(partial_follower, state=replace(partial_follower.state, laps=2))
         explicit_ours = replace(partial_ours, state=replace(partial_ours.state, laps=12))
+        attach_interval_facts((explicit_ours, explicit_follower))
         explicit_scope = replace(base.class_scopes[0], participants=(explicit_ours, explicit_follower))
         explicit = replace(base, participants=(explicit_ours, explicit_follower), class_scopes=(explicit_scope,))
         explicit_session = candidate_values(evaluate_heat_metrics(explicit), "session", "session-1")
@@ -493,6 +825,10 @@ class MetricEngineTests(unittest.TestCase):
         no_laps_leader = replace(leader, state=replace(leader.state, laps=None))
         no_laps_ours = replace(ours, state=replace(ours.state, laps=None))
         no_laps_follower = replace(follower, state=replace(follower.state, laps=None))
+        attach_interval_facts(
+            (no_laps_leader, no_laps_ours, no_laps_follower),
+            observed_at_us=180_000_000,
+        )
         scope = replace(base.class_scopes[0], participants=(no_laps_leader, no_laps_ours, no_laps_follower))
         heat = replace(
             base,
@@ -515,9 +851,22 @@ class MetricEngineTests(unittest.TestCase):
                     "class_ahead_state": "ON_TRACK",
                     "lap_delta_to_ahead": None,
                     "gap_to_ahead_ms": gap,
+                    "relation_intervals": {
+                        "class_ahead": delta_relation_interval(
+                            target_participant_id="leader",
+                            value_ms=gap,
+                            observed_at_us=timestamp,
+                            ours_laps=None,
+                            target_laps=None,
+                            source_message_id=source_message_id,
+                        ),
+                    },
                 },
             )
-            for timestamp, gap in ((0, 5_000), (30_000_000, 4_000), (60_000_000, 3_000), (120_000_000, 2_000))
+            for source_message_id, (timestamp, gap) in enumerate(
+                ((0, 5_000), (30_000_000, 4_000), (60_000_000, 3_000), (120_000_000, 2_000)),
+                1,
+            )
         )
 
         session = candidate_values(evaluate_heat_metrics(heat, history=history), "session", "session-1")
@@ -854,6 +1203,7 @@ class MetricEngineTests(unittest.TestCase):
                 calibrated_started_at_us=0,
             ),
         )
+        attach_interval_facts(heat.participants, observed_at_us=180_000_000)
         history = tuple(
             MetricHistoryPoint(
                 observed_at_us=timestamp,
@@ -871,13 +1221,36 @@ class MetricEngineTests(unittest.TestCase):
                     "lap_delta_to_behind": 0,
                     "gap_to_ahead_ms": ahead_gap,
                     "gap_to_behind_ms": behind_gap,
+                    "relation_intervals": {
+                        "class_ahead": delta_relation_interval(
+                            target_participant_id="leader",
+                            value_ms=ahead_gap,
+                            observed_at_us=timestamp,
+                            ours_laps=laps_count,
+                            target_laps=laps_count,
+                            source_message_id=source_message_id,
+                            fact_id=source_message_id * 10 + 1,
+                        ),
+                        "class_behind": delta_relation_interval(
+                            target_participant_id="follower",
+                            value_ms=behind_gap,
+                            observed_at_us=timestamp,
+                            ours_laps=laps_count,
+                            target_laps=laps_count,
+                            source_message_id=source_message_id,
+                            fact_id=source_message_id * 10 + 2,
+                        ),
+                    },
                 },
             )
-            for timestamp, laps_count, ahead_gap, behind_gap in (
-                (0, 8, 5_000, 750),
-                (30_000_000, 9, 4_000, 1_000),
-                (60_000_000, 10, 3_000, 1_250),
-                (120_000_000, 11, 2_000, 1_500),
+            for source_message_id, (timestamp, laps_count, ahead_gap, behind_gap) in enumerate(
+                (
+                    (0, 8, 5_000, 750),
+                    (30_000_000, 9, 4_000, 1_000),
+                    (60_000_000, 10, 3_000, 1_250),
+                    (120_000_000, 11, 2_000, 1_500),
+                ),
+                1,
             )
         )
         session = candidate_values(evaluate_heat_metrics(heat, history=history), "session", "session-1")

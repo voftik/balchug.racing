@@ -46,6 +46,11 @@ not engineer inputs.
       "durations": "Use event boundaries, never browser time. Pit duration is full pit-lane time from confirmed pit_in to confirmed pit_out, not stationary/service time.",
       "remaining_time": "For race, max(0, race_duration_s - session_elapsed_s). For practice/qualifying it is source-supplied only; otherwise null."
     },
+    "interval_provenance": {
+      "source": "Every GAP and DIFF is an immutable result-cell fact with its cell id, source message/key/change ordinal, observed time, source handle, subject state/position/laps and resolved absolute target state/position/laps.",
+      "validity": "A displayed tactical interval is valid only when that exact fact still matches the current source relation, both participants are on track or out-lap, and explicit source LAPS do not show a lap mismatch. It is never synthesized from LAST, BEST, sectors or receive-time subtraction.",
+      "trend": "Only r_c DELTA facts can advance closure, catch or forecast history. An r_i reconnect snapshot may provide the current confirmed table value but is not a new measurement."
+    },
     "lap_and_stint_rules": {
       "completed_lap": "A provider-confirmed finish-loop crossing, using the grid LAPS value when present or the dynamic tracker topology when it is absent. Do not double count both sources. Public official lap totals remain null when the grid does not expose LAPS; tracker crossings remain available only for observed stint and chronology logic.",
       "last_timing_stream": "Every valid changed r_c LAST cell from a no-LAPS layout is retained in source frame order as a timing event without inventing a provider lap number. An r_i snapshot is only a reconnect baseline. Pace may combine those raw LAST events with later explicit-LAPS rows only when the latter retain exact source-cell provenance; tracker-only and pre-provenance legacy rows remain available for tyre/stint chronology but are excluded from timing formulas.",
@@ -211,25 +216,25 @@ not engineer inputs.
         {
           "key": "gap_to_class_leader_ms",
           "unit": "ms",
-          "formula": "Official normalized time interval from ours to class leader. If explicit LAPS exist for both rows they must match; if the grid has no LAPS column, a provider TIME GAP/DIFF remains usable while lap delta stays null.",
-          "window": "current tick",
-          "null_when": ["not same lap", "official interval absent or invalid"],
+          "formula": "Source-proven provider TIME GAP/DIFF relation from ours to class leader. Direct GAP binds to the source overall leader; DIFF binds to the source absolute row ahead; a GAP pair is usable only when both cells came from one atomic table update and share that leader. If explicit LAPS exist for both rows they must match.",
+          "window": "last confirmed interval source cell",
+          "null_when": ["not same lap", "participant in pit or unknown state", "source target/position/state mismatch", "interval fact absent or invalid"],
           "display": {"sign": "interval_ms", "lapped_fallback": "lap_delta_to_class_leader"}
         },
         {
           "key": "gap_to_ahead_ms",
           "unit": "ms",
-          "formula": "Official normalized time interval from ours to class_ahead_id. If explicit LAPS exist for both rows they must match; if the grid has no LAPS column, a provider TIME GAP/DIFF remains usable while lap delta stays null.",
-          "window": "current tick",
-          "null_when": ["no class_ahead_id", "not same lap", "official interval absent or invalid"],
+          "formula": "Source-proven provider TIME GAP/DIFF relation from ours to class_ahead_id under the same exact-cell rule; no interval is inferred from lap times or later row state.",
+          "window": "last confirmed interval source cell",
+          "null_when": ["no class_ahead_id", "not same lap", "participant in pit or unknown state", "source target/position/state mismatch", "interval fact absent or invalid"],
           "display": {"sign": "interval_ms", "lapped_fallback": "lap delta"}
         },
         {
           "key": "gap_to_behind_ms",
           "unit": "ms",
-          "formula": "Official normalized time interval from ours to class_behind_id. If explicit LAPS exist for both rows they must match; if the grid has no LAPS column, a provider TIME GAP/DIFF remains usable while lap delta stays null.",
-          "window": "current tick",
-          "null_when": ["no class_behind_id", "not same lap", "official interval absent or invalid"],
+          "formula": "Source-proven provider TIME GAP/DIFF relation from ours to class_behind_id under the same exact-cell rule; no interval is inferred from lap times or later row state.",
+          "window": "last confirmed interval source cell",
+          "null_when": ["no class_behind_id", "not same lap", "participant in pit or unknown state", "source target/position/state mismatch", "interval fact absent or invalid"],
           "display": {"sign": "interval_ms", "lapped_fallback": "lap delta"}
         }
       ]

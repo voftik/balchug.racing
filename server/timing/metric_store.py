@@ -29,6 +29,10 @@ METRIC_SAMPLE_INTERVAL_US = 5_000_000
 PLAYBACK_SNAPSHOT_INTERVAL_US = METRIC_SAMPLE_INTERVAL_US
 """Archive projection cadence; relevant domain boundaries are retained too."""
 
+# ``playback_snapshots.projection_version`` is constrained to 1 in the
+# durable SQLite schema.  Metric-engine versioning distinguishes semantic
+# revisions inside this stable envelope; changing it would require a separate
+# table migration and would reject every existing snapshot before rebuild.
 PLAYBACK_PROJECTION_VERSION = 1
 PLAYBACK_PAYLOAD_CODEC = "gzip-json-v1"
 
@@ -139,6 +143,36 @@ class ParticipantStateInput:
     source_message_id: int | None
     source_key: str
     updated_at_us: int
+    # GAP/DIFF are sparse cells. Their field-level provenance must not be
+    # replaced by the generic current-row timestamp after a STATE/LAST update.
+    gap_interval_fact: "IntervalSourceFactInput | None" = None
+    diff_interval_fact: "IntervalSourceFactInput | None" = None
+
+
+@dataclass(frozen=True)
+class IntervalSourceFactInput:
+    """One immutable provider GAP/DIFF cell with its source-time context."""
+
+    id: int
+    field_kind: str
+    raw_value: str | None
+    value_ms: int | None
+    value_kind: str | None
+    cell_observation_id: int
+    source_message_id: int | None
+    source_key: str
+    source_change_ordinal: int
+    observed_at_us: int
+    source_handle: str
+    observation_kind: str
+    subject_position_overall: int | None
+    subject_state_kind: str | None
+    subject_laps: int | None
+    target_participant_id: str | None
+    target_position_overall: int | None
+    target_state_kind: str | None
+    target_laps: int | None
+    relation_kind: str | None
 
 
 @dataclass(frozen=True)
@@ -738,6 +772,35 @@ def _load_raw_result_last_laps(
     return grouped, latest_event_id, source_cell_ids
 
 
+def _interval_fact_input(row: sqlite3.Row, prefix: str) -> IntervalSourceFactInput | None:
+    """Read one optional current interval pointer without synthesizing history."""
+
+    if row[f"{prefix}_id"] is None:
+        return None
+    return IntervalSourceFactInput(
+        id=int(row[f"{prefix}_id"]),
+        field_kind=row[f"{prefix}_interval_kind"],
+        raw_value=row[f"{prefix}_raw_value"],
+        value_ms=_int(row[f"{prefix}_interval_ms"]),
+        value_kind=row[f"{prefix}_value_kind"],
+        cell_observation_id=int(row[f"{prefix}_source_cell_observation_id"]),
+        source_message_id=_int(row[f"{prefix}_source_message_id"]),
+        source_key=row[f"{prefix}_source_key"],
+        source_change_ordinal=int(row[f"{prefix}_source_change_ordinal"]),
+        observed_at_us=int(row[f"{prefix}_observed_at_us"]),
+        source_handle=row[f"{prefix}_source_handle"],
+        observation_kind=row[f"{prefix}_observation_kind"],
+        subject_position_overall=_int(row[f"{prefix}_source_position_overall"]),
+        subject_state_kind=row[f"{prefix}_source_state_kind"],
+        subject_laps=_int(row[f"{prefix}_source_laps"]),
+        target_participant_id=row[f"{prefix}_target_participant_id"],
+        target_position_overall=_int(row[f"{prefix}_target_position_overall"]),
+        target_state_kind=row[f"{prefix}_target_state_kind"],
+        target_laps=_int(row[f"{prefix}_target_laps"]),
+        relation_kind=row[f"{prefix}_relation_kind"],
+    )
+
+
 def _state_input(row: sqlite3.Row) -> ParticipantStateInput | None:
     if row["state_source_key"] is None:
         return None
@@ -771,6 +834,8 @@ def _state_input(row: sqlite3.Row) -> ParticipantStateInput | None:
         source_message_id=_int(row["state_source_message_id"]),
         source_key=row["state_source_key"],
         updated_at_us=int(row["state_updated_at_us"]),
+        gap_interval_fact=_interval_fact_input(row, "gap_fact"),
+        diff_interval_fact=_interval_fact_input(row, "diff_fact"),
     )
 
 
@@ -931,10 +996,40 @@ def load_heat_metric_input(connection: sqlite3.Connection, source_heat_id: int) 
                    c.best_sectors_json,c.last_speeds_json,c.gap_ms,c.gap_raw,c.gap_kind,c.diff_ms,
                    c.diff_raw,c.diff_kind,c.sector_json,c.speed_kph,c.pit_time_raw,c.provider_pit_count,
                    c.source_message_id AS state_source_message_id,c.source_key AS state_source_key,
-                   c.updated_at_us AS state_updated_at_us
+                   c.updated_at_us AS state_updated_at_us,
+                   gap_fact.id AS gap_fact_id,gap_fact.interval_kind AS gap_fact_interval_kind,
+                   gap_fact.raw_value AS gap_fact_raw_value,gap_fact.interval_ms AS gap_fact_interval_ms,
+                   gap_fact.value_kind AS gap_fact_value_kind,
+                   gap_fact.source_cell_observation_id AS gap_fact_source_cell_observation_id,
+                   gap_fact.source_message_id AS gap_fact_source_message_id,gap_fact.source_key AS gap_fact_source_key,
+                   gap_fact.source_change_ordinal AS gap_fact_source_change_ordinal,
+                   gap_fact.observed_at_us AS gap_fact_observed_at_us,gap_fact.source_handle AS gap_fact_source_handle,
+                   gap_fact.observation_kind AS gap_fact_observation_kind,
+                   gap_fact.source_position_overall AS gap_fact_source_position_overall,
+                   gap_fact.source_state_kind AS gap_fact_source_state_kind,gap_fact.source_laps AS gap_fact_source_laps,
+                   gap_fact.target_participant_id AS gap_fact_target_participant_id,
+                   gap_fact.target_position_overall AS gap_fact_target_position_overall,
+                   gap_fact.target_state_kind AS gap_fact_target_state_kind,gap_fact.target_laps AS gap_fact_target_laps,
+                   gap_fact.relation_kind AS gap_fact_relation_kind,
+                   diff_fact.id AS diff_fact_id,diff_fact.interval_kind AS diff_fact_interval_kind,
+                   diff_fact.raw_value AS diff_fact_raw_value,diff_fact.interval_ms AS diff_fact_interval_ms,
+                   diff_fact.value_kind AS diff_fact_value_kind,
+                   diff_fact.source_cell_observation_id AS diff_fact_source_cell_observation_id,
+                   diff_fact.source_message_id AS diff_fact_source_message_id,diff_fact.source_key AS diff_fact_source_key,
+                   diff_fact.source_change_ordinal AS diff_fact_source_change_ordinal,
+                   diff_fact.observed_at_us AS diff_fact_observed_at_us,diff_fact.source_handle AS diff_fact_source_handle,
+                   diff_fact.observation_kind AS diff_fact_observation_kind,
+                   diff_fact.source_position_overall AS diff_fact_source_position_overall,
+                   diff_fact.source_state_kind AS diff_fact_source_state_kind,diff_fact.source_laps AS diff_fact_source_laps,
+                   diff_fact.target_participant_id AS diff_fact_target_participant_id,
+                   diff_fact.target_position_overall AS diff_fact_target_position_overall,
+                   diff_fact.target_state_kind AS diff_fact_target_state_kind,diff_fact.target_laps AS diff_fact_target_laps,
+                   diff_fact.relation_kind AS diff_fact_relation_kind
             FROM participants p
             LEFT JOIN participant_state_current c
               ON c.source_heat_id = p.source_heat_id AND c.participant_id = p.id
+            LEFT JOIN participant_interval_source_facts AS gap_fact ON gap_fact.id = c.gap_interval_fact_id
+            LEFT JOIN participant_interval_source_facts AS diff_fact ON diff_fact.id = c.diff_interval_fact_id
             WHERE p.source_heat_id = ?
             ORDER BY p.id
             """,

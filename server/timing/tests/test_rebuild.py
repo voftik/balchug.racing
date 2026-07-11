@@ -7,6 +7,7 @@ from pathlib import Path
 
 from timing.db import connect
 from timing.importer import import_recording
+from timing.read_api import TimingReadModel
 from timing.rebuild import RebuildError, plan_rebuild, rebuild_session
 from timing.sse import read_cursor_window
 
@@ -84,6 +85,62 @@ class TimingRebuildTests(unittest.TestCase):
         ]
         self.events.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
 
+    def _write_interval_recording(self, path):
+        """Record a complete current result grid followed by source deltas."""
+
+        headers = ("POS", "NR", "STATE", "TEAM", "CLS", "PIC", "LAPS", "GAP", "DIFF", "LAST")
+
+        def initial_grid(lap, leader_last, balchug_last):
+            rows = []
+            leader = ("1", "9", "E1000000", "Про Моторспорт", "CN PRO", "1", str(lap), "0.000", None, str(leader_last))
+            balchug = ("2", "21", "E1000000", "BALCHUG Racing", "CN PRO", "2", str(lap), "1.246", "1.246", str(balchug_last))
+            for row_index, values in enumerate((leader, balchug)):
+                rows.extend([row_index, column, value] for column, value in enumerate(values) if value is not None)
+            return {"l": {"h": [{"n": header} for header in headers]}, "r": rows}
+
+        def result_delta(lap, leader_last, balchug_last):
+            changes = []
+            for row_index, values in enumerate(
+                (
+                    ((6, str(lap)), (7, "0.000"), (9, str(leader_last))),
+                    ((6, str(lap)), (7, "1.246"), (8, "1.246"), (9, str(balchug_last))),
+                )
+            ):
+                changes.extend([row_index, column, value] for column, value in values)
+            return changes
+
+        frames = [
+            {
+                "M": [
+                    ["h_i", {"n": "Practice", "s": 1_000_000, "f": 6}],
+                    ["s_i", 1_000_000],
+                    ["r_i", initial_grid(8, 107_000_000, 108_000_000)],
+                ]
+            }
+        ]
+        for offset, lap in enumerate((9, 10, 11), start=1):
+            frames.append(
+                {
+                    "M": [
+                        ["s_t", 1_000_000 + offset * 120_000_000],
+                        ["r_c", result_delta(lap, 107_000_000 + offset * 100_000, 108_000_000 + offset * 100_000)],
+                    ]
+                }
+            )
+        records = [{"v": 1, "kind": "connected", "received_at": "2000-01-01T03:00:01Z", "monotonic_ns": 1}]
+        for index, frame in enumerate(frames, start=1):
+            records.append(
+                {
+                    "v": 1,
+                    "kind": "frame",
+                    "received_at": f"2000-01-01T03:0{index}:01Z",
+                    "monotonic_ns": index + 1,
+                    "sequence": index,
+                    "text_b64": base64.b64encode(json.dumps(frame, separators=(",", ":")).encode()).decode(),
+                }
+            )
+        path.write_text("\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8")
+
     def test_rebuilds_stopped_session_from_unchanged_raw_frames(self):
         reader = connect(self.database, readonly=True)
         try:
@@ -137,6 +194,74 @@ class TimingRebuildTests(unittest.TestCase):
             self.assertIsNone(reader.execute("PRAGMA foreign_key_check").fetchone())
         finally:
             reader.close()
+
+    def test_rebuild_preserves_source_proven_interval_relation_from_raw_result_grid(self):
+        events = self.root / "interval-events.ndjson"
+        database = self.root / "interval-timing.db"
+        self._write_interval_recording(events)
+        session_id = import_recording(database, events)
+
+        result = rebuild_session(database, session_id)
+        self.assertEqual(result.frames_replayed, 4)
+
+        reader = connect(database, readonly=True)
+        try:
+            current = reader.execute(
+                """
+                SELECT gap_fact.interval_kind AS gap_kind,gap_fact.raw_value AS gap_raw,
+                       gap_fact.interval_ms AS gap_ms,gap_fact.value_kind AS gap_value_kind,
+                       gap_fact.source_cell_observation_id AS gap_cell_id,
+                       gap_fact.source_handle AS gap_handle,gap_fact.observation_kind AS gap_observation_kind,
+                       gap_fact.source_position_overall AS gap_subject_position,
+                       gap_fact.source_laps AS gap_subject_laps,
+                       gap_target.start_number AS gap_target_number,
+                       gap_fact.target_position_overall AS gap_target_position,
+                       gap_fact.target_laps AS gap_target_laps,
+                       gap_fact.relation_kind AS gap_relation_kind,
+                       diff_fact.interval_kind AS diff_kind,diff_fact.interval_ms AS diff_ms,
+                       diff_fact.source_cell_observation_id AS diff_cell_id,
+                       diff_fact.source_handle AS diff_handle,diff_fact.observation_kind AS diff_observation_kind
+                FROM participant_state_current AS state
+                JOIN participants AS participant ON participant.id = state.participant_id
+                JOIN participant_interval_source_facts AS gap_fact ON gap_fact.id = state.gap_interval_fact_id
+                JOIN participants AS gap_target ON gap_target.id = gap_fact.target_participant_id
+                JOIN participant_interval_source_facts AS diff_fact ON diff_fact.id = state.diff_interval_fact_id
+                WHERE participant.start_number = '21'
+                """
+            ).fetchone()
+            self.assertIsNotNone(current)
+            self.assertEqual(
+                (
+                    current["gap_kind"], current["gap_raw"], current["gap_ms"], current["gap_value_kind"],
+                    current["gap_handle"], current["gap_observation_kind"], current["gap_subject_position"],
+                    current["gap_subject_laps"], current["gap_target_number"], current["gap_target_position"],
+                    current["gap_target_laps"], current["gap_relation_kind"], current["diff_kind"], current["diff_ms"],
+                    current["diff_handle"], current["diff_observation_kind"],
+                ),
+                (
+                    "GAP", "1.246", 1_246, "TIME", "r_c", "DELTA", 2, 11,
+                    "9", 1, 11, "OVERALL_LEADER", "DIFF", 1_246, "r_c", "DELTA",
+                ),
+            )
+            self.assertIsNotNone(current["gap_cell_id"])
+            self.assertIsNotNone(current["diff_cell_id"])
+            observed_at_us = reader.execute("SELECT MAX(observed_at_us) FROM playback_snapshots").fetchone()[0]
+            self.assertIsNotNone(observed_at_us)
+        finally:
+            reader.close()
+
+        archive = TimingReadModel(database).archive_snapshot(session_id, at_us=observed_at_us)["snapshot"]["archive_intervals"]
+        relation = archive["relations"]["class_leader"]
+        self.assertEqual((relation["status"], relation["value_ms"], relation["relation_kind"]), ("VALID", 1_246, "GAP_TO_OVERALL_LEADER"))
+        self.assertEqual((relation["ours_state_kind"], relation["target_state_kind"], relation["ours_laps"], relation["target_laps"]), ("ON_TRACK", "ON_TRACK", 11, 11))
+        self.assertEqual(len(relation["source_facts"]), 1)
+        source = relation["source_facts"][0]
+        self.assertEqual(
+            (source["field_kind"], source["raw_value"], source["value_ms"], source["value_kind"], source["source_handle"], source["observation_kind"]),
+            ("GAP", "1.246", 1_246, "TIME", "r_c", "DELTA"),
+        )
+        self.assertEqual(source["cell_observation_id"], current["gap_cell_id"])
+        self.assertEqual(archive["gap_to_class_leader_ms"], 1_246)
 
     def test_rejects_an_active_session_before_mutating_raw_or_derived_data(self):
         writer = connect(self.database)

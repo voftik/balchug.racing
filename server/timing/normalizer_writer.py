@@ -79,6 +79,17 @@ class ResultCellFact:
     value_text: str | None
     source_message_id: int
     source_key: str
+    source_change_ordinal: int
+
+
+@dataclass(frozen=True)
+class IntervalSourceFact:
+    """One exact GAP or DIFF cell retained independently from the grid cache."""
+
+    id: int
+    raw_value: str | None
+    interval_ms: int | None
+    value_kind: str | None
 
 
 @dataclass(frozen=True)
@@ -742,6 +753,11 @@ class TimingNormalizer:
                 },
             )
             changed_rows.add(row_index)
+        # Resolve identities for every changed row before interval facts are
+        # written. A GAP/DIFF cell may refer to another row which appears
+        # later in the same atomic provider message.
+        for row_index in sorted(changed_rows):
+            self._participant_for_row(connection, context, row_index)
         for row_index in sorted(changed_rows):
             self._write_row_state(connection, context, row_index, layout_id)
 
@@ -763,7 +779,7 @@ class TimingNormalizer:
         rows = connection.execute(
             """
             SELECT definition.canonical_key,observation.id,observation.value_text,
-                   observation.source_message_id,observation.source_key
+                   observation.source_message_id,observation.source_key,observation.source_change_ordinal
             FROM participant_result_cell_observations AS observation
             JOIN result_column_definitions AS definition
               ON definition.layout_version_id = observation.layout_version_id
@@ -771,7 +787,7 @@ class TimingNormalizer:
             WHERE observation.source_heat_id = ?
               AND observation.participant_id = ?
               AND observation.source_message_id = ?
-              AND definition.canonical_key IN ('state','pit_stops','pit_time','driver_stint','laps')
+              AND definition.canonical_key IN ('state','pit_stops','pit_time','driver_stint','laps','gap','diff')
             ORDER BY definition.canonical_key,observation.id
             """,
             (self.heat_id, participant_id, source_message_id),
@@ -791,8 +807,178 @@ class TimingNormalizer:
                 value_text=value["value_text"],
                 source_message_id=int(value["source_message_id"]),
                 source_key=value["source_key"],
+                source_change_ordinal=int(value["source_change_ordinal"]),
             )
         return result
+
+    def _interval_target_context(
+        self,
+        connection: sqlite3.Connection,
+        context: FrameMessage,
+        *,
+        participant_id: str,
+        interval_kind: str,
+        row: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Resolve only a source-time absolute target from the atomic grid.
+
+        Time Service GAP is relative to the unique overall leader; DIFF is
+        relative to the unique overall row directly ahead. The provider does
+        not encode a target in the cell itself, so ambiguity stays explicit
+        rather than being inferred later from a changed current position.
+        """
+
+        subject_position = _integer(row.get("position_overall"), minimum=1)
+        if interval_kind == "GAP":
+            target_position = 1
+            relation_kind = "OVERALL_LEADER"
+        elif interval_kind == "DIFF" and subject_position is not None and subject_position > 1:
+            target_position = subject_position - 1
+            relation_kind = "OVERALL_AHEAD"
+        else:
+            return {
+                "relation_kind": None,
+                "target_participant_id": None,
+                "target_position_overall": None,
+                "target_state_kind": None,
+                "target_laps": None,
+            }
+
+        candidates: list[tuple[int, Mapping[str, Any]]] = []
+        for target_row_index, target_row in self.grid.all_rows().items():
+            if _integer(target_row.get("position_overall"), minimum=1) == target_position:
+                candidates.append((target_row_index, target_row))
+        if len(candidates) != 1:
+            return {
+                "relation_kind": None,
+                "target_participant_id": None,
+                "target_position_overall": None,
+                "target_state_kind": None,
+                "target_laps": None,
+            }
+        target_row_index, target_row = candidates[0]
+        target_participant_id = self._participant_for_row(connection, context, target_row_index)
+        if target_participant_id is None:
+            return {
+                "relation_kind": None,
+                "target_participant_id": None,
+                "target_position_overall": None,
+                "target_state_kind": None,
+                "target_laps": None,
+            }
+        target_state = parse_result_state(target_row.get("state")) if "state" in target_row else ResultState(raw=None, kind="UNKNOWN")
+        return {
+            "relation_kind": relation_kind,
+            "target_participant_id": target_participant_id,
+            "target_position_overall": target_position,
+            "target_state_kind": target_state.kind,
+            "target_laps": _integer(target_row.get("laps"), minimum=0),
+        }
+
+    def _interval_source_fact(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        context: FrameMessage,
+        participant_id: str,
+        row_index: int,
+        layout_id: int,
+        interval_kind: str,
+        cell: ResultCellFact | None,
+        row: Mapping[str, Any],
+        state_kind: str,
+    ) -> IntervalSourceFact | None:
+        """Persist one exact GAP/DIFF cell and return its immutable fact.
+
+        GAP and DIFF are sparse display cells.  A value currently present in
+        ``row`` can be an older materialized value, so this method intentionally
+        accepts only an unambiguous cell changed by the current source message.
+        The accompanying position/lap/state values and target are resolved
+        from the same fully applied source grid message. They are never
+        inferred from a later current projection.
+        """
+
+        if cell is None:
+            return None
+        interval_ms = _gap_ms(cell.value_text)
+        target_context = self._interval_target_context(
+            connection,
+            context,
+            participant_id=participant_id,
+            interval_kind=interval_kind,
+            row=row,
+        )
+        _insert_ignore(
+            connection,
+            "participant_interval_source_facts",
+            {
+                "source_heat_id": self.heat_id,
+                "participant_id": participant_id,
+                "interval_kind": interval_kind,
+                "raw_value": cell.value_text,
+                "interval_ms": interval_ms,
+                "value_kind": "TIME" if interval_ms is not None else None,
+                "source_cell_observation_id": cell.id,
+                "source_message_id": cell.source_message_id,
+                "source_key": cell.source_key,
+                "source_change_ordinal": cell.source_change_ordinal,
+                "source_handle": context.handle,
+                "observation_kind": "DELTA" if context.handle == "r_c" else "SNAPSHOT_BASELINE",
+                "observed_at_us": context.received_at_us,
+                "source_layout_version_id": layout_id,
+                "source_provider_row_index": row_index,
+                "source_position_overall": _integer(row.get("position_overall"), minimum=0),
+                "source_position_class": _integer(row.get("position_class"), minimum=0),
+                "source_laps": _integer(row.get("laps"), minimum=0),
+                "source_state_kind": state_kind,
+                **target_context,
+                "created_at_us": now_us(),
+            },
+        )
+        fact = connection.execute(
+            """
+            SELECT id,raw_value,interval_ms,value_kind
+            FROM participant_interval_source_facts
+            WHERE source_cell_observation_id = ?
+            """,
+            (cell.id,),
+        ).fetchone()
+        if fact is None:
+            raise NormalizerError("Interval source fact was not persisted")
+        return IntervalSourceFact(
+            id=int(fact["id"]),
+            raw_value=fact["raw_value"],
+            interval_ms=fact["interval_ms"],
+            value_kind=fact["value_kind"],
+        )
+
+    @staticmethod
+    def _current_interval_source_fact(
+        connection: sqlite3.Connection,
+        current: sqlite3.Row | None,
+        *,
+        pointer_column: str,
+    ) -> IntervalSourceFact | None:
+        """Load the current interval only through its append-only fact pointer."""
+
+        if current is None or current[pointer_column] is None:
+            return None
+        fact = connection.execute(
+            """
+            SELECT id,raw_value,interval_ms,value_kind
+            FROM participant_interval_source_facts
+            WHERE id = ?
+            """,
+            (current[pointer_column],),
+        ).fetchone()
+        if fact is None:
+            raise NormalizerError("Current interval fact pointer is dangling")
+        return IntervalSourceFact(
+            id=int(fact["id"]),
+            raw_value=fact["raw_value"],
+            interval_ms=fact["interval_ms"],
+            value_kind=fact["value_kind"],
+        )
 
     def _participant_for_row(self, connection: sqlite3.Connection, context: FrameMessage, row_index: int) -> str | None:
         row = self.grid.row_values(row_index)
@@ -1118,10 +1304,46 @@ class TimingNormalizer:
         pit_time_cell = event_cells.get("pit_time")
         driver_stint_cell = event_cells.get("driver_stint")
         lap_cell = event_cells.get("laps")
+        gap_cell = event_cells.get("gap")
+        diff_cell = event_cells.get("diff")
         event_state = parse_result_state(state_cell.value_text) if state_cell is not None else None
         event_pit_count = _integer(pit_count_cell.value_text, minimum=0) if pit_count_cell is not None else None
         event_driver_stint = _parse_driver_stint(driver_stint_cell.value_text) if driver_stint_cell is not None else None
         current_driver_stint = _parse_driver_stint(row.get("driver_stint"))
+        gap_fact = self._interval_source_fact(
+            connection,
+            context=context,
+            participant_id=participant_id,
+            row_index=row_index,
+            layout_id=layout_id,
+            interval_kind="GAP",
+            cell=gap_cell,
+            row=row,
+            state_kind=current_state.kind,
+        )
+        if gap_fact is None:
+            gap_fact = self._current_interval_source_fact(
+                connection,
+                old,
+                pointer_column="gap_interval_fact_id",
+            )
+        diff_fact = self._interval_source_fact(
+            connection,
+            context=context,
+            participant_id=participant_id,
+            row_index=row_index,
+            layout_id=layout_id,
+            interval_kind="DIFF",
+            cell=diff_cell,
+            row=row,
+            state_kind=current_state.kind,
+        )
+        if diff_fact is None:
+            diff_fact = self._current_interval_source_fact(
+                connection,
+                old,
+                pointer_column="diff_interval_fact_id",
+            )
         # A reconnect r_i repeats every visible cell. Treat an unchanged
         # L-PIT value as display state, not a new duration fact for an exit.
         # A repeated value in an explicit r_c is still a fresh source event:
@@ -1213,12 +1435,14 @@ class TimingNormalizer:
                 "last_sectors_json": _json(sectors),
                 "best_sectors_json": None,
                 "last_speeds_json": None,
-                "gap_ms": _gap_ms(row.get("gap")),
-                "gap_raw": _text(row.get("gap")),
-                "gap_kind": "TIME" if _gap_ms(row.get("gap")) is not None else None,
-                "diff_ms": _gap_ms(row.get("diff")),
-                "diff_raw": _text(row.get("diff")),
-                "diff_kind": "TIME" if _gap_ms(row.get("diff")) is not None else None,
+                "gap_ms": gap_fact.interval_ms if gap_fact is not None else None,
+                "gap_raw": gap_fact.raw_value if gap_fact is not None else None,
+                "gap_kind": gap_fact.value_kind if gap_fact is not None else None,
+                "diff_ms": diff_fact.interval_ms if diff_fact is not None else None,
+                "diff_raw": diff_fact.raw_value if diff_fact is not None else None,
+                "diff_kind": diff_fact.value_kind if diff_fact is not None else None,
+                "gap_interval_fact_id": gap_fact.id if gap_fact is not None else None,
+                "diff_interval_fact_id": diff_fact.id if diff_fact is not None else None,
                 "sector_json": _json(sectors),
                 "speed_kph": _number(row.get("speed")),
                 "pit_time_raw": current_pit_time_raw,

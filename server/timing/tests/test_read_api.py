@@ -273,6 +273,44 @@ class TimingReadModelTests(unittest.TestCase):
             cell_ids.append(self.connection.execute("SELECT last_insert_rowid()").fetchone()[0])
         return cell_ids
 
+    def _add_interval_source_fact(self, *, raw_value, interval_ms, observed_at_us):
+        """Seed one exact current GAP cell independently of cached state."""
+
+        cell_id = self._add_result_last_cells([("r_c", raw_value, observed_at_us)])[0]
+        cell = self.connection.execute(
+            """
+            SELECT layout_version_id,provider_row_index,source_message_id,source_key,source_change_ordinal
+            FROM participant_result_cell_observations
+            WHERE id = ?
+            """,
+            (cell_id,),
+        ).fetchone()
+        self.connection.execute(
+            """
+            INSERT INTO participant_interval_source_facts(
+              source_heat_id,participant_id,interval_kind,raw_value,interval_ms,value_kind,
+              source_cell_observation_id,source_message_id,source_key,source_change_ordinal,
+              source_handle,observation_kind,observed_at_us,source_layout_version_id,
+              source_provider_row_index,source_position_overall,source_position_class,
+              source_laps,source_state_kind,created_at_us
+            ) VALUES (?,'ours','GAP',?,?,'TIME',?,?,?,?,'r_c','DELTA',?,?,?,4,1,12,'ON_TRACK',?)
+            """,
+            (
+                self.heat_id,
+                raw_value,
+                interval_ms,
+                cell_id,
+                cell["source_message_id"],
+                cell["source_key"],
+                cell["source_change_ordinal"],
+                observed_at_us,
+                cell["layout_version_id"],
+                cell["provider_row_index"],
+                observed_at_us,
+            ),
+        )
+        return self.connection.execute("SELECT last_insert_rowid()").fetchone()[0], cell_id
+
     def test_snapshot_exposes_source_facts_metrics_freshness_and_stream_barrier(self):
         snapshot = self.model.snapshot("session-1").as_dict()
 
@@ -292,6 +330,49 @@ class TimingReadModelTests(unittest.TestCase):
         self.assertEqual(snapshot["cursor"], snapshot["barrier"])
         self.assertEqual(snapshot["cursor"]["stream_event_id"], 1)
         self.assertTrue(snapshot["system_assumption"]["tyre_change_on_confirmed_pit_out"])
+
+    def test_snapshot_interval_scalars_come_only_from_their_exact_source_facts(self):
+        self.connection.execute(
+            """
+            UPDATE participant_state_current
+            SET gap_ms = 99_999,gap_raw = '99.999',gap_kind = 'TIME',
+                diff_ms = 88_888,diff_raw = '88.888',diff_kind = 'TIME'
+            WHERE source_heat_id = ? AND participant_id = 'ours'
+            """,
+            (self.heat_id,),
+        )
+        self.connection.commit()
+
+        no_fact_state = self.model.snapshot("session-1").as_dict()["measured"]["participants"][0]["state"]
+        self.assertIsNone(no_fact_state["gap_ms"])
+        self.assertIsNone(no_fact_state["gap_raw"])
+        self.assertIsNone(no_fact_state["diff_ms"])
+        self.assertIsNone(no_fact_state["diff_raw"])
+        self.assertIsNone(no_fact_state["gap_source_fact"])
+
+        fact_id, cell_id = self._add_interval_source_fact(
+            raw_value="1.246",
+            interval_ms=1_246,
+            observed_at_us=12_500_000,
+        )
+        self.connection.execute(
+            """
+            UPDATE participant_state_current
+            SET gap_interval_fact_id = ?
+            WHERE source_heat_id = ? AND participant_id = 'ours'
+            """,
+            (fact_id, self.heat_id),
+        )
+        self.connection.commit()
+
+        state = self.model.snapshot("session-1").as_dict()["measured"]["participants"][0]["state"]
+        self.assertEqual((state["gap_ms"], state["gap_raw"], state["gap_kind"]), (1_246, "1.246", "TIME"))
+        self.assertEqual(state["gap_source_fact"]["id"], fact_id)
+        self.assertEqual(state["gap_source_fact"]["cell_observation_id"], cell_id)
+        self.assertEqual(state["gap_source_fact"]["source_handle"], "r_c")
+        self.assertEqual(state["gap_source_fact"]["observed_at_us"], 12_500_000)
+        self.assertIsNone(state["diff_ms"])
+        self.assertIsNone(state["diff_source_fact"])
 
     def test_terminal_and_open_gap_overrides_are_explicit(self):
         self.connection.execute(
@@ -463,7 +544,7 @@ class TimingReadModelTests(unittest.TestCase):
         with self.assertRaises(ReadValidationError):
             self.model.archive_snapshot("session-1", at_us=1_999_999)
 
-    def test_archive_intervals_rederive_source_gap_without_source_laps(self):
+    def test_archive_intervals_do_not_synthesize_a_legacy_source_gap(self):
         self.connection.execute("UPDATE analysis_sessions SET lifecycle = 'stopped' WHERE id = 'session-1'")
 
         def participant(participant_id, position, source_laps, gap_ms, *, ours=False):
@@ -501,8 +582,8 @@ class TimingReadModelTests(unittest.TestCase):
                         "class_leader_id": "ours",
                         "class_ahead_id": None,
                         "class_behind_id": "behind",
-                        # This is the old immutable materialization.  The
-                        # reader must derive the source interval separately.
+                        # This legacy projection retains cached grid values,
+                        # but not source-bound interval provenance.
                         "gap_to_behind_ms": None,
                         "lap_delta_to_behind": 10,
                     },
@@ -522,13 +603,98 @@ class TimingReadModelTests(unittest.TestCase):
         explicit = manifest["keyframes"][1]["snapshot"]["archive_intervals"]
 
         self.assertEqual(partial["lap_count_scope"], "capture_tracker")
-        self.assertEqual(partial["gap_to_behind_ms"], 1_246)
+        self.assertEqual(partial["relations"]["class_behind"]["status"], "UNAVAILABLE_PROVENANCE")
+        self.assertEqual(partial["relations"]["class_behind"]["source_facts"], [])
+        self.assertIsNone(partial["gap_to_behind_ms"])
         self.assertIsNone(partial["lap_delta_to_behind"])
         self.assertEqual(explicit["lap_count_scope"], "source_grid")
+        self.assertEqual(explicit["relations"]["class_behind"]["status"], "UNAVAILABLE_PROVENANCE")
         self.assertIsNone(explicit["gap_to_behind_ms"])
         self.assertEqual(explicit["lap_delta_to_behind"], 10)
 
-    def test_archive_intervals_hide_gap_when_relation_participant_is_in_pit(self):
+    def test_archive_intervals_preserve_engine_relation_provenance(self):
+        self.connection.execute("UPDATE analysis_sessions SET lifecycle = 'stopped' WHERE id = 'session-1'")
+        source_fact = {
+            "id": 17,
+            "field_kind": "GAP",
+            "raw_value": "1.246",
+            "value_ms": 1_246,
+            "value_kind": "TIME",
+            "cell_observation_id": 71,
+            "source_message_id": 23,
+            "source_key": "r_c:23",
+            "source_change_ordinal": 4,
+            "observed_at_us": 2_000_000,
+            "source_handle": "r_c",
+            "observation_kind": "DELTA",
+            "subject_position_overall": 2,
+            "subject_state_kind": "ON_TRACK",
+            "subject_laps": 12,
+            "target_participant_id": "ours",
+            "target_position_overall": 1,
+            "target_state_kind": "ON_TRACK",
+            "target_laps": 12,
+            "relation_kind": "OVERALL_LEADER",
+        }
+        payload = {
+            "schema_version": "timing-archive.v1",
+            "observed_at_us": 2_000_000,
+            "measured": {"track_flag": {"flag": "GREEN"}},
+            "computed": {
+                "session": {
+                    "ours_participant_id": "ours",
+                    "class_leader_id": "ours",
+                    "class_ahead_id": None,
+                    "class_behind_id": "behind",
+                    # A stale compatibility scalar must not override the
+                    # structured relation below.
+                    "gap_to_behind_ms": 99_999,
+                    "relation_intervals": {
+                        "class_behind": {
+                            "target_participant_id": "behind",
+                            "status": "VALID",
+                            "value_ms": 1_246,
+                            "relation_kind": "GAP_PAIR_COMMON_OVERALL_LEADER",
+                            "source_facts": [source_fact],
+                            "source_observed_at_us": 2_000_000,
+                            "source_age_ms": 0,
+                            "ours_state_kind": "ON_TRACK",
+                            "target_state_kind": "ON_TRACK",
+                            "ours_laps": 12,
+                            "target_laps": 12,
+                        },
+                    },
+                },
+            },
+            "class_participants": [
+                {
+                    "measured": {
+                        "participant_id": "ours",
+                        "is_ours": True,
+                        "state": {"position_overall": 1, "laps": 12, "state_kind": "ON_TRACK"},
+                    },
+                    "computed": {"participant_id": "ours", "position_overall": 1},
+                },
+                {
+                    "measured": {
+                        "participant_id": "behind",
+                        "state": {"position_overall": 2, "laps": 12, "state_kind": "ON_TRACK"},
+                    },
+                    "computed": {"participant_id": "behind", "position_overall": 2},
+                },
+            ],
+        }
+        self._add_playback_snapshot(2_000_000, payload)
+        self.connection.commit()
+
+        intervals = self.model.archive_snapshot("session-1", at_us=2_000_000)["snapshot"]["archive_intervals"]
+        relation = intervals["relations"]["class_behind"]
+        self.assertEqual((relation["status"], relation["value_ms"]), ("VALID", 1_246))
+        self.assertEqual(relation["relation_kind"], "GAP_PAIR_COMMON_OVERALL_LEADER")
+        self.assertEqual(relation["source_facts"], [source_fact])
+        self.assertEqual(intervals["gap_to_behind_ms"], 1_246)
+
+    def test_archive_intervals_preserve_non_racing_engine_status_without_raw_fallback(self):
         self.connection.execute("UPDATE analysis_sessions SET lifecycle = 'stopped' WHERE id = 'session-1'")
         payload = {
             "schema_version": "timing-archive.v1",
@@ -540,6 +706,21 @@ class TimingReadModelTests(unittest.TestCase):
                     "class_leader_id": "ours",
                     "class_ahead_id": None,
                     "class_behind_id": "behind",
+                    "relation_intervals": {
+                        "class_behind": {
+                            "target_participant_id": "behind",
+                            "status": "NON_RACING_STATE",
+                            "value_ms": None,
+                            "relation_kind": None,
+                            "source_facts": [],
+                            "source_observed_at_us": None,
+                            "source_age_ms": None,
+                            "ours_state_kind": "ON_TRACK",
+                            "target_state_kind": "IN_PIT",
+                            "ours_laps": 12,
+                            "target_laps": 12,
+                        },
+                    },
                 },
             },
             "class_participants": [
@@ -564,6 +745,9 @@ class TimingReadModelTests(unittest.TestCase):
         self.connection.commit()
 
         snapshot = self.model.archive_snapshot("session-1", at_us=2_000_000)
+        relation = snapshot["snapshot"]["archive_intervals"]["relations"]["class_behind"]
+        self.assertEqual(relation["status"], "NON_RACING_STATE")
+        self.assertIsNone(relation["value_ms"])
         self.assertIsNone(snapshot["snapshot"]["archive_intervals"]["gap_to_behind_ms"])
 
     def test_archive_comparison_returns_one_bounded_competitor_benchmark(self):

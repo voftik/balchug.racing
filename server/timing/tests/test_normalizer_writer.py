@@ -1353,6 +1353,99 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         )
         gap = self.connection.execute("SELECT gap_raw,gap_ms,gap_kind FROM participant_state_current").fetchone()
         self.assertEqual(tuple(gap), ("1 lap", None, None))
+        fact = self.connection.execute(
+            """
+            SELECT id,interval_kind,raw_value,interval_ms,value_kind,source_cell_observation_id
+            FROM participant_interval_source_facts
+            """
+        ).fetchone()
+        self.assertEqual(tuple(fact)[1:5], ("GAP", "1 lap", None, None))
+        self.assertIsNotNone(fact["source_cell_observation_id"])
+        self.assertEqual(
+            self.connection.execute("SELECT gap_interval_fact_id FROM participant_state_current").fetchone()[0],
+            fact["id"],
+        )
+
+    def test_interval_facts_follow_exact_gap_and_diff_cells_not_cached_grid_values(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 91_000_000
+        self.apply(
+            [
+                [
+                    "r_i",
+                    {
+                        "l": {
+                            "h": [
+                                {"n": "POS"}, {"n": "NR"}, {"n": "TEAM"}, {"n": "CLS"},
+                                {"n": "STATE"}, {"n": "LAPS"}, {"n": "GAP"}, {"n": "DIFF"}, {"n": "PIC"},
+                            ]
+                        },
+                        "r": [
+                            [0, 0, "2"], [0, 1, "21"], [0, 2, "BALCHUG Racing"], [0, 3, "CN PRO"],
+                            [0, 4, "E91000000"], [0, 5, "11"], [0, 6, "1.246"], [0, 7, "0.120"], [0, 8, "1"],
+                            [1, 0, "1"], [1, 1, "9"], [1, 2, "Про Моторспорт"], [1, 3, "CN PRO"],
+                            [1, 4, "E91000000"], [1, 5, "11"], [1, 8, "1"],
+                        ],
+                    },
+                ]
+            ],
+            received_at_us=received,
+        )
+        current = self.connection.execute(
+            """
+            SELECT gap_interval_fact_id,diff_interval_fact_id,gap_raw,gap_ms,gap_kind,diff_raw,diff_ms,diff_kind
+            FROM participant_state_current
+            """
+        ).fetchone()
+        first_gap_id = current["gap_interval_fact_id"]
+        first_diff_id = current["diff_interval_fact_id"]
+        self.assertIsNotNone(first_gap_id)
+        self.assertIsNotNone(first_diff_id)
+        self.assertEqual(tuple(current)[2:], ("1.246", 1246, "TIME", "0.120", 120, "TIME"))
+        facts = self.connection.execute(
+            """
+            SELECT interval_kind,raw_value,interval_ms,value_kind,source_position_overall,
+                   source_position_class,source_laps,source_state_kind,relation_kind,
+                   target.start_number AS target_start_number,target_position_overall,
+                   target_state_kind,target_laps
+            FROM participant_interval_source_facts AS fact
+            LEFT JOIN participants AS target ON target.id = fact.target_participant_id
+            ORDER BY fact.id
+            """
+        ).fetchall()
+        self.assertEqual(
+            [tuple(fact) for fact in facts],
+            [
+                ("GAP", "1.246", 1246, "TIME", 2, 1, 11, "ON_TRACK", "OVERALL_LEADER", "9", 1, "ON_TRACK", 11),
+                ("DIFF", "0.120", 120, "TIME", 2, 1, 11, "ON_TRACK", "OVERALL_AHEAD", "9", 1, "ON_TRACK", 11),
+            ],
+        )
+
+        # STATE updates materialize the same visible GAP/DIFF text, but no
+        # interval source cell changed.  Current pointers and facts must stay
+        # untouched instead of treating the cached grid values as new facts.
+        self.apply([['r_c', [[0, 4, 'E91001000']]]], received_at_us=received + 1_000_000)
+        cached = self.connection.execute(
+            """
+            SELECT gap_interval_fact_id,diff_interval_fact_id,gap_raw,gap_ms,diff_raw,diff_ms
+            FROM participant_state_current
+            """
+        ).fetchone()
+        self.assertEqual(tuple(cached), (first_gap_id, first_diff_id, "1.246", 1246, "0.120", 120))
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM participant_interval_source_facts").fetchone()[0], 2)
+
+        # A new GAP cell is a new source fact even if its displayed text is
+        # unchanged.  DIFF still points to its original exact source cell.
+        self.apply([['r_c', [[0, 6, '1.246']]]], received_at_us=received + 2_000_000)
+        refreshed = self.connection.execute(
+            """
+            SELECT gap_interval_fact_id,diff_interval_fact_id,gap_raw,gap_ms,diff_raw,diff_ms
+            FROM participant_state_current
+            """
+        ).fetchone()
+        self.assertNotEqual(refreshed["gap_interval_fact_id"], first_gap_id)
+        self.assertEqual(refreshed["diff_interval_fact_id"], first_diff_id)
+        self.assertEqual(tuple(refreshed)[2:], ("1.246", 1246, "0.120", 120))
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM participant_interval_source_facts").fetchone()[0], 3)
 
 
 if __name__ == "__main__":

@@ -498,6 +498,126 @@ class MetricStoreTests(unittest.TestCase):
         with self.assertRaises(AttributeError):
             snapshot.participants.append(ours)
 
+    def test_loads_current_gap_and_diff_from_immutable_interval_fact_pointers(self):
+        """A later row update must not erase GAP/DIFF cell provenance."""
+
+        layout_id = int(
+            self.connection.execute(
+                """
+                INSERT INTO result_layout_versions(
+                  source_heat_id,version_ordinal,layout_fingerprint,raw_layout_json,
+                  source_key,observed_at_us,created_at_us
+                ) VALUES (?,0,'interval-provenance','{}','result:91',91000000,91000000)
+                RETURNING id
+                """,
+                (self.source_heat_id,),
+            ).fetchone()[0]
+        )
+        self.connection.executemany(
+            """
+            INSERT INTO result_column_definitions(
+              layout_version_id,column_index,source_name_raw,source_parameter_raw,
+              display_name_raw,canonical_key,raw_definition_json
+            ) VALUES (?,?,?,NULL,NULL,?,'{}')
+            """,
+            ((layout_id, 0, "GAP", "gap"), (layout_id, 1, "DIFF", "diff")),
+        )
+
+        def cell(column_index, value_text, ordinal):
+            return int(
+                self.connection.execute(
+                    """
+                    INSERT INTO participant_result_cell_observations(
+                      source_heat_id,participant_id,layout_version_id,provider_row_index,column_index,
+                      raw_value_json,value_text,source_key,source_change_ordinal,observed_at_us,created_at_us
+                    ) VALUES (?,'ours',?,0,?,?,?,'result:91',?,91000000,91000000)
+                    RETURNING id
+                    """,
+                    (
+                        self.source_heat_id,
+                        layout_id,
+                        column_index,
+                        json.dumps([value_text]),
+                        value_text,
+                        ordinal,
+                    ),
+                ).fetchone()[0]
+            )
+
+        gap_cell = cell(0, "1.246", 3)
+        diff_cell = cell(1, "0.120", 4)
+
+        def fact(*, kind, cell_id, raw, value_ms, target_id, target_position, relation_kind):
+            return int(
+                self.connection.execute(
+                    """
+                    INSERT INTO participant_interval_source_facts(
+                      source_heat_id,participant_id,interval_kind,raw_value,interval_ms,value_kind,
+                      source_cell_observation_id,source_message_id,source_key,source_change_ordinal,
+                      source_handle,observation_kind,observed_at_us,source_layout_version_id,
+                      source_provider_row_index,source_position_overall,source_position_class,
+                      source_laps,source_state_kind,relation_kind,target_participant_id,
+                      target_position_overall,target_state_kind,target_laps,created_at_us
+                    ) VALUES (?,'ours',?,?,?,?,?,NULL,'result:91',?,'r_c','DELTA',91000000,?,0,4,2,12,
+                              'ON_TRACK',?,?,?,'ON_TRACK',12,91000000)
+                    RETURNING id
+                    """,
+                    (
+                        self.source_heat_id,
+                        kind,
+                        raw,
+                        value_ms,
+                        "TIME",
+                        cell_id,
+                        3 if kind == "GAP" else 4,
+                        layout_id,
+                        relation_kind,
+                        target_id,
+                        target_position,
+                    ),
+                ).fetchone()[0]
+            )
+
+        gap_id = fact(
+            kind="GAP",
+            cell_id=gap_cell,
+            raw="1.246",
+            value_ms=1_246,
+            target_id="gt",
+            target_position=1,
+            relation_kind="OVERALL_LEADER",
+        )
+        diff_id = fact(
+            kind="DIFF",
+            cell_id=diff_cell,
+            raw="0.120",
+            value_ms=120,
+            target_id="leader",
+            target_position=3,
+            relation_kind="OVERALL_AHEAD",
+        )
+        # Simulate a later STATE/LAST materialization: only pointer-backed
+        # field facts, never the row timestamp, describe interval freshness.
+        self.connection.execute(
+            """
+            UPDATE participant_state_current
+            SET gap_interval_fact_id = ?, diff_interval_fact_id = ?, updated_at_us = 99000000
+            WHERE source_heat_id = ? AND participant_id = 'ours'
+            """,
+            (gap_id, diff_id, self.source_heat_id),
+        )
+        self.connection.commit()
+
+        state = load_heat_metric_input(self.connection, self.source_heat_id).our_participant.state
+        self.assertEqual(state.gap_interval_fact.id, gap_id)
+        self.assertEqual(state.gap_interval_fact.value_ms, 1_246)
+        self.assertEqual(state.gap_interval_fact.observed_at_us, 91_000_000)
+        self.assertEqual(state.gap_interval_fact.target_participant_id, "gt")
+        self.assertEqual(state.diff_interval_fact.id, diff_id)
+        self.assertEqual(state.diff_interval_fact.value_ms, 120)
+        self.assertEqual(state.diff_interval_fact.target_participant_id, "leader")
+        self.assertEqual(state.diff_interval_fact.relation_kind, "OVERALL_AHEAD")
+
     def test_loads_each_raw_r_c_last_without_inventing_a_provider_lap_number(self):
         raw_ids = self._seed_no_laps_last_history()
         self.connection.commit()

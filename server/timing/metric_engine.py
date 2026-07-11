@@ -49,7 +49,7 @@ from .metrics import (
 )
 
 
-METRIC_ENGINE_VERSION = 3
+METRIC_ENGINE_VERSION = 4
 """Version of the deterministic value schema emitted by this module."""
 
 FRESHNESS_STALE_MS = 3_000
@@ -65,6 +65,9 @@ STINT_TREND_MAX_POINTS = 60
 """Bound robust degradation regression to the tactically current tyre window."""
 SLOW_LAP_MAX_CLEAN_LAPS = 120
 """Retain current anomaly evidence without rescanning a 24-hour session."""
+
+IntervalFactPointer = tuple[int | None, int | None, int | None, str | None, int | None, str | None]
+"""Stable identity of one GAP/DIFF source cell, independent from row updates."""
 
 
 @dataclass(frozen=True)
@@ -82,6 +85,8 @@ class ParticipantBoundaryState:
     last_lap_ms: int | None
     latest_timing_event_id: int | None
     best_lap_ms: int | None
+    gap_interval_fact_pointer: IntervalFactPointer | None
+    diff_interval_fact_pointer: IntervalFactPointer | None
     pits: tuple[tuple[int | None, int | None, int | None, bool | None], ...]
     active_stint: tuple[int | None, int | None, int | None] | None
 
@@ -123,6 +128,16 @@ def serialize_metric_boundary_state(state: MetricBoundaryState) -> str:
                 "last_lap_ms": participant.last_lap_ms,
                 "latest_timing_event_id": participant.latest_timing_event_id,
                 "best_lap_ms": participant.best_lap_ms,
+                "gap_interval_fact_pointer": (
+                    list(participant.gap_interval_fact_pointer)
+                    if participant.gap_interval_fact_pointer is not None
+                    else None
+                ),
+                "diff_interval_fact_pointer": (
+                    list(participant.diff_interval_fact_pointer)
+                    if participant.diff_interval_fact_pointer is not None
+                    else None
+                ),
                 "pits": [list(pit) for pit in participant.pits],
                 "active_stint": list(participant.active_stint) if participant.active_stint is not None else None,
             }
@@ -151,6 +166,23 @@ def deserialize_metric_boundary_state(value: str) -> MetricBoundaryState:
 
     def optional_integer(item: Any) -> int | None:
         return item if _is_int(item) else None
+
+    def interval_fact_pointer(item: Any) -> IntervalFactPointer | None:
+        """Read a backward-compatible, field-level source fact cursor."""
+
+        if item is None:
+            return None
+        if not isinstance(item, list) or len(item) != 6:
+            raise ValueError("Metric runner boundary state has an invalid interval fact pointer")
+        pointer: IntervalFactPointer = (
+            item[0] if _is_int(item[0], minimum=1) else None,
+            item[1] if _is_int(item[1], minimum=1) else None,
+            item[2] if _is_int(item[2], minimum=1) else None,
+            optional_text(item[3]),
+            item[4] if _is_int(item[4], minimum=0) else None,
+            optional_text(item[5]),
+        )
+        return pointer if any(value is not None for value in pointer) else None
 
     session_raw = payload.get("session")
     if not isinstance(session_raw, list) or len(session_raw) != 5:
@@ -222,6 +254,8 @@ def deserialize_metric_boundary_state(value: str) -> MetricBoundaryState:
                 last_lap_ms=optional_integer(item.get("last_lap_ms")),
                 latest_timing_event_id=optional_integer(item.get("latest_timing_event_id")),
                 best_lap_ms=optional_integer(item.get("best_lap_ms")),
+                gap_interval_fact_pointer=interval_fact_pointer(item.get("gap_interval_fact_pointer")),
+                diff_interval_fact_pointer=interval_fact_pointer(item.get("diff_interval_fact_pointer")),
                 pits=tuple(pits),
                 active_stint=active_stint,
             )
@@ -778,6 +812,8 @@ def _participant_values(
         "last_to_best_delta_ms": last_lap - best_lap if last_lap is not None and best_lap is not None and last_lap >= best_lap else None,
         "source_gap_ms": _source_time_ms(state.gap_ms, state.gap_kind) if state is not None else None,
         "source_diff_ms": _source_time_ms(state.diff_ms, state.diff_kind) if state is not None else None,
+        "source_gap_fact": _source_fact_payload(state.gap_interval_fact) if state is not None else None,
+        "source_diff_fact": _source_fact_payload(state.diff_interval_fact) if state is not None else None,
         "pace_3_ms": pace.pace3_ms,
         "pace_5_ms": pace.pace5_ms,
         "pace_10_ms": pace.pace10_ms,
@@ -937,6 +973,7 @@ _HISTORY_KEYS_BY_SCOPE: dict[str, tuple[str, ...]] = {
         "gap_to_class_leader_ms",
         "gap_to_ahead_ms",
         "gap_to_behind_ms",
+        "relation_intervals",
         "pace_3_ms",
         "pace_5_ms",
         "pace_10_ms",
@@ -1067,39 +1104,439 @@ def _class_best_lap_ms(scope: ClassScopeInput) -> int | None:
     return min(available) if available else None
 
 
-def _relative_gap_ms(ours: ParticipantMetricInput, target: ParticipantMetricInput) -> int | None:
-    """Return a source time interval unless explicit LAPS proves cars are apart."""
+_INTERVAL_STATUS_VALID = "VALID"
+_INTERVAL_STATUS_SELF = "SELF"
+_INTERVAL_STATUS_NO_TARGET = "NO_TARGET"
+_INTERVAL_STATUS_NO_STATE = "NO_STATE"
+_INTERVAL_STATUS_NON_RACING_STATE = "NON_RACING_STATE"
+_INTERVAL_STATUS_LAPPED = "LAPPED"
+_INTERVAL_STATUS_NO_SOURCE_FACT = "NO_SOURCE_FACT"
+_INTERVAL_STATUS_INVALID_SOURCE_FACT = "INVALID_SOURCE_FACT"
+_INTERVAL_STATUS_SOURCE_TARGET_MISMATCH = "SOURCE_TARGET_MISMATCH"
+_INTERVAL_STATUS_SOURCE_POSITION_MISMATCH = "SOURCE_POSITION_MISMATCH"
+_INTERVAL_STATUS_SOURCE_STATE_MISMATCH = "SOURCE_STATE_MISMATCH"
+_INTERVAL_STATUS_SOURCE_LAPPED = "SOURCE_LAPPED"
+_INTERVAL_STATUS_STALE_LAP_CONTEXT = "STALE_LAP_CONTEXT"
+_INTERVAL_STATUS_NO_COHERENT_SOURCE_PAIR = "NO_COHERENT_SOURCE_PAIR"
 
-    ours_laps = _source_lap_count(ours)
-    target_laps = _source_lap_count(target)
-    if target.id == ours.id:
-        return 0
-    # Only explicit source LAPS can prove that a time interval is invalid.
-    # A partial capture may have tracker-derived local lap counts that differ
-    # simply because one transponder was first observed later in the capture.
-    if ours_laps is not None and target_laps is not None and ours_laps != target_laps:
+_GAP_FACT_RELATIONS = frozenset({"OVERALL_LEADER", "GAP_TO_OVERALL_LEADER"})
+_DIFF_FACT_RELATIONS = frozenset({"OVERALL_AHEAD", "DIFF_TO_OVERALL_AHEAD"})
+_INTERVAL_RACING_STATE_KINDS = frozenset({"ON_TRACK", "OUT_LAP"})
+
+
+def _source_fact_field(fact: Any, key: str) -> Any:
+    """Read an additive interval-provenance field without coupling storage shape.
+
+    The normalizer will provide a typed fact object, while fixture and replay
+    callers may use mappings during the migration.  This evaluator must remain
+    fail-closed when either representation is incomplete.
+    """
+
+    aliases = {
+        "field_kind": ("interval_kind",),
+        "value_ms": ("interval_ms",),
+        "cell_observation_id": ("source_cell_observation_id",),
+        "subject_position_overall": ("source_position_overall",),
+        "subject_state_kind": ("source_state_kind",),
+        "subject_laps": ("source_laps",),
+    }
+    names = (key, *aliases.get(key, ()))
+    for name in names:
+        value = fact.get(name) if isinstance(fact, Mapping) else getattr(fact, name, None)
+        if value is not None:
+            return value
+    return None
+
+
+def _source_fact_text(fact: Any, key: str) -> str | None:
+    value = _source_fact_field(fact, key)
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _source_fact_int(fact: Any, key: str, *, minimum: int | None = None) -> int | None:
+    value = _source_fact_field(fact, key)
+    return value if _is_int(value, minimum=minimum) else None
+
+
+def _source_interval_fact(state: Any, field_kind: str) -> Any | None:
+    """Return a field-specific fact, never the row's generic source pointer."""
+
+    if state is None:
         return None
+    attribute = "gap_interval_fact" if field_kind == "GAP" else "diff_interval_fact"
+    return getattr(state, attribute, None)
+
+
+def _interval_fact_pointer(fact: Any) -> IntervalFactPointer | None:
+    """Return only immutable GAP/DIFF provenance, not its derived value.
+
+    A result row can be re-written by STATE, LAST, or driver changes while its
+    cached interval cell still points to an older source observation.  The
+    boundary cursor therefore tracks the fact identity and source ordering,
+    rather than the row timestamp or the displayed number.
+    """
+
+    if fact is None:
+        return None
+    pointer: IntervalFactPointer = (
+        _source_fact_int(fact, "id", minimum=1),
+        _source_fact_int(fact, "cell_observation_id", minimum=1),
+        _source_fact_int(fact, "source_message_id", minimum=1),
+        _source_fact_text(fact, "source_key"),
+        _source_fact_int(fact, "source_change_ordinal", minimum=0),
+        _source_fact_text(fact, "field_kind"),
+    )
+    return pointer if any(value is not None for value in pointer) else None
+
+
+def _source_fact_payload(fact: Any) -> dict[str, Any] | None:
+    """Produce the public, compact provenance carried by a tactical relation."""
+
+    if fact is None:
+        return None
+    payload = {
+        "id": _source_fact_field(fact, "id"),
+        "field_kind": _source_fact_text(fact, "field_kind"),
+        "raw_value": _source_fact_text(fact, "raw_value"),
+        "value_ms": _source_fact_int(fact, "value_ms", minimum=0),
+        "value_kind": _source_fact_text(fact, "value_kind"),
+        "cell_observation_id": _source_fact_int(fact, "cell_observation_id", minimum=1),
+        "source_message_id": _source_fact_int(fact, "source_message_id", minimum=1),
+        "source_key": _source_fact_text(fact, "source_key"),
+        "source_change_ordinal": _source_fact_int(fact, "source_change_ordinal", minimum=0),
+        "observed_at_us": _source_fact_int(fact, "observed_at_us", minimum=0),
+        "source_handle": _source_fact_text(fact, "source_handle"),
+        "observation_kind": _source_fact_text(fact, "observation_kind"),
+        "subject_position_overall": _source_fact_int(fact, "subject_position_overall", minimum=1),
+        "subject_state_kind": _source_fact_text(fact, "subject_state_kind"),
+        "subject_laps": _source_fact_int(fact, "subject_laps", minimum=0),
+        "target_participant_id": _source_fact_text(fact, "target_participant_id"),
+        "target_position_overall": _source_fact_int(fact, "target_position_overall", minimum=1),
+        "target_state_kind": _source_fact_text(fact, "target_state_kind"),
+        "target_laps": _source_fact_int(fact, "target_laps", minimum=0),
+        "relation_kind": _source_fact_text(fact, "relation_kind"),
+    }
+    return payload
+
+
+def _participant_state_kind(participant: ParticipantMetricInput | None) -> str | None:
+    state = participant.state if participant is not None else None
+    return state.state_kind if state is not None and isinstance(state.state_kind, str) else None
+
+
+def _relation_result(
+    ours: ParticipantMetricInput,
+    target: ParticipantMetricInput | None,
+    *,
+    status: str,
+    value_ms: int | None = None,
+    relation_kind: str | None = None,
+    source_facts: Sequence[dict[str, Any] | None] = (),
+    evaluated_at_us: int | None = None,
+) -> dict[str, Any]:
+    """Return one uniform relation object; scalar consumers use only VALID/SELF."""
+
+    facts = [fact for fact in source_facts if fact is not None]
+    observed = [fact["observed_at_us"] for fact in facts if _is_int(fact.get("observed_at_us"), minimum=0)]
+    latest_at_us = max(observed) if observed else None
+    age_ms = (
+        max(0, evaluated_at_us - latest_at_us) // 1_000
+        if _is_int(evaluated_at_us, minimum=0) and latest_at_us is not None
+        else None
+    )
+    return {
+        "target_participant_id": target.id if target is not None else None,
+        "status": status,
+        "value_ms": value_ms if status in {_INTERVAL_STATUS_VALID, _INTERVAL_STATUS_SELF} else None,
+        "relation_kind": relation_kind,
+        "source_facts": facts,
+        "source_observed_at_us": latest_at_us,
+        "source_age_ms": age_ms,
+        "ours_state_kind": _participant_state_kind(ours),
+        "target_state_kind": _participant_state_kind(target),
+        "ours_laps": _source_lap_count(ours),
+        "target_laps": _source_lap_count(target) if target is not None else None,
+    }
+
+
+def _relation_value_ms(relation: Mapping[str, Any]) -> int | None:
+    value = relation.get("value_ms")
+    return value if relation.get("status") in {_INTERVAL_STATUS_VALID, _INTERVAL_STATUS_SELF} and _is_int(value, minimum=0) else None
+
+
+def _fact_context_status(
+    fact: Any,
+    *,
+    holder: ParticipantMetricInput,
+    target: ParticipantMetricInput,
+    field_kind: str,
+    allowed_relations: frozenset[str],
+) -> tuple[str, dict[str, Any] | None]:
+    """Validate one source fact against both its source and current relation.
+
+    A GAP/DIFF number alone is deliberately insufficient: the source target,
+    positions and states must still describe the exact pair being displayed.
+    """
+
+    payload = _source_fact_payload(fact)
+    if payload is None:
+        return _INTERVAL_STATUS_NO_SOURCE_FACT, None
+    if (
+        payload["field_kind"] != field_kind
+        or payload["value_kind"] != "TIME"
+        or payload["value_ms"] is None
+        or payload["cell_observation_id"] is None
+        or payload["source_message_id"] is None
+        or payload["source_key"] is None
+        or payload["source_change_ordinal"] is None
+        or payload["observed_at_us"] is None
+        or payload["source_handle"] is None
+        or payload["observation_kind"] is None
+    ):
+        return _INTERVAL_STATUS_INVALID_SOURCE_FACT, payload
+    if payload["relation_kind"] not in allowed_relations or payload["target_participant_id"] != target.id:
+        return _INTERVAL_STATUS_SOURCE_TARGET_MISMATCH, payload
+
+    holder_state = holder.state
+    target_state = target.state
+    if holder_state is None or target_state is None:
+        return _INTERVAL_STATUS_NO_STATE, payload
+    if (
+        holder_state.state_kind not in _INTERVAL_RACING_STATE_KINDS
+        or target_state.state_kind not in _INTERVAL_RACING_STATE_KINDS
+    ):
+        return _INTERVAL_STATUS_NON_RACING_STATE, payload
+    holder_position = _rank(holder_state.position_overall)
+    target_position = _rank(target_state.position_overall)
+    if (
+        holder_position is None
+        or target_position is None
+        or payload["subject_position_overall"] != holder_position
+        or payload["target_position_overall"] != target_position
+    ):
+        return _INTERVAL_STATUS_SOURCE_POSITION_MISMATCH, payload
+    # The interpretation comes from the provider column, not merely the
+    # numeric duration.  GAP is explicitly to P1; DIFF is explicitly to the
+    # immediately preceding overall position.
+    if (
+        (field_kind == "GAP" and target_position != 1)
+        or (field_kind == "DIFF" and holder_position != target_position + 1)
+    ):
+        return _INTERVAL_STATUS_SOURCE_POSITION_MISMATCH, payload
+    if (
+        payload["subject_state_kind"] not in _INTERVAL_RACING_STATE_KINDS
+        or payload["target_state_kind"] not in _INTERVAL_RACING_STATE_KINDS
+    ):
+        return _INTERVAL_STATUS_SOURCE_STATE_MISMATCH, payload
+
+    holder_laps = _source_lap_count(holder)
+    target_laps = _source_lap_count(target)
+    if holder_laps is not None and target_laps is not None and holder_laps != target_laps:
+        return _INTERVAL_STATUS_LAPPED, payload
+    if payload["subject_laps"] is not None and payload["target_laps"] is not None and payload["subject_laps"] != payload["target_laps"]:
+        return _INTERVAL_STATUS_SOURCE_LAPPED, payload
+    if (
+        (payload["subject_laps"] is not None and holder_laps is not None and payload["subject_laps"] != holder_laps)
+        or (payload["target_laps"] is not None and target_laps is not None and payload["target_laps"] != target_laps)
+    ):
+        return _INTERVAL_STATUS_STALE_LAP_CONTEXT, payload
+    return _INTERVAL_STATUS_VALID, payload
+
+
+def _same_source_message(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    """Only one atomic table message may support a derived GAP-pair distance."""
+
+    return (
+        left.get("source_message_id") == right.get("source_message_id")
+        and left.get("source_key") == right.get("source_key")
+        and left.get("observed_at_us") == right.get("observed_at_us")
+        and left.get("source_handle") == right.get("source_handle")
+    )
+
+
+def _relative_interval(
+    ours: ParticipantMetricInput,
+    target: ParticipantMetricInput | None,
+    *,
+    participants: Mapping[str, ParticipantMetricInput] | None = None,
+    evaluated_at_us: int | None = None,
+) -> dict[str, Any]:
+    """Resolve one tactical interval solely from source-proven GAP/DIFF facts.
+
+    Direct GAP binds its row to the source's absolute leader; direct DIFF binds
+    its row to the immediately preceding absolute position.  A GAP pair is
+    accepted only when both cells are from the same atomic result message and
+    share the same current overall leader.  No lap-time calculation is used.
+    """
+
+    if target is None:
+        return _relation_result(ours, None, status=_INTERVAL_STATUS_NO_TARGET, evaluated_at_us=evaluated_at_us)
+    if target.id == ours.id:
+        return _relation_result(
+            ours,
+            target,
+            status=_INTERVAL_STATUS_SELF,
+            value_ms=0,
+            relation_kind="SELF",
+            evaluated_at_us=evaluated_at_us,
+        )
+
     ours_state = ours.state
     target_state = target.state
     if ours_state is None or target_state is None:
-        return None
-    ours_gap = _source_time_ms(ours_state.gap_ms, ours_state.gap_kind)
-    target_gap = _source_time_ms(target_state.gap_ms, target_state.gap_kind)
-    if ours_gap is not None and target_gap is not None:
-        return abs(ours_gap - target_gap)
-    ours_pos = _rank(ours_state.position_overall)
-    target_pos = _rank(target_state.position_overall)
-    # A blank GAP for the absolute leader is a normal presentation of zero.
-    if target_pos == 1 and ours_gap is not None:
-        return ours_gap
-    if ours_pos == 1 and target_gap is not None:
-        return target_gap
-    # DIFF is only a direct interval when these rows are absolute neighbours.
-    if target_pos is not None and ours_pos is not None and target_pos == ours_pos - 1:
-        return _source_time_ms(ours_state.diff_ms, ours_state.diff_kind)
-    if target_pos is not None and ours_pos is not None and target_pos == ours_pos + 1:
-        return _source_time_ms(target_state.diff_ms, target_state.diff_kind)
-    return None
+        return _relation_result(ours, target, status=_INTERVAL_STATUS_NO_STATE, evaluated_at_us=evaluated_at_us)
+    if (
+        ours_state.state_kind not in _INTERVAL_RACING_STATE_KINDS
+        or target_state.state_kind not in _INTERVAL_RACING_STATE_KINDS
+    ):
+        return _relation_result(
+            ours,
+            target,
+            status=_INTERVAL_STATUS_NON_RACING_STATE,
+            source_facts=(
+                _source_fact_payload(_source_interval_fact(ours_state, "GAP")),
+                _source_fact_payload(_source_interval_fact(ours_state, "DIFF")),
+                _source_fact_payload(_source_interval_fact(target_state, "GAP")),
+                _source_fact_payload(_source_interval_fact(target_state, "DIFF")),
+            ),
+            evaluated_at_us=evaluated_at_us,
+        )
+    ours_laps = _source_lap_count(ours)
+    target_laps = _source_lap_count(target)
+    if ours_laps is not None and target_laps is not None and ours_laps != target_laps:
+        return _relation_result(ours, target, status=_INTERVAL_STATUS_LAPPED, evaluated_at_us=evaluated_at_us)
+
+    candidates: list[tuple[str, dict[str, Any] | None]] = []
+
+    def direct(
+        holder: ParticipantMetricInput,
+        direct_target: ParticipantMetricInput,
+        field_kind: str,
+        allowed_relations: frozenset[str],
+        relation_kind: str,
+    ) -> dict[str, Any] | None:
+        fact = _source_interval_fact(holder.state, field_kind)
+        status, payload = _fact_context_status(
+            fact,
+            holder=holder,
+            target=direct_target,
+            field_kind=field_kind,
+            allowed_relations=allowed_relations,
+        )
+        candidates.append((status, payload))
+        if status != _INTERVAL_STATUS_VALID or payload is None:
+            return None
+        return _relation_result(
+            ours,
+            target,
+            status=_INTERVAL_STATUS_VALID,
+            value_ms=payload["value_ms"],
+            relation_kind=relation_kind,
+            source_facts=(payload,),
+            evaluated_at_us=evaluated_at_us,
+        )
+
+    # A direct GAP is valid only if the stored leader target is the tactical
+    # target. The reverse form covers our car being the overall leader.
+    result = direct(ours, target, "GAP", _GAP_FACT_RELATIONS, "GAP_TO_OVERALL_LEADER")
+    if result is not None:
+        return result
+    result = direct(target, ours, "GAP", _GAP_FACT_RELATIONS, "GAP_TO_OVERALL_LEADER")
+    if result is not None:
+        return result
+    result = direct(ours, target, "DIFF", _DIFF_FACT_RELATIONS, "DIFF_TO_OVERALL_AHEAD")
+    if result is not None:
+        return result
+    result = direct(target, ours, "DIFF", _DIFF_FACT_RELATIONS, "DIFF_TO_OVERALL_AHEAD")
+    if result is not None:
+        return result
+
+    # Two GAP cells may be compared only when they were emitted atomically and
+    # point to the same actual leader. Otherwise subtraction is a synthetic
+    # relation between unrelated moments and must be rejected.
+    ours_fact = _source_interval_fact(ours_state, "GAP")
+    target_fact = _source_interval_fact(target_state, "GAP")
+    ours_payload = _source_fact_payload(ours_fact)
+    target_payload = _source_fact_payload(target_fact)
+    common_id = (
+        ours_payload.get("target_participant_id")
+        if ours_payload is not None and target_payload is not None
+        and ours_payload.get("target_participant_id") == target_payload.get("target_participant_id")
+        else None
+    )
+    roster = participants or {}
+    common = roster.get(common_id) if isinstance(common_id, str) else None
+    if common is not None and common.id not in {ours.id, target.id}:
+        ours_status, valid_ours = _fact_context_status(
+            ours_fact,
+            holder=ours,
+            target=common,
+            field_kind="GAP",
+            allowed_relations=_GAP_FACT_RELATIONS,
+        )
+        target_status, valid_target = _fact_context_status(
+            target_fact,
+            holder=target,
+            target=common,
+            field_kind="GAP",
+            allowed_relations=_GAP_FACT_RELATIONS,
+        )
+        candidates.extend(((ours_status, valid_ours), (target_status, valid_target)))
+        if (
+            ours_status == _INTERVAL_STATUS_VALID
+            and target_status == _INTERVAL_STATUS_VALID
+            and valid_ours is not None
+            and valid_target is not None
+            and _same_source_message(valid_ours, valid_target)
+            and (
+                valid_ours["subject_laps"] is None
+                or valid_target["subject_laps"] is None
+                or valid_ours["subject_laps"] == valid_target["subject_laps"]
+            )
+        ):
+            return _relation_result(
+                ours,
+                target,
+                status=_INTERVAL_STATUS_VALID,
+                value_ms=abs(valid_ours["value_ms"] - valid_target["value_ms"]),
+                relation_kind="GAP_PAIR_COMMON_OVERALL_LEADER",
+                source_facts=(valid_ours, valid_target),
+                evaluated_at_us=evaluated_at_us,
+            )
+        if ours_status == _INTERVAL_STATUS_VALID and target_status == _INTERVAL_STATUS_VALID:
+            return _relation_result(
+                ours,
+                target,
+                status=_INTERVAL_STATUS_NO_COHERENT_SOURCE_PAIR,
+                source_facts=(valid_ours, valid_target),
+                evaluated_at_us=evaluated_at_us,
+            )
+
+    non_missing = next(
+        (status for status, _ in candidates if status not in {_INTERVAL_STATUS_NO_SOURCE_FACT, _INTERVAL_STATUS_VALID}),
+        _INTERVAL_STATUS_NO_SOURCE_FACT,
+    )
+    return _relation_result(
+        ours,
+        target,
+        status=non_missing,
+        source_facts=tuple(payload for _, payload in candidates),
+        evaluated_at_us=evaluated_at_us,
+    )
+
+
+def _relative_gap_ms(
+    ours: ParticipantMetricInput,
+    target: ParticipantMetricInput,
+    *,
+    participants: Mapping[str, ParticipantMetricInput] | None = None,
+    evaluated_at_us: int | None = None,
+) -> int | None:
+    """Compatibility scalar, deliberately derived only from a valid relation."""
+
+    return _relation_value_ms(
+        _relative_interval(ours, target, participants=participants, evaluated_at_us=evaluated_at_us)
+    )
 
 
 def _lap_delta(ours: ParticipantMetricInput, target: ParticipantMetricInput | None) -> int | None:
@@ -1250,27 +1687,56 @@ def _gap_sample_from_values(
     relation: str,
 ) -> GapSample:
     suffix = "ahead" if relation == GAP_RELATION_AHEAD else "behind"
-    gap_ms = _mapping_int(values, f"gap_to_{suffix}_ms")
-    ours_laps = _mapping_int(values, "completed_laps")
-    lap_delta = _mapping_int(values, f"lap_delta_to_{suffix}")
-    target_laps = ours_laps - lap_delta if ours_laps is not None and lap_delta is not None else None
+    relation_key = f"class_{suffix}"
+    relation_values = values.get("relation_intervals")
+    interval = (
+        relation_values.get(relation_key)
+        if isinstance(relation_values, Mapping) and isinstance(relation_values.get(relation_key), Mapping)
+        else None
+    )
+    # New materializations carry the full source relation.  A baseline table
+    # snapshot is useful for a KPI, but it is not a new gap measurement and
+    # therefore cannot extend a closure/catch trend. Legacy history has no
+    # relation object and remains readable until its source heat is rebuilt.
+    if interval is not None:
+        source_facts = interval.get("source_facts")
+        has_delta = (
+            isinstance(source_facts, Sequence)
+            and not isinstance(source_facts, (str, bytes, bytearray))
+            and bool(source_facts)
+            and all(
+                isinstance(fact, Mapping) and fact.get("observation_kind") == "DELTA"
+                for fact in source_facts
+            )
+        )
+        gap_ms = _relation_value_ms(interval) if has_delta else None
+        source_at_us = _mapping_int(interval, "source_observed_at_us")
+        sample_at_us = source_at_us if source_at_us is not None else observed_at_us
+        target_id = interval.get("target_participant_id") if isinstance(interval.get("target_participant_id"), str) else None
+        ours_state = interval.get("ours_state_kind") if isinstance(interval.get("ours_state_kind"), str) else None
+        target_state = interval.get("target_state_kind") if isinstance(interval.get("target_state_kind"), str) else None
+        ours_laps = _mapping_int(interval, "ours_laps")
+        target_laps = _mapping_int(interval, "target_laps")
+    else:
+        # A pre-provenance history point can still be inspected as raw
+        # archive state, but it must never turn its flattened scalar into a
+        # tactical closure, catch or forecast input.
+        gap_ms = None
+        sample_at_us = observed_at_us
+        target_id = None
+        ours_state = None
+        target_state = None
+        ours_laps = None
+        target_laps = None
     return GapSample(
-        target_participant_id=(
-            values.get(f"class_{suffix}_id")
-            if isinstance(values.get(f"class_{suffix}_id"), str)
-            else None
-        ),
-        observed_at_us=observed_at_us,
+        target_participant_id=target_id,
+        observed_at_us=sample_at_us,
         gap_ms=gap_ms,
         our_lap_number=ours_laps,
         target_lap_number=target_laps,
         flag_kind=values.get("track_flag") if isinstance(values.get("track_flag"), str) else None,
-        our_state_kind=values.get("current_state") if isinstance(values.get("current_state"), str) else None,
-        target_state_kind=(
-            values.get(f"class_{suffix}_state")
-            if isinstance(values.get(f"class_{suffix}_state"), str)
-            else None
-        ),
+        our_state_kind=ours_state,
+        target_state_kind=target_state,
         has_feed_gap=values.get("channel_status") != CHANNEL_LIVE,
         # ``gap_ms`` can only be non-null after _relative_gap_ms accepted an
         # explicit provider TIME GAP/DIFF.  When LAPS is absent, it permits a
@@ -1346,11 +1812,22 @@ def _projected_gaps(
     }
 
 
-def _class_density(ours: ParticipantMetricInput, scope: ClassScopeInput | None) -> dict[str, int] | None:
+def _class_density(
+    ours: ParticipantMetricInput,
+    scope: ClassScopeInput | None,
+    *,
+    observed_at_us: int,
+) -> dict[str, int] | None:
     if scope is None:
         return None
+    participants = {participant.id: participant for participant in scope.participants}
     gaps = [
-        _relative_gap_ms(ours, participant)
+        _relative_gap_ms(
+            ours,
+            participant,
+            participants=participants,
+            evaluated_at_us=observed_at_us,
+        )
         for participant in scope.participants
         if participant.id != ours.id
     ]
@@ -1553,7 +2030,7 @@ def _battle_values(
                 trend=behind_trends[60],
             ),
         },
-        "class_density": _class_density(ours, scope),
+        "class_density": _class_density(ours, scope, observed_at_us=observed_at_us),
         "position_change": prior_position - current_position
         if prior_position is not None and current_position is not None
         else None,
@@ -1835,6 +2312,11 @@ def _ours_tactical_values(
         "gap_to_class_leader_ms": None,
         "gap_to_ahead_ms": None,
         "gap_to_behind_ms": None,
+        "relation_intervals": {
+            "class_leader": None,
+            "class_ahead": None,
+            "class_behind": None,
+        },
         "pace_3_ms": None,
         "pace_5_ms": None,
         "pace_10_ms": None,
@@ -1924,6 +2406,30 @@ def _ours_tactical_values(
     }
     class_best = _class_best_lap_ms(scope) if scope is not None else None
     sector_values = _sector_metrics(ours, scope)
+    participants_by_id = {
+        participant.id: participant
+        for participant in (scope.participants if scope is not None else ())
+    }
+    relation_intervals = {
+        "class_leader": _relative_interval(
+            ours,
+            leader,
+            participants=participants_by_id,
+            evaluated_at_us=observed_at_us,
+        ),
+        "class_ahead": _relative_interval(
+            ours,
+            ahead,
+            participants=participants_by_id,
+            evaluated_at_us=observed_at_us,
+        ),
+        "class_behind": _relative_interval(
+            ours,
+            behind,
+            participants=participants_by_id,
+            evaluated_at_us=observed_at_us,
+        ),
+    }
     obligations = _race_obligation_values(
         heat,
         ours,
@@ -1957,9 +2463,10 @@ def _ours_tactical_values(
         "lap_delta_to_class_leader": _lap_delta(ours, leader),
         "lap_delta_to_ahead": _lap_delta(ours, ahead),
         "lap_delta_to_behind": _lap_delta(ours, behind),
-        "gap_to_class_leader_ms": _relative_gap_ms(ours, leader) if leader is not None else None,
-        "gap_to_ahead_ms": _relative_gap_ms(ours, ahead) if ahead is not None else None,
-        "gap_to_behind_ms": _relative_gap_ms(ours, behind) if behind is not None else None,
+        "gap_to_class_leader_ms": _relation_value_ms(relation_intervals["class_leader"]),
+        "gap_to_ahead_ms": _relation_value_ms(relation_intervals["class_ahead"]),
+        "gap_to_behind_ms": _relation_value_ms(relation_intervals["class_behind"]),
+        "relation_intervals": relation_intervals,
         "pace_3_ms": ours_pace.pace3_ms,
         "pace_5_ms": ours_pace.pace5_ms,
         "pace_10_ms": ours_pace.pace10_ms,
@@ -2050,6 +2557,8 @@ def _participant_boundary_state(participant: ParticipantMetricInput) -> Particip
         last_lap_ms=_last_lap_ms(participant),
         latest_timing_event_id=participant.latest_timing_event_id,
         best_lap_ms=_best_lap_ms(participant),
+        gap_interval_fact_pointer=_interval_fact_pointer(_source_interval_fact(state, "GAP")),
+        diff_interval_fact_pointer=_interval_fact_pointer(_source_interval_fact(state, "DIFF")),
         pits=tuple(
             (stop.stop_number, stop.entered_at_us, stop.exited_at_us, stop.completed)
             for stop in sorted(participant.pit_stops, key=lambda stop: (stop.stop_number, stop.entered_at_us))
@@ -2145,6 +2654,10 @@ def detect_event_boundaries(
             continue
         if left.identity != right.identity or left.driver_name != right.driver_name or left.class_key != right.class_key:
             events.append(f"identity:{participant_id}")
+        if left.gap_interval_fact_pointer != right.gap_interval_fact_pointer:
+            events.append(f"interval_fact:{participant_id}:GAP")
+        if left.diff_interval_fact_pointer != right.diff_interval_fact_pointer:
+            events.append(f"interval_fact:{participant_id}:DIFF")
         if left.state_kind != right.state_kind:
             events.append(f"state:{participant_id}")
         if (

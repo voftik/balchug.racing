@@ -40,10 +40,22 @@ from .stream_events import StreamEventCandidate
 
 
 STREAM_SCHEMA_VERSION = "timing-live.v1"
+_INTERVAL_FACT_BOUNDARY_PREFIX = "interval_fact:"
 
 
 class MetricRunnerError(RuntimeError):
     """A normalized frame could not be turned into a durable metric snapshot."""
+
+
+def _interval_fact_boundary_parts(boundary: str) -> tuple[str, str] | None:
+    """Decode one field-level interval event without assuming ID formatting."""
+
+    if not boundary.startswith(_INTERVAL_FACT_BOUNDARY_PREFIX):
+        return None
+    participant_id, separator, field_kind = boundary[len(_INTERVAL_FACT_BOUNDARY_PREFIX) :].rpartition(":")
+    if not separator or not participant_id or field_kind not in {"GAP", "DIFF"}:
+        return None
+    return participant_id, field_kind
 
 
 @dataclass(frozen=True)
@@ -159,11 +171,23 @@ class TimingMetricRunner:
 
         ours = heat.our_participant
         ours_id = ours.id if ours is not None else None
+        ours_class_key = ours.class_key if ours is not None else None
+        participants = {participant.id: participant for participant in heat.participants}
         for event_key in evaluation.event_keys:
             if event_key in {"track_flag", "source_gap"}:
                 return True
             if ours_id is not None and event_key in {f"lap:{ours_id}", f"pit_or_stint:{ours_id}"}:
                 return True
+            interval = _interval_fact_boundary_parts(event_key)
+            if interval is not None:
+                participant_id, _ = interval
+                participant = participants.get(participant_id)
+                if participant_id == ours_id or (
+                    participant is not None
+                    and ours_class_key is not None
+                    and participant.class_key == ours_class_key
+                ):
+                    return True
         return False
 
     @staticmethod
@@ -194,11 +218,29 @@ class TimingMetricRunner:
             "observed_at_us": observed_at_us,
         }
         prefix = f"metric:{heat.source_heat_id}:{source_frame_id}"
+        event_scopes = [
+            {"scope_kind": candidate.scope_kind, "scope_key": candidate.scope_key}
+            for candidate in evaluation.candidates
+            if candidate.event_boundary
+        ]
+        interval_fact_updates = [
+            {"participant_id": participant_id, "field_kind": field_kind}
+            for boundary in evaluation.event_keys
+            if (parts := _interval_fact_boundary_parts(boundary)) is not None
+            for participant_id, field_kind in (parts,)
+        ]
         events: list[StreamEventCandidate] = [
             StreamEventCandidate(
                 "state",
                 f"{prefix}:state",
-                {**metadata, "data": {"event_keys": list(evaluation.event_keys)}},
+                {
+                    **metadata,
+                    "data": {
+                        "event_keys": list(evaluation.event_keys),
+                        "event_scopes": event_scopes,
+                        "interval_fact_updates": interval_fact_updates,
+                    },
+                },
             ),
             StreamEventCandidate(
                 "metric",
@@ -211,6 +253,8 @@ class TimingMetricRunner:
                             {"scope_kind": candidate.scope_kind, "scope_key": candidate.scope_key}
                             for candidate in evaluation.candidates
                         ],
+                        "event_scopes": event_scopes,
+                        "interval_fact_updates": interval_fact_updates,
                     },
                 },
             ),

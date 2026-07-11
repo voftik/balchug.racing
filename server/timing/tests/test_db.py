@@ -65,7 +65,10 @@ class TimingDatabaseTests(unittest.TestCase):
     def test_migration_is_repeatable_and_enables_wal(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "timing.db"
-            self.assertEqual(migrate(path), ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010"])
+            self.assertEqual(
+                migrate(path),
+                ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011"],
+            )
             self.assertEqual(migrate(path), [])
             connection = connect(path)
             try:
@@ -84,6 +87,7 @@ class TimingDatabaseTests(unittest.TestCase):
                         "stream_events",
                         "stream_event_cursor_floors",
                         "playback_snapshots",
+                        "participant_interval_source_facts",
                     }.issubset(tables)
                 )
             finally:
@@ -115,6 +119,8 @@ class TimingDatabaseTests(unittest.TestCase):
                         "diff_raw",
                         "diff_kind",
                         "pit_time_raw",
+                        "gap_interval_fact_id",
+                        "diff_interval_fact_id",
                         "source_message_id",
                         "source_key",
                     }.issubset(columns)
@@ -155,6 +161,7 @@ class TimingDatabaseTests(unittest.TestCase):
                         "connection_clock_calibrations",
                         "participant_identity_observations",
                         "participant_state_observations",
+                        "participant_interval_source_facts",
                         "tracker_passing_observations",
                         "heat_statistics_current",
                         "heat_statistics_samples",
@@ -186,7 +193,36 @@ class TimingDatabaseTests(unittest.TestCase):
                         "driver_stint_provider_ts_time",
                         "driver_stint_duration_ms",
                         "driver_stint_source_cell_observation_id",
+                        "gap_interval_fact_id",
+                        "diff_interval_fact_id",
                     }.issubset(state_columns)
+                )
+                interval_fact_columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(participant_interval_source_facts)")
+                }
+                self.assertTrue(
+                    {
+                        "interval_kind",
+                        "raw_value",
+                        "interval_ms",
+                        "value_kind",
+                        "source_cell_observation_id",
+                        "source_message_id",
+                        "source_key",
+                        "source_change_ordinal",
+                        "source_handle",
+                        "observation_kind",
+                        "observed_at_us",
+                        "source_position_overall",
+                        "source_position_class",
+                        "source_laps",
+                        "source_state_kind",
+                        "relation_kind",
+                        "target_participant_id",
+                        "target_position_overall",
+                        "target_state_kind",
+                        "target_laps",
+                    }.issubset(interval_fact_columns)
                 )
                 passing_columns = {row[1] for row in connection.execute("PRAGMA table_info(tracker_passings)")}
                 self.assertTrue(
@@ -384,7 +420,10 @@ class TimingDatabaseTests(unittest.TestCase):
             finally:
                 connection.close()
 
-            self.assertEqual(migrate(path), ["0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010"])
+            self.assertEqual(
+                migrate(path),
+                ["0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011"],
+            )
             connection = connect(path)
             try:
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM participants").fetchone()[0], 1)

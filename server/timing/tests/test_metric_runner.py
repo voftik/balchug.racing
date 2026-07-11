@@ -139,6 +139,112 @@ class MetricRunnerIntegrationTests(unittest.TestCase):
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM stream_events").fetchone()[0], 4)
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM playback_snapshots").fetchone()[0], 1)
 
+    def test_interval_fact_boundary_scopes_sse_and_archive_without_state_noise(self):
+        provider_start = 45_000_000
+        received = TIME_SERVICE_EPOCH_UNIX_US + provider_start
+        self.apply(
+            [
+                ["h_i", {"n": "Practice - Open-Pit", "s": provider_start, "f": 6}],
+                ["s_i", provider_start],
+                [
+                    "r_i",
+                    {
+                        "l": {
+                            "h": [
+                                {"n": "POS"},
+                                {"n": "NR"},
+                                {"n": "STATE"},
+                                {"n": "TEAM"},
+                                {"n": "DRIVER IN CAR"},
+                                {"n": "CLS"},
+                                {"n": "PIC"},
+                                {"n": "LAPS"},
+                                {"n": "GAP"},
+                                {"n": "DIFF"},
+                            ]
+                        },
+                        "r": [
+                            [0, 0, "2"],
+                            [0, 1, "21"],
+                            [0, 2, "E45000000"],
+                            [0, 3, "BALCHUG Racing"],
+                            [0, 4, "Киракозов Кирилл"],
+                            [0, 5, "CN PRO"],
+                            [0, 6, "1"],
+                            [0, 7, "5"],
+                            [0, 8, "1.246"],
+                            [0, 9, "0.120"],
+                        ],
+                    },
+                ],
+            ],
+            received_at_us=received,
+        )
+        current = self.connection.execute(
+            "SELECT participant_id,gap_interval_fact_id FROM participant_state_current"
+        ).fetchone()
+        participant_id = current["participant_id"]
+        first_gap_fact_id = current["gap_interval_fact_id"]
+
+        state_only = self.apply(
+            [["r_c", [[0, 2, "E45001000"]]]],
+            received_at_us=received + 1_000_000,
+        )
+        self.assertEqual(
+            self.connection.execute("SELECT gap_interval_fact_id FROM participant_state_current").fetchone()[0],
+            first_gap_fact_id,
+        )
+        state_payload = json.loads(
+            self.connection.execute(
+                "SELECT payload_json FROM stream_events WHERE source_frame_id = ? AND event_type = 'state'",
+                (state_only.id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual(state_payload["data"]["event_keys"], [])
+        self.assertEqual(state_payload["data"]["event_scopes"], [])
+        self.assertEqual(state_payload["data"]["interval_fact_updates"], [])
+
+        gap_update = self.apply(
+            [["r_c", [[0, 8, "1.246"]]]],
+            received_at_us=received + 2_000_000,
+        )
+        self.assertNotEqual(
+            self.connection.execute("SELECT gap_interval_fact_id FROM participant_state_current").fetchone()[0],
+            first_gap_fact_id,
+        )
+        state_payload = json.loads(
+            self.connection.execute(
+                "SELECT payload_json FROM stream_events WHERE source_frame_id = ? AND event_type = 'state'",
+                (gap_update.id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual(state_payload["data"]["event_keys"], [f"interval_fact:{participant_id}:GAP"])
+        self.assertEqual(
+            state_payload["data"]["event_scopes"],
+            [
+                {"scope_kind": "session", "scope_key": self.session.id},
+                {"scope_kind": "class", "scope_key": "cn pro"},
+                {"scope_kind": "participant", "scope_key": participant_id},
+            ],
+        )
+        self.assertEqual(
+            state_payload["data"]["interval_fact_updates"],
+            [{"participant_id": participant_id, "field_kind": "GAP"}],
+        )
+        metric_payload = json.loads(
+            self.connection.execute(
+                "SELECT payload_json FROM stream_events WHERE source_frame_id = ? AND event_type = 'metric'",
+                (gap_update.id,),
+            ).fetchone()[0]
+        )
+        self.assertEqual(metric_payload["data"]["event_scopes"], state_payload["data"]["event_scopes"])
+        playback = self.connection.execute(
+            "SELECT is_event_boundary FROM playback_snapshots WHERE source_frame_id = ?",
+            (gap_update.id,),
+        ).fetchone()
+        self.assertIsNotNone(playback)
+        self.assertTrue(playback["is_event_boundary"])
+
     def test_restart_restores_the_prior_boundary_before_a_red_transition(self):
         provider_start = 50_000_000
         received = TIME_SERVICE_EPOCH_UNIX_US + provider_start

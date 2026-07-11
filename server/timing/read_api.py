@@ -613,6 +613,55 @@ def _statistics(connection: sqlite3.Connection, heat_id: int) -> dict[str, Any] 
     return values
 
 
+def _interval_source_fact_payload(row: sqlite3.Row, prefix: str) -> dict[str, Any] | None:
+    """Expose one current GAP/DIFF pointer with its own source context.
+
+    GAP and DIFF cells are sparse in the provider grid.  The generic current
+    state row can therefore be newer than the displayed interval.  The live
+    read model must never use that row's cached scalar as interval evidence:
+    only the immutable source fact joined by its pointer is public here.
+    """
+
+    if row[f"{prefix}_id"] is None:
+        return None
+    return {
+        "id": row[f"{prefix}_id"],
+        "field_kind": row[f"{prefix}_interval_kind"],
+        "raw_value": row[f"{prefix}_raw_value"],
+        "value_ms": row[f"{prefix}_interval_ms"],
+        "value_kind": row[f"{prefix}_value_kind"],
+        "cell_observation_id": row[f"{prefix}_source_cell_observation_id"],
+        "source_message_id": row[f"{prefix}_source_message_id"],
+        "source_key": row[f"{prefix}_source_key"],
+        "source_change_ordinal": row[f"{prefix}_source_change_ordinal"],
+        "observed_at_us": row[f"{prefix}_observed_at_us"],
+        "source_handle": row[f"{prefix}_source_handle"],
+        "observation_kind": row[f"{prefix}_observation_kind"],
+        "subject_position_overall": row[f"{prefix}_source_position_overall"],
+        "subject_state_kind": row[f"{prefix}_source_state_kind"],
+        "subject_laps": row[f"{prefix}_source_laps"],
+        "target_participant_id": row[f"{prefix}_target_participant_id"],
+        "target_position_overall": row[f"{prefix}_target_position_overall"],
+        "target_state_kind": row[f"{prefix}_target_state_kind"],
+        "target_laps": row[f"{prefix}_target_laps"],
+        "relation_kind": row[f"{prefix}_relation_kind"],
+    }
+
+
+def _interval_source_value(fact: Mapping[str, Any] | None) -> tuple[int | None, str | None, str | None]:
+    """Return compatibility scalar fields only when the exact fact says TIME."""
+
+    if fact is None:
+        return None, None, None
+    value_ms = fact.get("value_ms")
+    value_ms = value_ms if _archive_int(value_ms) is not None and fact.get("value_kind") == "TIME" else None
+    raw_value = fact.get("raw_value")
+    raw_value = raw_value if isinstance(raw_value, str) else None
+    value_kind = fact.get("value_kind")
+    value_kind = value_kind if isinstance(value_kind, str) else None
+    return value_ms, raw_value, value_kind
+
+
 def _participants(connection: sqlite3.Connection, heat_id: int) -> list[dict[str, Any]]:
     rows = connection.execute(
         """
@@ -621,16 +670,46 @@ def _participants(connection: sqlite3.Connection, heat_id: int) -> list[dict[str
                c.position_overall,c.position_class,c.marker,c.laps,c.state,c.state_raw,c.state_kind,
                c.current_driver_name,c.current_driver_stint_raw,c.last_lap_ms,c.last_lap_number,
                c.best_lap_ms,c.best_lap_number,c.last_sectors_json,c.best_sectors_json,
-               c.last_speeds_json,c.gap_ms,c.gap_raw,c.gap_kind,c.diff_ms,c.diff_raw,c.diff_kind,
+               c.last_speeds_json,
                c.sector_json,c.speed_kph,c.pit_time_raw,c.provider_pit_count,
                c.state_timer_target_raw,c.state_timer_target_provider_us,c.state_timer_target_at_us,
                c.provider_pit_count_raw,c.source_message_id,c.source_key,c.updated_at_us,
+               gap_fact.id AS gap_fact_id,gap_fact.interval_kind AS gap_fact_interval_kind,
+               gap_fact.raw_value AS gap_fact_raw_value,gap_fact.interval_ms AS gap_fact_interval_ms,
+               gap_fact.value_kind AS gap_fact_value_kind,
+               gap_fact.source_cell_observation_id AS gap_fact_source_cell_observation_id,
+               gap_fact.source_message_id AS gap_fact_source_message_id,gap_fact.source_key AS gap_fact_source_key,
+               gap_fact.source_change_ordinal AS gap_fact_source_change_ordinal,
+               gap_fact.observed_at_us AS gap_fact_observed_at_us,gap_fact.source_handle AS gap_fact_source_handle,
+               gap_fact.observation_kind AS gap_fact_observation_kind,
+               gap_fact.source_position_overall AS gap_fact_source_position_overall,
+               gap_fact.source_state_kind AS gap_fact_source_state_kind,gap_fact.source_laps AS gap_fact_source_laps,
+               gap_fact.target_participant_id AS gap_fact_target_participant_id,
+               gap_fact.target_position_overall AS gap_fact_target_position_overall,
+               gap_fact.target_state_kind AS gap_fact_target_state_kind,gap_fact.target_laps AS gap_fact_target_laps,
+               gap_fact.relation_kind AS gap_fact_relation_kind,
+               diff_fact.id AS diff_fact_id,diff_fact.interval_kind AS diff_fact_interval_kind,
+               diff_fact.raw_value AS diff_fact_raw_value,diff_fact.interval_ms AS diff_fact_interval_ms,
+               diff_fact.value_kind AS diff_fact_value_kind,
+               diff_fact.source_cell_observation_id AS diff_fact_source_cell_observation_id,
+               diff_fact.source_message_id AS diff_fact_source_message_id,diff_fact.source_key AS diff_fact_source_key,
+               diff_fact.source_change_ordinal AS diff_fact_source_change_ordinal,
+               diff_fact.observed_at_us AS diff_fact_observed_at_us,diff_fact.source_handle AS diff_fact_source_handle,
+               diff_fact.observation_kind AS diff_fact_observation_kind,
+               diff_fact.source_position_overall AS diff_fact_source_position_overall,
+               diff_fact.source_state_kind AS diff_fact_source_state_kind,diff_fact.source_laps AS diff_fact_source_laps,
+               diff_fact.target_participant_id AS diff_fact_target_participant_id,
+               diff_fact.target_position_overall AS diff_fact_target_position_overall,
+               diff_fact.target_state_kind AS diff_fact_target_state_kind,diff_fact.target_laps AS diff_fact_target_laps,
+               diff_fact.relation_kind AS diff_fact_relation_kind,
                i.driver_name_raw AS identity_driver_name,i.source_message_id AS identity_source_message_id,
                i.source_key AS identity_source_key,i.observed_at_us AS identity_observed_at_us
-        FROM participants p
-        LEFT JOIN participant_state_current c
-          ON c.source_heat_id = p.source_heat_id AND c.participant_id = p.id
-        LEFT JOIN participant_identity_segments i
+            FROM participants p
+            LEFT JOIN participant_state_current c
+              ON c.source_heat_id = p.source_heat_id AND c.participant_id = p.id
+            LEFT JOIN participant_interval_source_facts AS gap_fact ON gap_fact.id = c.gap_interval_fact_id
+            LEFT JOIN participant_interval_source_facts AS diff_fact ON diff_fact.id = c.diff_interval_fact_id
+            LEFT JOIN participant_identity_segments i
           ON i.source_heat_id = p.source_heat_id AND i.participant_id = p.id AND i.ended_at_us IS NULL
         WHERE p.source_heat_id = ?
         ORDER BY
@@ -642,6 +721,10 @@ def _participants(connection: sqlite3.Connection, heat_id: int) -> list[dict[str
     result: list[dict[str, Any]] = []
     for row in rows:
         driver_name = row["current_driver_name"] or row["identity_driver_name"]
+        gap_fact = _interval_source_fact_payload(row, "gap_fact")
+        diff_fact = _interval_source_fact_payload(row, "diff_fact")
+        gap_ms, gap_raw, gap_kind = _interval_source_value(gap_fact)
+        diff_ms, diff_raw, diff_kind = _interval_source_value(diff_fact)
         state = None
         if row["source_key"] is not None:
             state = {
@@ -661,12 +744,14 @@ def _participants(connection: sqlite3.Connection, heat_id: int) -> list[dict[str
                 "last_sectors": _json_value(row["last_sectors_json"], context="participant last sectors"),
                 "best_sectors": _json_value(row["best_sectors_json"], context="participant best sectors"),
                 "last_speeds": _json_value(row["last_speeds_json"], context="participant last speeds"),
-                "gap_ms": row["gap_ms"],
-                "gap_raw": row["gap_raw"],
-                "gap_kind": row["gap_kind"],
-                "diff_ms": row["diff_ms"],
-                "diff_raw": row["diff_raw"],
-                "diff_kind": row["diff_kind"],
+                "gap_ms": gap_ms,
+                "gap_raw": gap_raw,
+                "gap_kind": gap_kind,
+                "gap_source_fact": gap_fact,
+                "diff_ms": diff_ms,
+                "diff_raw": diff_raw,
+                "diff_kind": diff_kind,
+                "diff_source_fact": diff_fact,
                 "sector": _json_value(row["sector_json"], context="participant sector"),
                 "speed_kph": row["speed_kph"],
                 "pit_time_raw": row["pit_time_raw"],
@@ -1396,107 +1481,180 @@ def _archive_explicit_laps(entry: Mapping[str, Any]) -> int | None:
     return laps if laps is not None and laps >= 0 else None
 
 
-def _archive_source_time(entry: Mapping[str, Any], field: Literal["gap", "diff"]) -> int | None:
-    state = _archive_participant_state(entry)
-    value = _archive_int(state.get(f"{field}_ms"))
-    if value is not None and state.get(f"{field}_kind") == "TIME":
-        return value
-    return _archive_int(_archive_participant_values(entry).get(f"source_{field}_ms"))
+_ARCHIVE_INTERVAL_RELATIONS = (
+    ("class_leader", "gap_to_class_leader_ms", "lap_delta_to_class_leader"),
+    ("class_ahead", "gap_to_ahead_ms", "lap_delta_to_ahead"),
+    ("class_behind", "gap_to_behind_ms", "lap_delta_to_behind"),
+)
+
+_ARCHIVE_INTERVAL_FACT_KEYS = (
+    "id",
+    "field_kind",
+    "raw_value",
+    "value_ms",
+    "value_kind",
+    "cell_observation_id",
+    "source_message_id",
+    "source_key",
+    "source_change_ordinal",
+    "observed_at_us",
+    "source_handle",
+    "observation_kind",
+    "subject_position_overall",
+    "subject_state_kind",
+    "subject_laps",
+    "target_participant_id",
+    "target_position_overall",
+    "target_state_kind",
+    "target_laps",
+    "relation_kind",
+)
 
 
-def _archive_position(entry: Mapping[str, Any]) -> int | None:
-    values = _archive_participant_values(entry)
-    state = _archive_participant_state(entry)
-    value = _archive_int(values.get("position_overall"))
-    if value is None:
-        value = _archive_int(state.get("position_overall"))
-    return value if value is not None and value >= 1 else None
+def _archive_interval_fact_payload(value: Any) -> dict[str, Any] | None:
+    """Retain only named field-level provenance from a metric projection."""
+
+    if not isinstance(value, Mapping):
+        return None
+    return {key: value.get(key) for key in _ARCHIVE_INTERVAL_FACT_KEYS}
 
 
-def _archive_interval_participant_is_on_track(entry: Mapping[str, Any]) -> bool:
-    """Accept an archive time interval only for an active on-track relation.
+def _archive_valid_time_fact(fact: Mapping[str, Any]) -> bool:
+    """Require the provenance fields that make a GAP/DIFF scalar auditable."""
 
-    Result-grid fields are incremental.  A participant can enter the pits
-    while its prior ``GAP`` cell remains the latest durable table value.  That
-    historical cell is retained verbatim in RAW, but it must not be presented
-    as a current race interval for a lap point while either side is in pit or
-    has an unknown state.
+    return (
+        fact.get("field_kind") in {"GAP", "DIFF"}
+        and fact.get("value_kind") == "TIME"
+        and (_archive_int(fact.get("value_ms")) is not None and _archive_int(fact.get("value_ms")) >= 0)
+        and (_archive_int(fact.get("cell_observation_id")) is not None and _archive_int(fact.get("cell_observation_id")) >= 1)
+        and (_archive_int(fact.get("source_message_id")) is not None and _archive_int(fact.get("source_message_id")) >= 1)
+        and isinstance(fact.get("source_key"), str)
+        and bool(fact["source_key"].strip())
+        and (_archive_int(fact.get("source_change_ordinal")) is not None and _archive_int(fact.get("source_change_ordinal")) >= 0)
+        and (_archive_int(fact.get("observed_at_us")) is not None and _archive_int(fact.get("observed_at_us")) >= 0)
+        and isinstance(fact.get("source_handle"), str)
+        and bool(fact["source_handle"].strip())
+        and isinstance(fact.get("observation_kind"), str)
+        and bool(fact["observation_kind"].strip())
+    )
+
+
+def _archive_unavailable_relation(target_participant_id: str | None) -> dict[str, Any]:
+    """Make a legacy projection explicitly unavailable rather than inferred."""
+
+    return {
+        "target_participant_id": target_participant_id,
+        "status": "UNAVAILABLE_PROVENANCE",
+        "value_ms": None,
+        "relation_kind": None,
+        "source_facts": [],
+        "source_observed_at_us": None,
+        "source_age_ms": None,
+        "ours_state_kind": None,
+        "target_state_kind": None,
+        "ours_laps": None,
+        "target_laps": None,
+    }
+
+
+def _archive_relation_payload(value: Any, *, expected_target_id: str | None) -> dict[str, Any]:
+    """Project an engine-evaluated relation without re-evaluating raw cells.
+
+    Archive playback is an audit surface.  Older snapshots did not retain
+    target-bound GAP/DIFF provenance, so a read-time subtraction of cached
+    grid fields would make a stale interval look current.  Keep only the
+    structured engine relation and fail closed for every older shape.
     """
 
-    state = _archive_participant_state(entry)
-    kind = _comparison_text(state.get("state_kind"), state.get("state"))
-    return kind in {"ON_TRACK", "OUT_LAP"}
+    if not isinstance(value, Mapping):
+        return _archive_unavailable_relation(expected_target_id)
+    status = value.get("status")
+    if not isinstance(status, str) or not status.strip():
+        return _archive_unavailable_relation(expected_target_id)
+    target_id = _comparison_text(value.get("target_participant_id"), expected_target_id)
+    if expected_target_id is not None and target_id != expected_target_id:
+        return _archive_unavailable_relation(expected_target_id)
+    raw_facts = value.get("source_facts")
+    if not isinstance(raw_facts, Sequence) or isinstance(raw_facts, (str, bytes, bytearray)):
+        return _archive_unavailable_relation(expected_target_id)
+    source_facts = [_archive_interval_fact_payload(fact) for fact in raw_facts]
+    if any(fact is None for fact in source_facts):
+        return _archive_unavailable_relation(expected_target_id)
+    facts = [fact for fact in source_facts if fact is not None]
+    raw_value_ms = _archive_int(value.get("value_ms"))
+    is_self = status == "SELF"
+    is_valid = status == "VALID"
+    if is_self:
+        if raw_value_ms != 0 or facts:
+            return _archive_unavailable_relation(expected_target_id)
+    elif is_valid:
+        if raw_value_ms is None or raw_value_ms < 0 or not facts or not all(_archive_valid_time_fact(fact) for fact in facts):
+            return _archive_unavailable_relation(expected_target_id)
+    else:
+        raw_value_ms = None
+    return {
+        "target_participant_id": target_id,
+        "status": status,
+        "value_ms": raw_value_ms if is_valid or is_self else None,
+        "relation_kind": _comparison_text(value.get("relation_kind")),
+        "source_facts": facts,
+        "source_observed_at_us": _archive_int(value.get("source_observed_at_us")),
+        "source_age_ms": _archive_int(value.get("source_age_ms")),
+        "ours_state_kind": _comparison_text(value.get("ours_state_kind")),
+        "target_state_kind": _comparison_text(value.get("target_state_kind")),
+        "ours_laps": _archive_int(value.get("ours_laps")),
+        "target_laps": _archive_int(value.get("target_laps")),
+    }
 
 
-def _archive_relative_gap_ms(
-    ours: Mapping[str, Any], target: Mapping[str, Any],
-) -> int | None:
-    """Re-evaluate one source interval from immutable archive facts.
-
-    Older playback projections can contain tracker-derived local lap counts
-    when a partial capture had no grid LAPS column.  Those counts are not
-    allowed to veto a provider TIME GAP.  Explicit source LAPS still protect
-    against presenting a time interval for genuinely lapped cars.
-    """
-
-    if _archive_participant_id(ours) == _archive_participant_id(target):
-        return 0
-    if not _archive_interval_participant_is_on_track(ours) or not _archive_interval_participant_is_on_track(target):
-        return None
-    ours_laps = _archive_explicit_laps(ours)
-    target_laps = _archive_explicit_laps(target)
-    if ours_laps is not None and target_laps is not None and ours_laps != target_laps:
-        return None
-    ours_gap = _archive_source_time(ours, "gap")
-    target_gap = _archive_source_time(target, "gap")
-    if ours_gap is not None and target_gap is not None:
-        return abs(ours_gap - target_gap)
-    ours_position = _archive_position(ours)
-    target_position = _archive_position(target)
-    if target_position == 1 and ours_gap is not None:
-        return ours_gap
-    if ours_position == 1 and target_gap is not None:
-        return target_gap
-    if ours_position is not None and target_position == ours_position - 1:
-        return _archive_source_time(ours, "diff")
-    if ours_position is not None and target_position == ours_position + 1:
-        return _archive_source_time(target, "diff")
-    return None
+def _archive_relation_value_ms(relation: Mapping[str, Any]) -> int | None:
+    value = _archive_int(relation.get("value_ms"))
+    return value if relation.get("status") in {"VALID", "SELF"} and value is not None and value >= 0 else None
 
 
 def _archive_interval_derivation(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """Return read-time interval values without mutating durable projections."""
+    """Expose engine-evaluated interval provenance without synthesizing it."""
 
     computed = payload.get("computed")
     computed = computed if isinstance(computed, Mapping) else {}
     session = computed.get("session")
     session = session if isinstance(session, Mapping) else {}
+    relation_values = session.get("relation_intervals")
+    relation_values = relation_values if isinstance(relation_values, Mapping) else {}
+    relations = {
+        relation: _archive_relation_payload(
+            relation_values.get(relation),
+            expected_target_id=_comparison_text(session.get(f"{relation}_id")),
+        )
+        for relation, _, _ in _ARCHIVE_INTERVAL_RELATIONS
+    }
+
     ours_id = _comparison_text(session.get("ours_participant_id"))
     raw_participants = payload.get("class_participants")
-    if ours_id is None or not isinstance(raw_participants, list):
-        return {"lap_count_scope": "unknown"}
     participants: dict[str, Mapping[str, Any]] = {}
-    for candidate in raw_participants:
-        if not isinstance(candidate, Mapping):
-            continue
-        participant_id = _archive_participant_id(candidate)
-        if participant_id is not None:
-            participants[participant_id] = candidate
-    ours = participants.get(ours_id)
-    if ours is None:
-        return {"lap_count_scope": "unknown"}
+    if isinstance(raw_participants, list):
+        for candidate in raw_participants:
+            if not isinstance(candidate, Mapping):
+                continue
+            participant_id = _archive_participant_id(candidate)
+            if participant_id is not None:
+                participants[participant_id] = candidate
+    ours = participants.get(ours_id) if ours_id is not None else None
     result: dict[str, Any] = {
-        "lap_count_scope": "source_grid" if _archive_explicit_laps(ours) is not None else "capture_tracker",
+        "lap_count_scope": (
+            "source_grid"
+            if ours is not None and _archive_explicit_laps(ours) is not None
+            else "capture_tracker"
+            if ours is not None
+            else "unknown"
+        ),
+        "relations": relations,
     }
-    for relation, gap_key, lap_key in (
-        ("class_leader", "gap_to_class_leader_ms", "lap_delta_to_class_leader"),
-        ("class_ahead", "gap_to_ahead_ms", "lap_delta_to_ahead"),
-        ("class_behind", "gap_to_behind_ms", "lap_delta_to_behind"),
-    ):
+    for relation, gap_key, lap_key in _ARCHIVE_INTERVAL_RELATIONS:
+        result[gap_key] = _archive_relation_value_ms(relations[relation])
         target_id = _comparison_text(session.get(f"{relation}_id"))
         target = participants.get(target_id) if target_id is not None else None
-        result[gap_key] = _archive_relative_gap_ms(ours, target) if target is not None else None
-        ours_laps = _archive_explicit_laps(ours)
+        ours_laps = _archive_explicit_laps(ours) if ours is not None else None
         target_laps = _archive_explicit_laps(target) if target is not None else None
         result[lap_key] = (
             ours_laps - target_laps

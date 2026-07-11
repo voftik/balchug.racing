@@ -33,6 +33,7 @@ _SESSION_KEYS = (
     "gap_to_class_leader_ms",
     "gap_to_ahead_ms",
     "gap_to_behind_ms",
+    "relation_intervals",
     "lap_delta_to_class_leader",
     "lap_delta_to_ahead",
     "lap_delta_to_behind",
@@ -69,6 +70,8 @@ _PARTICIPANT_KEYS = (
     "best_lap_ms",
     "source_gap_ms",
     "source_diff_ms",
+    "source_gap_fact",
+    "source_diff_fact",
     "pace_3_ms",
     "pace_5_ms",
     "pace_10_ms",
@@ -117,6 +120,35 @@ def _compact(values: Mapping[str, Any] | None, keys: tuple[str, ...]) -> dict[st
     return {key: values.get(key) for key in keys} if values is not None else None
 
 
+def _interval_fact_payload(fact: Any) -> dict[str, Any] | None:
+    """Expose field-level GAP/DIFF provenance without a generic row timestamp."""
+
+    if fact is None:
+        return None
+    return {
+        "id": fact.id,
+        "field_kind": fact.field_kind,
+        "raw_value": fact.raw_value,
+        "value_ms": fact.value_ms,
+        "value_kind": fact.value_kind,
+        "cell_observation_id": fact.cell_observation_id,
+        "source_message_id": fact.source_message_id,
+        "source_key": fact.source_key,
+        "source_change_ordinal": fact.source_change_ordinal,
+        "observed_at_us": fact.observed_at_us,
+        "source_handle": fact.source_handle,
+        "observation_kind": fact.observation_kind,
+        "subject_position_overall": fact.subject_position_overall,
+        "subject_state_kind": fact.subject_state_kind,
+        "subject_laps": fact.subject_laps,
+        "target_participant_id": fact.target_participant_id,
+        "target_position_overall": fact.target_position_overall,
+        "target_state_kind": fact.target_state_kind,
+        "target_laps": fact.target_laps,
+        "relation_kind": fact.relation_kind,
+    }
+
+
 def _participant_payload(participant: ParticipantMetricInput | None) -> dict[str, Any] | None:
     if participant is None:
         return None
@@ -143,6 +175,11 @@ def _participant_payload(participant: ParticipantMetricInput | None) -> dict[str
                 "gap_ms": state.gap_ms,
                 "gap_raw": state.gap_raw,
                 "gap_kind": state.gap_kind,
+                "gap_source_fact": _interval_fact_payload(state.gap_interval_fact),
+                "diff_ms": state.diff_ms,
+                "diff_raw": state.diff_raw,
+                "diff_kind": state.diff_kind,
+                "diff_source_fact": _interval_fact_payload(state.diff_interval_fact),
                 "provider_pit_count": state.provider_pit_count,
                 "observed_at_us": state.updated_at_us,
             }
