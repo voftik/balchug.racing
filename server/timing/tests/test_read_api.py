@@ -380,6 +380,36 @@ class TimingReadModelTests(unittest.TestCase):
                 ("lap-29-1", self.heat_id, "nr-29", 1, 5_000_000, 110_600, "[]", "lap:29:1", 5_000_000),
             ),
         )
+        self.connection.executemany(
+            """
+            INSERT INTO laps(
+              id,source_heat_id,participant_id,lap_number,completed_at_us,duration_ms,sectors_json,
+              flag,is_in_lap,is_out_lap,crosses_pit,is_clean,source_key,created_at_us
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                # The source can advance LAPS without publishing a duration.
+                # It remains a raw engineer-facing lap, even though it must
+                # not influence the legacy clean-lap benchmark.
+                (
+                    "lap-9-null-duration", self.heat_id, "nr-9", 3, 4_000_000, None, "[]",
+                    "YELLOW", 0, 1, 0, 0, "lap:9:3", 4_000_000,
+                ),
+                # A skipped grid number has neither a trusted completion time
+                # nor a duration. It is still a durable raw source fact.
+                (
+                    "lap-9-unplaced", self.heat_id, "nr-9", 4, None, None, None,
+                    None, 0, 0, 0, 0, "lap:9:4", 4_000_000,
+                ),
+                # Facts can be written after the last retained playback
+                # keyframe. The raw series is a heat fact surface, not a
+                # keyframe-derived chart, so it must retain this as well.
+                (
+                    "lap-9-after-playback", self.heat_id, "nr-9", 5, 8_000_000, 112_000, "[]",
+                    "GREEN", 0, 0, 0, 1, "lap:9:5", 8_000_000,
+                ),
+            ),
+        )
         self.connection.execute(
             """
             INSERT INTO pit_stops(
@@ -422,12 +452,40 @@ class TimingReadModelTests(unittest.TestCase):
         self.assertEqual(aggregate["lap_series"]["benchmark_kind"], "minute_median")
         self.assertEqual(aggregate["lap_series"]["benchmark"][0]["median_duration_ms"], 109_900.0)
         self.assertEqual(aggregate["lap_series"]["benchmark"][0]["participant_count"], 2)
+        raw_competitors = aggregate["lap_series"]["competitors"]
+        self.assertEqual(
+            [competitor["participant_id"] for competitor in raw_competitors],
+            ["nr-9", "nr-29", "nr-77"],
+        )
+        self.assertEqual(
+            [lap["lap_number"] for lap in raw_competitors[0]["laps"]],
+            [1, 2, 3, 4, 5],
+        )
+        self.assertEqual(raw_competitors[0]["laps"][2]["duration_ms"], None)
+        self.assertFalse(raw_competitors[0]["laps"][2]["is_clean"])
+        self.assertTrue(raw_competitors[0]["laps"][2]["is_out_lap"])
+        self.assertEqual(raw_competitors[0]["laps"][3]["completed_at_us"], None)
+        self.assertEqual(raw_competitors[2]["laps"], [])
+        self.assertIn("without averaging or decimation", aggregate["semantics"]["lap_series_competitors"])
+        # The legacy bounded player field remains bounded, but this raw
+        # contract must retain every competitor lap regardless of that limit.
+        with patch("timing.read_api.MAX_ARCHIVE_COMPARISON_LAPS_PER_PARTICIPANT", 1):
+            unbounded_raw = self.model.archive_comparison("session-1", mode="all")
+        self.assertEqual(
+            [lap["lap_number"] for lap in unbounded_raw["lap_series"]["competitors"][0]["laps"]],
+            [1, 2, 3, 4, 5],
+        )
 
         selected = self.model.archive_comparison("session-1", mode="participant", participant_id="nr-29")
         self.assertEqual(selected["comparison"]["participant_id"], "nr-29")
         self.assertEqual(selected["points"][0]["benchmark_pace_5_ms"], None)
         self.assertEqual(selected["points"][2]["benchmark_pace_5_ms"], 109_200)
         self.assertEqual([lap["participant_id"] for lap in selected["lap_series"]["benchmark"]], ["nr-29"])
+        self.assertEqual(
+            [competitor["participant_id"] for competitor in selected["lap_series"]["competitors"]],
+            ["nr-29"],
+        )
+        self.assertEqual([lap["lap_number"] for lap in selected["lap_series"]["competitors"][0]["laps"]], [1])
         # A legacy source row can carry is_clean=1 even though its complete
         # interval spans a persisted pit. The archive reader must correct that
         # fact before it can influence an engineer-facing chart.

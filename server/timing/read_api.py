@@ -43,9 +43,10 @@ MAX_ARCHIVE_SESSIONS = 100
 # timeline while keeping the public manifest bounded.
 MAX_ARCHIVE_MARKERS = 2_000
 ARCHIVE_FINALIZATION_WINDOW_US = 60 * US_PER_SECOND
-# The player receives raw lap facts for at most one or two cars.  This keeps
-# a pathological short-lap 24-hour session bounded without degrading the
-# server-side class benchmark, which is calculated from the complete facts.
+# Legacy player series for our car and one selected competitor are bounded.
+# The additive archive ``lap_series.competitors`` contract deliberately keeps
+# every raw competitor lap: a per-lap engineer view must not silently discard
+# a slow, pit-affected, or time-less source observation.
 MAX_ARCHIVE_COMPARISON_LAPS_PER_PARTICIPANT = 2_000
 ARCHIVE_COMPARISON_LAP_BUCKET_US = 60 * US_PER_SECOND
 # Time Service emits an explicit server clock about every 30 seconds.  Archive
@@ -1737,10 +1738,28 @@ def _archive_comparison_lap_rows(
     participant_ids: Sequence[str],
     first_at_us: int,
     last_at_us: int,
+    include_unplaced: bool = False,
+    clip_to_archive_range: bool = True,
 ) -> dict[str, list[dict[str, Any]]]:
+    """Return persisted raw lap facts in deterministic lap-number order.
+
+    The legacy comparison series has always required a completed timestamp so
+    it can be plotted on the archive timeline.  The raw competitor contract
+    additionally preserves every persisted row in the selected heat, including
+    rows without a completion time: source LAPS counters can advance by more
+    than one and the normalizer correctly retains those unknown facts instead
+    of inventing a completion time or duration.
+    """
+
     if not participant_ids:
         return {}
     placeholders = ",".join("?" for _ in participant_ids)
+    completed_at_filter = "" if include_unplaced else " AND f.completed_at_us IS NOT NULL"
+    lap_order = (
+        "f.participant_id,f.lap_number,f.completed_at_us,f.id"
+        if include_unplaced
+        else "f.participant_id,f.completed_at_us,f.lap_number"
+    )
     rows = connection.execute(
         f"""
         SELECT f.participant_id,p.start_number,p.team_name,f.lap_number,f.completed_at_us,f.duration_ms,
@@ -1748,8 +1767,8 @@ def _archive_comparison_lap_rows(
         FROM laps f
         JOIN participants p ON p.id = f.participant_id
         WHERE f.source_heat_id = ? AND f.participant_id IN ({placeholders})
-          AND f.completed_at_us IS NOT NULL
-        ORDER BY f.participant_id,f.completed_at_us,f.lap_number
+          {completed_at_filter}
+        ORDER BY {lap_order}
         """,
         (heat_id, *participant_ids),
     ).fetchall()
@@ -1769,10 +1788,11 @@ def _archive_comparison_lap_rows(
     previous_completed_at_us: dict[str, int] = {}
     for row in rows:
         participant_id = row["participant_id"]
-        completed_at_us = int(row["completed_at_us"])
-        previous_at_us = previous_completed_at_us.get(participant_id)
+        raw_completed_at_us = row["completed_at_us"]
+        completed_at_us = int(raw_completed_at_us) if raw_completed_at_us is not None else None
         crosses_pit_interval = False
-        if previous_at_us is not None:
+        previous_at_us = previous_completed_at_us.get(participant_id)
+        if completed_at_us is not None and previous_at_us is not None:
             for pit in pits_by_participant.get(participant_id, ()):
                 if not bool(pit["completed"]):
                     continue
@@ -1781,8 +1801,15 @@ def _archive_comparison_lap_rows(
                 if entered_at_us < completed_at_us and (exited_at_us is None or exited_at_us > previous_at_us):
                     crosses_pit_interval = True
                     break
-        previous_completed_at_us[participant_id] = completed_at_us
-        if completed_at_us < first_at_us or completed_at_us > last_at_us:
+        if completed_at_us is not None:
+            previous_completed_at_us[participant_id] = completed_at_us
+        if completed_at_us is None and not include_unplaced:
+            continue
+        if (
+            clip_to_archive_range
+            and completed_at_us is not None
+            and (completed_at_us < first_at_us or completed_at_us > last_at_us)
+        ):
             continue
         source_is_clean = bool(row["is_clean"])
         grouped.setdefault(row["participant_id"], []).append(
@@ -1802,6 +1829,36 @@ def _archive_comparison_lap_rows(
             }
         )
     return grouped
+
+
+def _archive_raw_lap_competitors(
+    participants: Sequence[Mapping[str, Any]],
+    laps_by_participant: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    participant_ids: Sequence[str],
+) -> list[dict[str, Any]]:
+    """Attach every raw lap fact to an explicitly ordered competitor roster."""
+
+    by_id = {
+        participant_id: participant
+        for participant in participants
+        if (participant_id := _comparison_text(participant.get("participant_id"))) is not None
+    }
+    result: list[dict[str, Any]] = []
+    for participant_id in participant_ids:
+        participant = by_id[participant_id]
+        result.append(
+            {
+                "participant_id": participant_id,
+                "start_number": participant.get("start_number"),
+                "team_name": participant.get("team_name"),
+                "car_name": participant.get("car_name"),
+                "class_name": participant.get("class_name"),
+                "driver_name": participant.get("driver_name"),
+                "laps": [dict(lap) for lap in laps_by_participant.get(participant_id, ())],
+            }
+        )
+    return result
 
 
 def _bounded_archive_lap_rows(laps: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -1960,9 +2017,13 @@ def read_archive_comparison(
                 "participants": [],
                 "points": [],
                 "pit_stops": [],
-                "lap_series": {"ours": [], "benchmark": [], "benchmark_kind": None},
+                "lap_series": {"ours": [], "benchmark": [], "benchmark_kind": None, "competitors": []},
                 "semantics": {
                     "series": "step",
+                    "lap_series_competitors": (
+                        "unaggregated raw lap facts for the requested competitors; no raw lap is filtered, "
+                        "averaged, or decimated"
+                    ),
                     "missing_values": "null values are not interpolated",
                 },
             }
@@ -2024,6 +2085,24 @@ def read_archive_comparison(
             first_at_us=first_at_us,
             last_at_us=last_at_us,
         )
+        raw_competitor_ids = (
+            [str(participant_id)]
+            if mode == "participant"
+            else [
+                str(participant["participant_id"])
+                for participant in participants
+                if participant["participant_id"] != ours_id
+            ]
+        )
+        raw_competitor_laps = _archive_comparison_lap_rows(
+            connection,
+            heat_id=int(heat["id"]),
+            participant_ids=raw_competitor_ids,
+            first_at_us=first_at_us,
+            last_at_us=last_at_us,
+            include_unplaced=True,
+            clip_to_archive_range=False,
+        )
         lap_series = {
             "ours": _bounded_archive_lap_rows(raw_lap_rows.get(ours_id, [])),
             "benchmark": (
@@ -2036,6 +2115,11 @@ def read_archive_comparison(
                 )
             ),
             "benchmark_kind": "participant" if mode == "participant" else "minute_median",
+            "competitors": _archive_raw_lap_competitors(
+                participants,
+                raw_competitor_laps,
+                participant_ids=raw_competitor_ids,
+            ),
         }
         return {
             "schema_version": ARCHIVE_SCHEMA_VERSION,
@@ -2075,6 +2159,14 @@ def read_archive_comparison(
                     "clean laps for our car and the selected participant; an interval that intersects a persisted pit stop is excluded even if an older source row was marked clean; display points are bounded and preserve non-clean breaks"
                     if mode == "participant"
                     else "one-minute median of the latest clean lap per competitor, excluding our car; pit-crossing intervals are excluded"
+                ),
+                "lap_series_competitors": (
+                    "unaggregated raw lap facts for every competitor in our archived class, ordered by participant "
+                    "number and lap number; includes non-clean laps and duration_ms=null rows without averaging or "
+                    "decimation"
+                    if mode == "all"
+                    else "unaggregated raw lap facts for the selected competitor, ordered by lap number; includes "
+                    "non-clean laps and duration_ms=null rows without averaging or decimation"
                 ),
                 "pit_stops": "confirmed pit in/out facts clipped only for timeline display; pit_lane_ms remains the measured full duration",
                 "missing_values": "null values are not interpolated or converted to zero",
