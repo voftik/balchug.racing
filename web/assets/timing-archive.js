@@ -2057,11 +2057,17 @@
     return geometry;
   }
 
-  function sectorTooltipLine(label, point, value, key) {
-    if (!point) return label + " · круг не подтверждён в этом шаге";
+  function sectorTooltipTeam(point, fallback) {
+    if (!point) return fallback;
+    var number = point.startNumber ? "#" + point.startNumber + " · " : "";
+    return number + (point.teamName || fallback);
+  }
+
+  function sectorTooltipValueLine(point, value, key) {
+    if (!point) return "Круг не подтверждён в этом шаге";
     var sourceCell = sectorSourceCellId(point, key);
     var source = sourceCell === null ? "" : " · LAST табло";
-    return label + " · " + sectorLapLabel(point) + " · " + formatSectorValue(value) + " · " + sectorClockText(point) + source;
+    return sectorLapLabel(point) + " · " + formatSectorValue(value) + source;
   }
 
   function renderSectorTooltip(cell, geometry, sample, anchor) {
@@ -2075,25 +2081,31 @@
     var deltaClass = sectorDeltaClass(sample.delta);
     var color = deltaClass === "fast" ? "#16824F" : (deltaClass === "slow" ? "#F0143D" : "#1B365D");
     var modeTitle = geometry.configuration.competitor ?
-      "Δ BALCHUG − " + comparisonOptionLabel(geometry.configuration.competitor) :
+      "Δ BALCHUG − соперник" :
       "Δ к центральному кругу";
     tooltip.style.setProperty("--ta-tooltip-accent", color);
     tooltip.replaceChildren();
     appendTooltipText(tooltip, "ta-tooltip-kicker", clock.source ? "Время табло" : "Время записи");
     appendTooltipText(tooltip, "ta-tooltip-time", formatAbsolute(clock.atUs));
     appendTooltipText(tooltip, "ta-tooltip-primary", cell.title + " · " + sectorDeltaText(sample.delta));
-    appendTooltipText(tooltip, "ta-tooltip-detail", sectorTooltipLine("BALCHUG Racing", sample.ownPoint, sample.ownValue, cell.key));
+    appendTooltipText(tooltip, "ta-tooltip-team", sectorTooltipTeam(sample.ownPoint, "BALCHUG Racing"));
+    appendTooltipText(tooltip, "ta-tooltip-detail", sectorTooltipValueLine(sample.ownPoint, sample.ownValue, cell.key));
     if (geometry.configuration.competitor) {
       appendTooltipText(
         tooltip,
+        "ta-tooltip-team",
+        sectorTooltipTeam(sample.competitorPoint, comparisonOptionLabel(geometry.configuration.competitor))
+      );
+      appendTooltipText(
+        tooltip,
         "ta-tooltip-detail",
-        sectorTooltipLine(comparisonOptionLabel(geometry.configuration.competitor), sample.competitorPoint, sample.competitorValue, cell.key)
+        sectorTooltipValueLine(sample.competitorPoint, sample.competitorValue, cell.key)
       );
     }
     appendTooltipText(
       tooltip,
       "ta-tooltip-context",
-      "Шаг " + (sample.offset > 0 ? "+" : "") + sample.offset + " · " + modeTitle + ". Отрицательная дельта быстрее, положительная медленнее."
+      "Шаг " + (sample.offset > 0 ? "+" : "") + sample.offset + " · " + modeTitle
     );
     positionArchiveTooltip(tooltip, cell.canvas, anchor || { x: geometry.xAt(sample.offset), y: geometry.yAt ? geometry.yAt(sample.ownValue !== null ? sample.ownValue : sample.competitorValue) : geometry.height / 2 });
   }
