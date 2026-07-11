@@ -22,6 +22,13 @@
     amber: "#b96d00",
     violet: "#7356a5"
   };
+  var SERIES_FILLS = {
+    ours: "rgba(240, 20, 61, .18)",
+    blue: "rgba(25, 118, 184, .18)",
+    teal: "rgba(20, 132, 119, .18)",
+    amber: "rgba(185, 109, 0, .18)",
+    violet: "rgba(115, 86, 165, .18)"
+  };
 
   function byId(id) { return document.getElementById(id); }
   function all(selector, root) { return Array.prototype.slice.call((root || document).querySelectorAll(selector)); }
@@ -67,6 +74,18 @@
   function formatGap(ms) {
     if (!isNumber(ms)) return "—";
     return (ms / 1000).toFixed(3) + " с";
+  }
+  function formatPitLaneTime(ms) {
+    if (!isNumber(ms) || ms < 0) return "—";
+    var value = Math.round(ms);
+    var hours = Math.floor(value / 3600000);
+    var minutes = Math.floor((value % 3600000) / 60000);
+    var seconds = Math.floor((value % 60000) / 1000);
+    var milliseconds = value % 1000;
+    var tail = String(seconds).padStart(2, "0") + "." + String(milliseconds).padStart(3, "0");
+    if (hours) return hours + ":" + String(minutes).padStart(2, "0") + ":" + tail;
+    if (minutes) return minutes + ":" + tail;
+    return seconds + "." + String(milliseconds).padStart(3, "0") + " с";
   }
   function formatGapTime(ms) {
     if (!isNumber(ms)) return "—";
@@ -302,6 +321,7 @@
         stintNumber: metric.stint_number,
         stintElapsedS: metric.stint_elapsed_s,
         stintTrend: metric.stint_trend_ms_per_lap,
+        stintSummary: Array.isArray(metric.stint_summary) ? metric.stint_summary : [],
         pitHistory: Array.isArray(metric.pit_history) ? metric.pit_history : []
       };
     });
@@ -382,13 +402,18 @@
       stateKind: "ON_TRACK", observedLaps: 37, lapCountExact: true,
       gapCoordinate: { status: "EXACT", observedAtUs: 1783771500000000, gapToLeaderLaps: 1, gapToLeaderResidualMs: 8365 },
       stintNumber: 2, stintElapsedS: 1288,
-      stintTrend: 42, pitHistory: [{ stop_number: 1, pit_in_at_us: 1783770960000000, pit_out_at_us: 1783771038400000, pit_in_lap: 25, pit_out_lap: 26, pit_lane_duration_ms: 78400 }]
+      stintTrend: 42,
+      stintSummary: [
+        { stint_number: 1, completed_laps: 25 },
+        { stint_number: 2, completed_laps: 12 }
+      ],
+      pitHistory: [{ stop_number: 1, pit_in_at_us: 1783770960000000, pit_out_at_us: 1783771038400000, pit_in_lap: 25, pit_out_lap: 26, pit_lane_duration_ms: 78400 }]
     };
     var participants = [
-      { id: "demo-9", startNumber: "9", teamName: "Про Моторспорт", driverName: "Мухин Игорь", carName: "Norma", className: "CN PRO", classKey: "cn pro", active: true, isOurs: false, positionClass: 1, positionOverall: 1, lastLapMs: 106105, bestLapMs: 105260, pace3Ms: 106310, pace5Ms: 106460, pace10Ms: 106720, tyreAge: 8, pitsCompleted: 2, stateKind: "ON_TRACK", observedLaps: 38, lapCountExact: true, gapCoordinate: { status: "EXACT", observedAtUs: 1783771500000000, gapToLeaderLaps: 0, gapToLeaderResidualMs: 0 }, stintNumber: 3, stintElapsedS: 866, pitHistory: [] },
+      { id: "demo-9", startNumber: "9", teamName: "Про Моторспорт", driverName: "Мухин Игорь", carName: "Norma", className: "CN PRO", classKey: "cn pro", active: true, isOurs: false, positionClass: 1, positionOverall: 1, lastLapMs: 106105, bestLapMs: 105260, pace3Ms: 106310, pace5Ms: 106460, pace10Ms: 106720, tyreAge: 8, pitsCompleted: 2, stateKind: "ON_TRACK", observedLaps: 38, lapCountExact: true, gapCoordinate: { status: "EXACT", observedAtUs: 1783771500000000, gapToLeaderLaps: 0, gapToLeaderResidualMs: 0 }, stintNumber: 3, stintElapsedS: 866, stintSummary: [{ stint_number: 1, completed_laps: 14 }, { stint_number: 2, completed_laps: 16 }, { stint_number: 3, completed_laps: 8 }], pitHistory: [{ stop_number: 1, pit_in_at_us: 1783768200000000, pit_out_at_us: 1783768385010000, pit_in_lap: 14, pit_out_lap: 15, pit_lane_duration_ms: 185010 }, { stop_number: 2, pit_in_at_us: 1783770600000000, pit_out_at_us: 1783770783200000, pit_in_lap: 30, pit_out_lap: 31, pit_lane_duration_ms: 183200 }] },
       ours,
-      { id: "demo-29", startNumber: "29", teamName: "TEAMGARIS 29", driverName: "Сидорук Станислав", carName: "LIGIER JS P325", className: "CN PRO", classKey: "cn pro", active: true, isOurs: false, positionClass: 3, positionOverall: 4, lastLapMs: 107149, bestLapMs: 106887, pace3Ms: 106940, pace5Ms: 107080, pace10Ms: 107220, tyreAge: 16, pitsCompleted: 1, stateKind: "ON_TRACK", observedLaps: 37, lapCountExact: true, gapCoordinate: { status: "EXACT", observedAtUs: 1783771500000000, gapToLeaderLaps: 1, gapToLeaderResidualMs: 13497 }, stintNumber: 2, stintElapsedS: 1754, pitHistory: [] },
-      { id: "demo-67", startNumber: "67", teamName: "Quasar Motorsport", driverName: "Громов Сергей", carName: "Ligier LMP3", className: "CN PRO", classKey: "cn pro", active: true, isOurs: false, positionClass: 4, positionOverall: 6, lastLapMs: 108221, bestLapMs: 107460, pace3Ms: 108050, pace5Ms: 108130, pace10Ms: 108340, tyreAge: 5, pitsCompleted: 2, stateKind: "ON_TRACK", observedLaps: 36, stintNumber: 3, stintElapsedS: 540, pitHistory: [] }
+      { id: "demo-29", startNumber: "29", teamName: "TEAMGARIS 29", driverName: "Сидорук Станислав", carName: "LIGIER JS P325", className: "CN PRO", classKey: "cn pro", active: true, isOurs: false, positionClass: 3, positionOverall: 4, lastLapMs: 107149, bestLapMs: 106887, pace3Ms: 106940, pace5Ms: 107080, pace10Ms: 107220, tyreAge: 16, pitsCompleted: 1, stateKind: "ON_TRACK", observedLaps: 37, lapCountExact: true, gapCoordinate: { status: "EXACT", observedAtUs: 1783771500000000, gapToLeaderLaps: 1, gapToLeaderResidualMs: 13497 }, stintNumber: 2, stintElapsedS: 1754, stintSummary: [{ stint_number: 1, completed_laps: 21 }, { stint_number: 2, completed_laps: 16 }], pitHistory: [{ stop_number: 1, pit_in_at_us: 1783769350000000, pit_out_at_us: 1783769533240000, pit_in_lap: 21, pit_out_lap: 22, pit_lane_duration_ms: 183240 }] },
+      { id: "demo-67", startNumber: "67", teamName: "Quasar Motorsport", driverName: "Громов Сергей", carName: "Ligier LMP3", className: "CN PRO", classKey: "cn pro", active: true, isOurs: false, positionClass: 4, positionOverall: 6, lastLapMs: 108221, bestLapMs: 107460, pace3Ms: 108050, pace5Ms: 108130, pace10Ms: 108340, tyreAge: 5, pitsCompleted: 2, stateKind: "ON_TRACK", observedLaps: 36, stintNumber: 3, stintElapsedS: 540, stintSummary: [{ stint_number: 1, completed_laps: 12 }, { stint_number: 2, completed_laps: 19 }, { stint_number: 3, completed_laps: 5 }], pitHistory: [{ stop_number: 1, pit_in_at_us: 1783767800000000, pit_out_at_us: 1783767984100000, pit_in_lap: 12, pit_out_lap: 13, pit_lane_duration_ms: 184100 }, { stop_number: 2, pit_in_at_us: 1783771080000000, pit_out_at_us: 1783771267550000, pit_in_lap: 31, pit_out_lap: 32, pit_lane_duration_ms: 187550 }] }
     ];
     var history = buildDemoHistory(participants, state.longDemo ? 720 : 25);
     return {
@@ -439,7 +464,45 @@
         return sign * Math.max(900, start - point * (participant.id === "demo-9" ? 210 : 90));
       });
     });
-    return { laps: laps, pace: pace, intervals: intervals };
+    var firstAtUs = 1783765946000000;
+    var lastAtUs = 1783772140000000;
+    var pitStops = [];
+    participants.forEach(function (participant) {
+      (participant.pitHistory || []).forEach(function (pit) {
+        pitStops.push({
+          participant_id: participant.id,
+          start_number: participant.startNumber,
+          team_name: participant.teamName,
+          is_ours: participant.isOurs,
+          stop_number: pit.stop_number,
+          entered_at_us: pit.pit_in_at_us,
+          exited_at_us: pit.pit_out_at_us,
+          timeline_started_at_us: pit.pit_in_at_us,
+          timeline_ended_at_us: pit.pit_out_at_us,
+          carried_into_range: false,
+          entered_lap: pit.pit_in_lap,
+          exited_lap: pit.pit_out_lap,
+          pit_lane_ms: pit.pit_lane_duration_ms,
+          completed: true
+        });
+      });
+    });
+    return {
+      laps: laps,
+      pace: pace,
+      intervals: intervals,
+      range: { first_at_us: firstAtUs, last_at_us: lastAtUs, max_points: pointCount },
+      pit_stops: pitStops,
+      flags: [
+        { flag: "GREEN", started_at_us: firstAtUs, ended_at_us: 1783768200000000 },
+        { flag: "FULL_COURSE_YELLOW", started_at_us: 1783768200000000, ended_at_us: 1783768500000000 },
+        { flag: "GREEN", started_at_us: 1783768500000000, ended_at_us: 1783770800000000 },
+        { flag: "SAFETY_CAR", started_at_us: 1783770800000000, ended_at_us: 1783771200000000 },
+        { flag: "GREEN", started_at_us: 1783771200000000, ended_at_us: lastAtUs }
+      ],
+      ingest_gaps: [],
+      time_axes: { source: { anchors: [], interpolation_max_gap_us: 90000000 } }
+    };
   }
 
   function assignColors() {
@@ -1057,19 +1120,132 @@
     delete state.chartSignatures[name];
   }
 
+  function timelineRange(history) {
+    var range = history && history.range;
+    if (!range || !isNumber(range.first_at_us) || !isNumber(range.last_at_us) || range.last_at_us <= range.first_at_us) return null;
+    return { firstAtUs: range.first_at_us, lastAtUs: range.last_at_us, durationUs: range.last_at_us - range.first_at_us };
+  }
+
+  function timelinePosition(atUs, range) {
+    return clamp((atUs - range.firstAtUs) / range.durationUs * 100, 0, 100);
+  }
+
+  function participantTimelinePits(history, participantId) {
+    return (history && Array.isArray(history.pit_stops) ? history.pit_stops : []).filter(function (pit) {
+      return pit.participant_id === participantId && isNumber(pit.timeline_started_at_us || pit.entered_at_us);
+    }).sort(function (left, right) {
+      return (left.timeline_started_at_us || left.entered_at_us) - (right.timeline_started_at_us || right.entered_at_us);
+    });
+  }
+
+  function stintAgeAt(participant, stintNumber, current) {
+    if (current && stintNumber === participant.stintNumber && isNumber(participant.tyreAge)) return participant.tyreAge;
+    var summary = (participant.stintSummary || []).find(function (item) { return item.stint_number === stintNumber; });
+    return summary && isNumber(summary.completed_laps) ? summary.completed_laps : null;
+  }
+
+  function timelineSegments(history, participant, range) {
+    var pits = participantTimelinePits(history, participant.id);
+    var segments = [];
+    var cursor = range.firstAtUs;
+    var stintNumber = pits.length && isNumber(pits[0].stop_number)
+      ? Math.max(1, pits[0].stop_number)
+      : Math.max(1, participant.stintNumber || 1);
+    pits.forEach(function (pit) {
+      var pitStart = clamp(pit.timeline_started_at_us || pit.entered_at_us, range.firstAtUs, range.lastAtUs);
+      var pitEndRaw = pit.timeline_ended_at_us || pit.exited_at_us || range.lastAtUs;
+      var pitEnd = clamp(Math.max(pitStart, pitEndRaw), range.firstAtUs, range.lastAtUs);
+      if (pitStart > cursor) {
+        segments.push({ kind: "stint", startedAtUs: cursor, endedAtUs: pitStart, stintNumber: stintNumber });
+      }
+      if (pitEnd > pitStart) {
+        segments.push({ kind: "pit", startedAtUs: pitStart, endedAtUs: pitEnd, pit: pit });
+      }
+      cursor = Math.max(cursor, pitEnd);
+      stintNumber = isNumber(pit.stop_number) ? pit.stop_number + 1 : stintNumber + 1;
+    });
+    if (cursor < range.lastAtUs) {
+      segments.push({ kind: "stint", startedAtUs: cursor, endedAtUs: range.lastAtUs, stintNumber: stintNumber, current: true });
+    }
+    return segments;
+  }
+
+  function timelineClock(history, atUs) {
+    return formatClockAt(sourceClockAt(history, atUs));
+  }
+
+  function timelineSegmentTooltip(history, participant, segment) {
+    var identity = participantLabel(participant);
+    if (segment.kind === "stint") {
+      var age = stintAgeAt(participant, segment.stintNumber, segment.current);
+      return identity + "\nСтинт " + segment.stintNumber + (isNumber(age) ? " · возраст шин: " + formatLaps(age) : "") +
+        "\nВремя табло: " + timelineClock(history, segment.startedAtUs) + " → " + timelineClock(history, segment.endedAtUs);
+    }
+    var pit = segment.pit;
+    var laps = isNumber(pit.entered_lap) || isNumber(pit.exited_lap)
+      ? "\nКруг " + (isNumber(pit.entered_lap) ? pit.entered_lap : "—") + " → " + (isNumber(pit.exited_lap) ? pit.exited_lap : "—") : "";
+    var duration = isNumber(pit.pit_lane_ms) ? "\nПит-лейн: " + formatPitLaneTime(pit.pit_lane_ms) : "\nПит-лейн: измерение продолжается";
+    return identity + "\nПит-стоп №" + (pit.stop_number || "—") +
+      "\nВремя табло: " + timelineClock(history, segment.startedAtUs) + " → " + (pit.completed ? timelineClock(history, segment.endedAtUs) : "сейчас") + laps + duration;
+  }
+
+  function timelineFlagBands(history, range) {
+    return (Array.isArray(history.flags) ? history.flags : []).map(function (flag) {
+      if (!isNumber(flag.started_at_us)) return "";
+      var start = timelinePosition(flag.started_at_us, range);
+      var end = timelinePosition(isNumber(flag.ended_at_us) ? flag.ended_at_us : range.lastAtUs, range);
+      if (end <= start) return "";
+      return '<span class="stint-flag-band" data-flag="' + html(normalizeFlag(flag.flag)) + '" style="left:' + start.toFixed(4) + '%;width:' + (end - start).toFixed(4) + '%"></span>';
+    }).join("");
+  }
+
+  function timelineAxis(history, range) {
+    var ticks = [];
+    for (var index = 0; index <= 4; index += 1) {
+      var ratio = index / 4;
+      var atUs = range.firstAtUs + range.durationUs * ratio;
+      ticks.push('<span class="stint-axis-tick" data-edge="' + (index === 0 ? "start" : index === 4 ? "end" : "middle") + '" style="left:' + (ratio * 100) + '%"><i></i><b>' + html(timelineClock(history, atUs)) + '</b></span>');
+    }
+    return '<div class="stint-axis-label">Время табло</div><div class="stint-axis">' + ticks.join("") + '</div>';
+  }
+
+  function stintTimelineMarkup(history, participants) {
+    var range = timelineRange(history);
+    if (!range) return '<div class="panel-empty compact"><p>Временная шкала появится после первого сохранённого среза.</p></div>';
+    var flags = timelineFlagBands(history, range);
+    var rows = participants.map(function (participant) {
+      var key = participant.isOurs ? "ours" : state.colors[participant.id] || "blue";
+      var segments = timelineSegments(history, participant, range).map(function (segment) {
+        var left = timelinePosition(segment.startedAtUs, range);
+        var right = timelinePosition(segment.endedAtUs, range);
+        var label = segment.kind === "pit" ? "П" + (segment.pit.stop_number || "") : "С" + segment.stintNumber;
+        var age = segment.kind === "stint" ? stintAgeAt(participant, segment.stintNumber, segment.current) : null;
+        if (segment.kind === "stint" && isNumber(age)) label += " · " + age + " кр";
+        return '<span class="stint-segment" data-kind="' + segment.kind + '" data-series="' + html(key) + '" tabindex="0" aria-label="' + html(timelineSegmentTooltip(history, participant, segment).replace(/\n/g, ". ")) + '" data-tooltip="' + html(timelineSegmentTooltip(history, participant, segment)) + '" style="left:' + left.toFixed(4) + '%;width:' + Math.max(0, right - left).toFixed(4) + '%;--timeline-series:' + SERIES_COLORS[key] + ';--timeline-fill:' + SERIES_FILLS[key] + '"><b>' + html(label) + '</b></span>';
+      }).join("");
+      return '<div class="stint-timeline-row"' + (participant.isOurs ? ' data-ours="true"' : '') + '><div class="stint-row-label"><i class="series-swatch" data-series="' + html(key) + '"></i><span><b>' + html(participantLabel(participant)) + '</b><small>' + html(participant.driverName || participant.carName || "—") + '</small></span></div><div class="stint-track">' + flags + segments + '<span class="stint-now" aria-hidden="true"></span></div></div>';
+    }).join("");
+    return '<div class="stint-timeline" aria-label="Сравнение стинтов и пит-стопов"><div class="stint-timeline-axis-row">' + timelineAxis(history, range) + '</div>' + rows + '<div class="stint-timeline-legend"><span><i data-legend="stint"></i>На трассе</span><span><i data-legend="pit"></i>Пит-лейн</span><span><i data-legend="flag"></i>Фон: состояние трассы</span><span><i data-legend="now"></i>Последний срез</span></div></div>';
+  }
+
   function renderPits(element) {
     var view = state.view || emptyView();
     if (view.lifecycle !== "active") { element.innerHTML = inactiveMarkup(); return; }
     var ours = view.ours;
     if (!ours) { element.innerHTML = '<div class="panel-empty"><h3>Питы пока недоступны</h3><p>Ожидается автоматическое определение нашего экипажа.</p></div>'; return; }
     var history = ours.pitHistory || view.sessionMetric.pit_history || [];
+    var timelineParticipants = [ours].concat(selectedParticipants());
+    var timeline = view.history
+      ? stintTimelineMarkup(view.history, timelineParticipants)
+      : '<div class="panel-empty compact"><p>Загружается хронология подтверждённых пит-стопов.</p></div>';
     element.innerHTML = '<div class="panel-section"><div class="section-heading"><h3>Обязательство</h3><span>по подтверждённым pit in/out</span></div><div class="metric-grid">' +
       metricCell("Выполнено", isNumber(ours.pitsCompleted) ? String(ours.pitsCompleted) : "—") +
       metricCell("Требуется", isNumber(view.requiredPits) ? String(view.requiredPits) : "—") +
       metricCell("Осталось", isNumber(view.requiredPits) && isNumber(ours.pitsCompleted) ? String(Math.max(0, view.requiredPits - ours.pitsCompleted)) : "—") +
-      '</div></div><div class="panel-section"><div class="section-heading"><h3>История BALCHUG</h3><span>' + history.length + '</span></div>' +
+      '</div></div><div class="panel-section"><div class="section-heading"><h3>Стинты и пит-стопы</h3><span>BALCHUG + выбранные соперники</span></div>' + timeline +
+      '</div><div class="panel-section"><div class="section-heading"><h3>История BALCHUG</h3><span>' + history.length + '</span></div>' +
       (history.length ? history.map(function (pit) {
-        return '<div class="pit-row"><b class="pit-number">№' + html(pit.stop_number) + '</b><span>' + html(formatClockAt(pit.pit_in_at_us)) + ' → ' + html(formatClockAt(pit.pit_out_at_us)) + '<small class="metric-context">круг ' + html(pit.pit_in_lap == null ? "—" : pit.pit_in_lap) + ' → ' + html(pit.pit_out_lap == null ? "—" : pit.pit_out_lap) + '</small></span><b class="pit-duration">' + html(formatGap(pit.pit_lane_duration_ms)) + '</b></div>';
+        return '<div class="pit-row"><b class="pit-number">№' + html(pit.stop_number) + '</b><span>' + html(formatClockAt(pit.pit_in_at_us)) + ' → ' + html(formatClockAt(pit.pit_out_at_us)) + '<small class="metric-context">круг ' + html(pit.pit_in_lap == null ? "—" : pit.pit_in_lap) + ' → ' + html(pit.pit_out_lap == null ? "—" : pit.pit_out_lap) + '</small></span><b class="pit-duration">' + html(formatPitLaneTime(pit.pit_lane_duration_ms)) + '</b></div>';
       }).join("") : '<p class="metric-context">Подтверждённых пит-стопов пока нет.</p>') + '</div>';
   }
 
