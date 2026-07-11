@@ -308,16 +308,61 @@
     return { sourceAvailable: sourceAvailable, ticks: ticks };
   }
 
-  function timelineLapTicks(range, laps) {
+  function captureRecordedLapEntries(laps) {
     var entries = [];
-    (Array.isArray(laps) ? laps : []).forEach(function (lap) {
+    var observedCells = Object.create(null);
+    (Array.isArray(laps) ? laps : []).forEach(function (lap, index) {
       var atUs = numericValue(lap && lap.board_observed_at_us);
       if (atUs === null) atUs = numericValue(lap && lap.completed_at_us);
-      var lapNumber = numericValue(lap && lap.lap_number);
-      if (atUs === null || lapNumber === null || atUs < range.first_at_us || atUs > range.last_at_us) return;
-      entries.push({ atUs: atUs, lapNumber: Math.round(lapNumber) });
+      var duration = numericValue(lap && lap.duration_ms);
+      var timelineKind = lap && lap.timeline_kind || "confirmed_lap";
+      if (atUs === null || duration === null || duration < 0 || timelineKind === "snapshot_baseline") return;
+      var source = asObject(lap && lap.source);
+      var observationId = numericValue(source.cell_observation_id);
+      // A source cell is one persisted table observation. Do not let a
+      // duplicate transport record turn into an additional captured lap.
+      if (observationId !== null) {
+        var key = String(observationId);
+        if (observedCells[key]) return;
+        observedCells[key] = true;
+      }
+      entries.push({ atUs: atUs, order: index });
     });
-    entries.sort(function (left, right) { return left.atUs - right.atUs || left.lapNumber - right.lapNumber; });
+    entries.sort(function (left, right) { return left.atUs - right.atUs || left.order - right.order; });
+    return entries;
+  }
+
+  function captureRecordedLapCount(laps, atUs) {
+    if (!Array.isArray(laps)) return null;
+    return captureRecordedLapEntries(laps).reduce(function (count, entry) {
+      return count + (entry.atUs <= atUs ? 1 : 0);
+    }, 0);
+  }
+
+  function captureRecordedLaps() {
+    var data = comparisonVisualData() || state.comparisonCache.all;
+    var lapSeries = asObject(data && data.lap_series);
+    return Array.isArray(lapSeries.ours_raw) ? lapSeries.ours_raw : null;
+  }
+
+  function timelineLapTicks(range, laps, captureLapScope) {
+    var entries = [];
+    if (captureLapScope) {
+      entries = captureRecordedLapEntries(laps).filter(function (entry) {
+        return entry.atUs >= range.first_at_us && entry.atUs <= range.last_at_us;
+      }).map(function (entry, index) {
+        return { atUs: entry.atUs, lapNumber: index + 1 };
+      });
+    } else {
+      (Array.isArray(laps) ? laps : []).forEach(function (lap) {
+        var atUs = numericValue(lap && lap.board_observed_at_us);
+        if (atUs === null) atUs = numericValue(lap && lap.completed_at_us);
+        var lapNumber = numericValue(lap && lap.lap_number);
+        if (atUs === null || lapNumber === null || atUs < range.first_at_us || atUs > range.last_at_us) return;
+        entries.push({ atUs: atUs, lapNumber: Math.round(lapNumber) });
+      });
+      entries.sort(function (left, right) { return left.atUs - right.atUs || left.lapNumber - right.lapNumber; });
+    }
     return entries.map(function (entry, index) {
       var major = index === 0 || entry.lapNumber % 5 === 0;
       return {
@@ -333,11 +378,12 @@
     if (!element || !geometry || !geometry.range) return;
     var width = geometry.width || element.getBoundingClientRect().width || 1;
     var axis = timelineAxisTicks(geometry.range, width);
-    var lapTicks = timelineLapTicks(geometry.range, ownLaps);
+    var captureLapScope = archiveLapCountScope(historicalSnapshot(state.atUs)) === "capture_tracker";
+    var lapTicks = timelineLapTicks(geometry.range, captureLapScope ? captureRecordedLaps() : ownLaps, captureLapScope);
     var key = [
       geometry.range.first_at_us, geometry.range.last_at_us, Math.round(width), geometry.left, geometry.right,
       axis.sourceAvailable, axis.ticks.map(function (tick) { return tick.text; }).join("|"),
-      lapTicks.map(function (tick) { return tick.lapNumber + ":" + tick.major; }).join("|")
+      captureLapScope, lapTicks.map(function (tick) { return tick.lapNumber + ":" + tick.major; }).join("|")
     ].join(":");
     if (element.dataset.axisKey === key) return;
     element.dataset.axisKey = key;
@@ -345,7 +391,6 @@
     element.dataset.axisLabel = axis.sourceAvailable ? "Время табло" : "Время записи";
     element.dataset.lapLabel = lapTicks.length ? "Пройдено кругов" : "";
     element.classList.toggle("has-lap-axis", lapTicks.length > 0);
-    var captureLapScope = archiveLapCountScope(historicalSnapshot(state.atUs)) === "capture_tracker";
     element.title = axis.sourceAvailable ?
       "Верхняя шкала: время Time Service из потока табло. Нижняя: " +
         (captureLapScope ? "зафиксированные круги с начала сохранённой записи" : "круги источника") + ", подпись через пять кругов." :
@@ -750,7 +795,10 @@
     state.comparisonRevision += 1;
     renderComparisonSelector();
     renderComparisonLegend();
-    if (state.payload) renderBenchmark(state.payload);
+    if (state.payload) {
+      renderSnapshot(state.payload, state.effectiveAtUs);
+      renderBenchmark(state.payload);
+    }
     drawChart();
   }
 
@@ -762,7 +810,10 @@
       state.comparisonRevision += 1;
       renderComparisonSelector();
       renderComparisonLegend();
-      if (state.payload) renderBenchmark(state.payload);
+      if (state.payload) {
+        renderSnapshot(state.payload, state.effectiveAtUs);
+        renderBenchmark(state.payload);
+      }
       drawChart();
       return;
     }
@@ -1147,8 +1198,9 @@
     var visibleTyreAge = firstDefined(session.tyre_age_laps, oursState.tyre_age_laps);
     var currentStint = numericValue(session.stint_number);
     var lapsValue = visibleLaps;
-    if (lapCountScope === "capture_tracker" && numericValue(visibleLaps) !== null) {
-      lapsValue = formatLapCount(numericValue(visibleLaps)) + " с начала записи";
+    if (lapCountScope === "capture_tracker") {
+      var capturedLapCount = captureRecordedLapCount(captureRecordedLaps(), state.atUs);
+      lapsValue = capturedLapCount === null ? "—" : formatLapCount(capturedLapCount) + " с начала записи";
     }
     var tyresValue = formatLapCount(visibleTyreAge);
     if (lapCountScope === "capture_tracker" && currentStint === 1 && numericValue(visibleTyreAge) !== null) {
@@ -1164,7 +1216,7 @@
     var values = [
       { id: "pos", label: "POS", tooltip: "Абсолютная позиция BALCHUG Racing в момент выбранного среза", value: session.position_overall !== null && session.position_overall !== undefined ? "P" + session.position_overall : oursState.position_overall !== null && oursState.position_overall !== undefined ? "P" + oursState.position_overall : "—" },
       { id: "class_leader_gap", label: "До лидера класса", tooltip: "Временной интервал до лидера CN PRO по данным выбранного среза", value: formatArchiveRelationDistance(effectiveAtUs, snapshot, "class_leader") },
-      { id: "laps", label: lapCountScope === "capture_tracker" ? "Круги в записи" : "Круги", tooltip: lapCountScope === "capture_tracker" ? "Количество crossing, зафиксированных после начала записи" : "Количество кругов по данным табло", value: lapsValue },
+      { id: "laps", label: lapCountScope === "capture_tracker" ? "Круги в записи" : "Круги", tooltip: lapCountScope === "capture_tracker" ? "Количество новых значений LAST, зафиксированных после начала записи" : "Количество кругов по данным табло", value: lapsValue },
       { id: "state", label: "Состояние", tooltip: "Последнее подтверждённое состояние экипажа по полю STATE", value: firstDefined(session.current_state, oursState.state_kind, oursState.state) },
       { id: "last", label: "Последний по табло", tooltip: "Последнее значение LAST, переданное табло; это не расчёт из timestamp", value: formatLap(firstDefined(session.last_lap_ms, oursState.last_lap_ms)) },
       { id: "last_to_best", label: "К лучшему кругу", tooltip: "Разница последнего времени LAST и лучшего времени BEST по табло", value: formatGap(
@@ -2248,6 +2300,23 @@
     return { gap: "gap_to_behind_ms", lap: "lap_delta_to_behind" };
   }
 
+  function archiveRelationTargetState(snapshot, relation) {
+    var payload = asObject(snapshot);
+    var session = asObject(asObject(payload.computed).session);
+    var targetId = session[relation + "_id"];
+    if (!targetId) return null;
+    var participants = Array.isArray(payload.class_participants) ? payload.class_participants : [];
+    for (var index = 0; index < participants.length; index += 1) {
+      var item = asObject(participants[index]);
+      var computed = asObject(item.computed);
+      var measured = asObject(item.measured);
+      if (firstDefined(computed.participant_id, measured.participant_id) !== targetId) continue;
+      var stateValue = firstDefined(computed.current_state, asObject(measured.state).state_kind, asObject(measured.state).state);
+      return typeof stateValue === "string" ? stateValue.trim().toUpperCase().replace(/\s+/g, "_") : null;
+    }
+    return null;
+  }
+
   function formatArchiveRelationDistance(atUs, snapshot, relation) {
     var payload = snapshot || historicalSnapshot(atUs);
     var session = asObject(asObject(payload.computed).session);
@@ -2256,7 +2325,8 @@
     var hasArchiveIntervals = archiveIntervals && typeof archiveIntervals === "object" && !Array.isArray(archiveIntervals);
     if (hasArchiveIntervals) {
       var derivedGap = numericValue(archiveIntervals[keys.gap]);
-      return derivedGap === null ? "—" : formatGap(derivedGap);
+      if (derivedGap !== null) return formatGap(derivedGap);
+      return archiveRelationTargetState(payload, relation) === "IN_PIT" ? "В PIT" : "—";
     }
     var gap = archiveSourceRelationGap(payload, relation);
     if (gap === null) gap = numericValue(session[keys.gap]);
