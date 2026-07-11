@@ -1504,6 +1504,69 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual([tuple(heat) for heat in heats], [(1, "Heat 1"), (2, "Heat 2")])
 
+    def test_last_changes_without_tracker_boundary_do_not_age_tires(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 45_000_000
+        self.apply(
+            [
+                ["s_i", 45_000_000],
+                [
+                    "t_i",
+                    {
+                        "l": [[50, True, -1], [500, False, 0], [750, False, 1], [0, False, 0]],
+                        "d": [[42, "21", 0, 1000, 0, 47000, False, 45_000_000]],
+                    },
+                ],
+                [
+                    "r_i",
+                    {
+                        "l": {
+                            "h": [
+                                {"n": "NR"},
+                                {"n": "TEAM"},
+                                {"n": "CLS"},
+                                {"n": "STATE"},
+                                {"n": "LAST"},
+                            ]
+                        },
+                        "r": [
+                            [0, 0, "21"],
+                            [0, 1, "BALCHUG Racing"],
+                            [0, 2, "CN PRO"],
+                            [0, 3, "E45000000"],
+                            [0, 4, "108000000"],
+                        ],
+                    },
+                ],
+            ],
+            received_at_us=received,
+        )
+        self.apply([["r_c", [[0, 4, "107900000"]]]], received_at_us=received + 1_000_000)
+        self.apply([["r_c", [[0, 4, "107800000"]]]], received_at_us=received + 2_000_000)
+
+        before_tracker = self.connection.execute(
+            "SELECT completed_laps FROM tire_stints WHERE ended_at_us IS NULL"
+        ).fetchone()
+        self.assertEqual(before_tracker["completed_laps"], 0)
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM laps").fetchone()[0], 0)
+
+        # The first physical finish observation establishes coverage. Only the
+        # following Tracker boundary closes one lap and ages the stint once.
+        self.apply(
+            [["t_p", [[42, "21", 0, 500, 0, 47000, False, 47_000_000]]]],
+            received_at_us=received + 2_100_000,
+        )
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM laps").fetchone()[0], 0)
+        self.apply(
+            [["t_p", [[42, "21", 0, 500, 0, 47000, False, 154_800_000]]]],
+            received_at_us=received + 109_900_000,
+        )
+
+        after_tracker = self.connection.execute(
+            "SELECT completed_laps FROM tire_stints WHERE ended_at_us IS NULL"
+        ).fetchone()
+        self.assertEqual(after_tracker["completed_laps"], 1)
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM laps").fetchone()[0], 1)
+
     def test_finish_loop_passings_age_tires_when_the_layout_has_no_laps_column(self):
         received = TIME_SERVICE_EPOCH_UNIX_US + 50_000_000
         self.apply(
