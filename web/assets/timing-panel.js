@@ -68,6 +68,14 @@
     if (!isNumber(ms)) return "—";
     return (ms / 1000).toFixed(3) + " с";
   }
+  function formatGapTime(ms) {
+    if (!isNumber(ms)) return "—";
+    var sign = ms < 0 ? "−" : "+";
+    var absolute = Math.abs(ms);
+    var minutes = Math.floor(absolute / 60000);
+    var seconds = (absolute - minutes * 60000) / 1000;
+    return sign + (minutes ? minutes + ":" + seconds.toFixed(3).padStart(6, "0") : seconds.toFixed(3) + " с");
+  }
   function formatLaps(value) {
     if (!isNumber(value)) return "—";
     var amount = Math.max(0, Math.floor(value));
@@ -76,6 +84,10 @@
     var noun = remainder10 === 1 && remainder100 !== 11 ? "круг" :
       (remainder10 >= 2 && remainder10 <= 4 && (remainder100 < 12 || remainder100 > 14) ? "круга" : "кругов");
     return amount + " " + noun;
+  }
+  function formatParticipantLaps(participant) {
+    if (!participant || !isNumber(participant.observedLaps)) return "—";
+    return (participant.lapCountExact ? "" : "≥") + String(Math.max(0, Math.floor(participant.observedLaps)));
   }
   function formatClockAt(us) {
     if (!isNumber(us)) return "—";
@@ -95,6 +107,33 @@
     var number = participant.startNumber ? "#" + participant.startNumber + " · " : "";
     return number + (participant.teamName || participant.carName || "Экипаж");
   }
+  function mixedGap(behind, ahead) {
+    var left = behind && behind.gapCoordinate;
+    var right = ahead && ahead.gapCoordinate;
+    if (!left || !right || left.status !== "EXACT" || right.status !== "EXACT") return null;
+    if (!isNumber(left.gapToLeaderLaps) || !isNumber(right.gapToLeaderLaps) ||
+        !isNumber(left.gapToLeaderResidualMs) || !isNumber(right.gapToLeaderResidualMs)) return null;
+    return {
+      laps: left.gapToLeaderLaps - right.gapToLeaderLaps,
+      residualMs: left.gapToLeaderResidualMs - right.gapToLeaderResidualMs,
+      observedAtUs: Math.min(left.observedAtUs || Infinity, right.observedAtUs || Infinity)
+    };
+  }
+  function gapFromOverallLeader(participant) {
+    var coordinate = participant && participant.gapCoordinate;
+    if (!coordinate || coordinate.status !== "EXACT" ||
+        !isNumber(coordinate.gapToLeaderLaps) || !isNumber(coordinate.gapToLeaderResidualMs)) return null;
+    return {
+      laps: coordinate.gapToLeaderLaps,
+      residualMs: coordinate.gapToLeaderResidualMs,
+      observedAtUs: coordinate.observedAtUs
+    };
+  }
+  function formatMixedGap(value, fallbackMs) {
+    if (!value || !isNumber(value.laps) || value.laps < 0) return formatGap(fallbackMs);
+    if (value.laps === 0) return isNumber(value.residualMs) ? formatGap(Math.abs(value.residualMs)) : formatGap(fallbackMs);
+    return formatLaps(value.laps) + (isNumber(value.residualMs) && value.residualMs !== 0 ? " " + formatGapTime(value.residualMs) : "");
+  }
 
   var dom = {
     workspace: byId("timingWorkspace"), suite: byId("engineerSuite"), panel: byId("engineerPanel"), iframe: byId("lt"),
@@ -102,7 +141,8 @@
     panelFlagStrip: byId("panelFlagStrip"), panelFlag: byId("panelFlag"), panelFlagElapsed: byId("panelFlagElapsed"),
     panelMode: byId("panelMode"), panelHeat: byId("panelHeat"), freshness: byId("freshnessBadge"),
     panelSessionTime: byId("panelSessionTime"), panelIdentity: byId("panelIdentity"),
-    position: byId("decisionPosition"), ahead: byId("decisionAhead"), behind: byId("decisionBehind"),
+    position: byId("decisionPosition"), laps: byId("decisionLaps"), leaderGap: byId("decisionLeaderGap"),
+    ahead: byId("decisionAhead"), behind: byId("decisionBehind"),
     pace: byId("decisionPace"), tyres: byId("decisionTyres"), pits: byId("decisionPits"),
     viewTitle: byId("panelViewTitle"), scroll: byId("panelScroll"),
     competitorTrigger: byId("competitorTrigger"), competitorLabel: byId("competitorTriggerLabel"),
@@ -225,6 +265,12 @@
     var participants = measured.map(function (source) {
       var metric = valuesById[source.participant_id] || {};
       var sourceState = source.state || {};
+      var lapCount = source.lap_count || {};
+      var gapCoordinate = source.gap_coordinate || null;
+      var canonicalLaps = isNumber(lapCount.completed_laps)
+        ? lapCount.completed_laps
+        : isNumber(lapCount.observed_complete_laps)
+          ? lapCount.observed_complete_laps : null;
       return {
         id: source.participant_id,
         startNumber: source.start_number || metric.start_number || null,
@@ -242,7 +288,17 @@
         pace3Ms: metric.pace_3_ms, pace5Ms: metric.pace_5_ms, pace10Ms: metric.pace_10_ms,
         tyreAge: metric.tyre_age_laps, pitsCompleted: metric.pits_completed,
         stateKind: metric.current_state || sourceState.state_kind || "UNKNOWN",
-        observedLaps: metric.observed_lap_count,
+        observedLaps: isNumber(canonicalLaps) ? canonicalLaps : metric.observed_lap_count,
+        lapCountExact: isNumber(lapCount.completed_laps) && lapCount.coverage_complete === true,
+        exactLastLaps: lapCount.exact_last_laps,
+        gapCoordinate: gapCoordinate ? {
+          status: gapCoordinate.status,
+          observedAtUs: gapCoordinate.observed_at_us,
+          gapToLeaderLaps: gapCoordinate.gap_to_overall_leader_laps,
+          gapToLeaderResidualMs: gapCoordinate.gap_to_overall_leader_residual_ms,
+          lapGroupCompletedLaps: gapCoordinate.lap_group_completed_laps,
+          raw: gapCoordinate.raw_gap_value
+        } : null,
         stintNumber: metric.stint_number,
         stintElapsedS: metric.stint_elapsed_s,
         stintTrend: metric.stint_trend_ms_per_lap,
@@ -323,13 +379,15 @@
       carName: "Ligier JS53 evo2", className: "CN PRO", classKey: "cn pro", active: true, isOurs: true,
       positionClass: 2, positionOverall: 3, lastLapMs: 106742, bestLapMs: 105911,
       pace3Ms: 106480, pace5Ms: 106620, pace10Ms: 106910, tyreAge: 12, pitsCompleted: 1,
-      stateKind: "ON_TRACK", observedLaps: 37, stintNumber: 2, stintElapsedS: 1288,
+      stateKind: "ON_TRACK", observedLaps: 37, lapCountExact: true,
+      gapCoordinate: { status: "EXACT", observedAtUs: 1783771500000000, gapToLeaderLaps: 1, gapToLeaderResidualMs: 8365 },
+      stintNumber: 2, stintElapsedS: 1288,
       stintTrend: 42, pitHistory: [{ stop_number: 1, pit_in_at_us: 1783770960000000, pit_out_at_us: 1783771038400000, pit_in_lap: 25, pit_out_lap: 26, pit_lane_duration_ms: 78400 }]
     };
     var participants = [
-      { id: "demo-9", startNumber: "9", teamName: "Про Моторспорт", driverName: "Мухин Игорь", carName: "Norma", className: "CN PRO", classKey: "cn pro", active: true, isOurs: false, positionClass: 1, positionOverall: 1, lastLapMs: 106105, bestLapMs: 105260, pace3Ms: 106310, pace5Ms: 106460, pace10Ms: 106720, tyreAge: 8, pitsCompleted: 2, stateKind: "ON_TRACK", observedLaps: 38, stintNumber: 3, stintElapsedS: 866, pitHistory: [] },
+      { id: "demo-9", startNumber: "9", teamName: "Про Моторспорт", driverName: "Мухин Игорь", carName: "Norma", className: "CN PRO", classKey: "cn pro", active: true, isOurs: false, positionClass: 1, positionOverall: 1, lastLapMs: 106105, bestLapMs: 105260, pace3Ms: 106310, pace5Ms: 106460, pace10Ms: 106720, tyreAge: 8, pitsCompleted: 2, stateKind: "ON_TRACK", observedLaps: 38, lapCountExact: true, gapCoordinate: { status: "EXACT", observedAtUs: 1783771500000000, gapToLeaderLaps: 0, gapToLeaderResidualMs: 0 }, stintNumber: 3, stintElapsedS: 866, pitHistory: [] },
       ours,
-      { id: "demo-29", startNumber: "29", teamName: "TEAMGARIS 29", driverName: "Сидорук Станислав", carName: "LIGIER JS P325", className: "CN PRO", classKey: "cn pro", active: true, isOurs: false, positionClass: 3, positionOverall: 4, lastLapMs: 107149, bestLapMs: 106887, pace3Ms: 106940, pace5Ms: 107080, pace10Ms: 107220, tyreAge: 16, pitsCompleted: 1, stateKind: "ON_TRACK", observedLaps: 37, stintNumber: 2, stintElapsedS: 1754, pitHistory: [] },
+      { id: "demo-29", startNumber: "29", teamName: "TEAMGARIS 29", driverName: "Сидорук Станислав", carName: "LIGIER JS P325", className: "CN PRO", classKey: "cn pro", active: true, isOurs: false, positionClass: 3, positionOverall: 4, lastLapMs: 107149, bestLapMs: 106887, pace3Ms: 106940, pace5Ms: 107080, pace10Ms: 107220, tyreAge: 16, pitsCompleted: 1, stateKind: "ON_TRACK", observedLaps: 37, lapCountExact: true, gapCoordinate: { status: "EXACT", observedAtUs: 1783771500000000, gapToLeaderLaps: 1, gapToLeaderResidualMs: 13497 }, stintNumber: 2, stintElapsedS: 1754, pitHistory: [] },
       { id: "demo-67", startNumber: "67", teamName: "Quasar Motorsport", driverName: "Громов Сергей", carName: "Ligier LMP3", className: "CN PRO", classKey: "cn pro", active: true, isOurs: false, positionClass: 4, positionOverall: 6, lastLapMs: 108221, bestLapMs: 107460, pace3Ms: 108050, pace5Ms: 108130, pace10Ms: 108340, tyreAge: 5, pitsCompleted: 2, stateKind: "ON_TRACK", observedLaps: 36, stintNumber: 3, stintElapsedS: 540, pitHistory: [] }
     ];
     var history = buildDemoHistory(participants, state.longDemo ? 720 : 25);
@@ -495,8 +553,10 @@
       : view.identityState === "unresolved" ? "Экипаж определяется автоматически" : "BALCHUG Racing · #21";
     dom.position.textContent = ours && isNumber(ours.positionClass)
       ? "P" + ours.positionClass + (isNumber(ours.positionOverall) ? " · OA " + ours.positionOverall : "") : "—";
-    dom.ahead.textContent = formatGap(metric.gap_to_ahead_ms);
-    dom.behind.textContent = formatGap(metric.gap_to_behind_ms);
+    dom.laps.textContent = formatParticipantLaps(ours);
+    dom.leaderGap.textContent = formatMixedGap(gapFromOverallLeader(ours), null);
+    dom.ahead.textContent = formatMixedGap(mixedGap(ours, view.ahead), metric.gap_to_ahead_ms);
+    dom.behind.textContent = formatMixedGap(mixedGap(view.behind, ours), metric.gap_to_behind_ms);
     dom.pace.textContent = ours ? formatLap(ours.lastLapMs) : "—";
     dom.tyres.textContent = ours ? formatLaps(ours.tyreAge) : "—";
     dom.pits.textContent = ours && isNumber(ours.pitsCompleted)
@@ -542,12 +602,13 @@
     var alerts = (metric.alerts || []).slice(-3).reverse();
     element.innerHTML =
       '<div class="panel-section"><div class="section-heading"><h3>Борьба на трассе</h3><span>наш класс</span></div>' +
-        battleMarkup("До соперника впереди", view.ahead, metric.gap_to_ahead_ms, metric.pace_delta_to_reference_ms && metric.pace_delta_to_reference_ms.class_ahead) +
-        battleMarkup("До соперника сзади", view.behind, metric.gap_to_behind_ms, metric.pace_delta_to_reference_ms && metric.pace_delta_to_reference_ms.class_behind) +
+        battleMarkup("До соперника впереди", view.ahead, metric.gap_to_ahead_ms, metric.pace_delta_to_reference_ms && metric.pace_delta_to_reference_ms.class_ahead, mixedGap(ours, view.ahead)) +
+        battleMarkup("До соперника сзади", view.behind, metric.gap_to_behind_ms, metric.pace_delta_to_reference_ms && metric.pace_delta_to_reference_ms.class_behind, mixedGap(view.behind, ours)) +
       '</div>' +
       '<div class="panel-section"><div class="section-heading"><h3>Темп и стинт</h3><span>обновление 1 с</span></div><div class="metric-grid">' +
         metricCell("Последний круг", formatLap(ours.lastLapMs)) +
         metricCell("Лучший круг", formatLap(ours.bestLapMs)) +
+        metricCell("Пройдено кругов", formatParticipantLaps(ours)) +
         metricCell("Pace3", formatLap(ours.pace3Ms)) +
         metricCell("Pace5", formatLap(ours.pace5Ms)) +
         metricCell("Pace10", formatLap(ours.pace10Ms)) +
@@ -568,12 +629,12 @@
       '</div>';
   }
 
-  function battleMarkup(label, participant, gapMs, paceDeltaMs) {
+  function battleMarkup(label, participant, gapMs, paceDeltaMs, mixedValue) {
     var context = participant ? participantLabel(participant) : "Нет подтверждённого соседа";
     if (isNumber(paceDeltaMs)) {
       context += " · " + (paceDeltaMs > 0 ? "мы медленнее на " : "мы быстрее на ") + Math.abs(paceDeltaMs / 1000).toFixed(3) + " с";
     }
-    return '<div class="battle-row"><div><span class="metric-label">' + html(label) + '</span><div class="battle-name">' + html(context) + '</div></div><b class="battle-number">' + html(formatGap(gapMs)) + '</b></div>';
+    return '<div class="battle-row"><div><span class="metric-label">' + html(label) + '</span><div class="battle-name">' + html(context) + '</div></div><b class="battle-number">' + html(formatMixedGap(mixedValue, gapMs)) + '</b></div>';
   }
 
   function metricCell(label, value) {
@@ -598,7 +659,7 @@
     if (view.lifecycle !== "active") { destroyChart("intervals"); element.innerHTML = inactiveMarkup(); return; }
     if (!state.viewReady.intervals || force) {
       destroyChart("intervals");
-      element.innerHTML = '<div class="panel-section"><div class="section-heading"><h3>Интервал относительно BALCHUG</h3><span>выше — впереди, ниже — сзади</span></div><div class="timing-chart" id="intervalChart" tabindex="0" aria-label="График интервалов относительно BALCHUG Racing"><div class="timing-chart-empty">Интервалы появятся после подтверждённых source GAP/DIFF.</div></div><div class="chart-legend" id="intervalLegend"></div></div><div class="panel-section"><div class="section-heading"><h3>Текущие соседи</h3><span>только подтверждённые интервалы</span></div>' + battleMarkup("До соперника впереди", view.ahead, view.sessionMetric.gap_to_ahead_ms, null) + battleMarkup("До соперника сзади", view.behind, view.sessionMetric.gap_to_behind_ms, null) + '</div>';
+      element.innerHTML = '<div class="panel-section"><div class="section-heading"><h3>Интервал относительно BALCHUG</h3><span>выше — впереди, ниже — сзади</span></div><div class="timing-chart" id="intervalChart" tabindex="0" aria-label="График интервалов относительно BALCHUG Racing"><div class="timing-chart-empty">Интервалы появятся после подтверждённых source GAP/DIFF.</div></div><div class="chart-legend" id="intervalLegend"></div></div><div class="panel-section"><div class="section-heading"><h3>Текущие соседи</h3><span>круги и остаточное время табло</span></div>' + battleMarkup("До соперника впереди", view.ahead, view.sessionMetric.gap_to_ahead_ms, null, mixedGap(view.ours, view.ahead)) + battleMarkup("До соперника сзади", view.behind, view.sessionMetric.gap_to_behind_ms, null, mixedGap(view.behind, view.ours)) + '</div>';
       state.viewReady.intervals = true;
     }
     renderLegend(byId("intervalLegend"));
@@ -1016,10 +1077,10 @@
     var view = state.view || emptyView();
     if (view.lifecycle !== "active") { element.innerHTML = inactiveMarkup(); return; }
     var selected = effectiveSelection();
-    element.innerHTML = '<table class="class-table"><thead><tr><th>PIC</th><th>Экипаж / машина</th><th>Last</th><th>Pace5</th><th>Шины</th><th>Питы</th><th>Сравнить</th></tr></thead><tbody>' +
+    element.innerHTML = '<table class="class-table"><thead><tr><th>PIC</th><th>Экипаж / машина</th><th>Круги</th><th>Last</th><th>Pace5</th><th>Шины</th><th>Питы</th><th>Сравнить</th></tr></thead><tbody>' +
       view.participants.map(function (participant) {
         var teamTooltip = participantLabel(participant) + (participant.driverName ? " · " + participant.driverName : "") + (participant.carName ? " · " + participant.carName : "");
-        return '<tr class="' + (participant.isOurs ? "ours-row" : "") + '"><td>' + html(isNumber(participant.positionClass) ? participant.positionClass : "—") + '</td><td data-tooltip="' + html(teamTooltip) + '"><span class="class-team">#' + html(participant.startNumber || "—") + ' · ' + html(participant.teamName || "—") + '</span><span class="class-car">' + html(participant.carName || participant.driverName || "—") + '</span></td><td>' + html(formatLap(participant.lastLapMs)) + '</td><td>' + html(formatLap(participant.pace5Ms)) + '</td><td>' + html(isNumber(participant.tyreAge) ? participant.tyreAge + "L" : "—") + '</td><td>' + html(isNumber(participant.pitsCompleted) ? participant.pitsCompleted : "—") + '</td><td>' + (participant.isOurs ? '<span class="series-swatch" data-series="ours"></span>' : '<button class="eye-button" type="button" data-competitor-eye="' + html(participant.id) + '" aria-pressed="' + String(selected.indexOf(participant.id) !== -1) + '" aria-label="Показать ' + html(participantLabel(participant)) + ' на графиках">◉</button>') + '</td></tr>';
+        return '<tr class="' + (participant.isOurs ? "ours-row" : "") + '"><td>' + html(isNumber(participant.positionClass) ? participant.positionClass : "—") + '</td><td data-tooltip="' + html(teamTooltip) + '"><span class="class-team">#' + html(participant.startNumber || "—") + ' · ' + html(participant.teamName || "—") + '</span><span class="class-car">' + html(participant.carName || participant.driverName || "—") + '</span></td><td><b>' + html(formatParticipantLaps(participant)) + '</b></td><td>' + html(formatLap(participant.lastLapMs)) + '</td><td>' + html(formatLap(participant.pace5Ms)) + '</td><td>' + html(isNumber(participant.tyreAge) ? participant.tyreAge + "L" : "—") + '</td><td>' + html(isNumber(participant.pitsCompleted) ? participant.pitsCompleted : "—") + '</td><td>' + (participant.isOurs ? '<span class="series-swatch" data-series="ours"></span>' : '<button class="eye-button" type="button" data-competitor-eye="' + html(participant.id) + '" aria-pressed="' + String(selected.indexOf(participant.id) !== -1) + '" aria-label="Показать ' + html(participantLabel(participant)) + ' на графиках">◉</button>') + '</td></tr>';
       }).join("") + '</tbody></table>';
   }
 

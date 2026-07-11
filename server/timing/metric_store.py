@@ -208,6 +208,7 @@ class LapInput:
     source_frame_id: int | None = None
     source_message_ordinal: int | None = None
     source_change_ordinal: int | None = None
+    lap_number_is_official: bool = False
 
 
 @dataclass(frozen=True)
@@ -476,6 +477,8 @@ class _ResultLastFact:
     sectors_json: str | None
     linked_lap_id: str | None
     linked_lap_number: int | None
+    linked_lap_number_is_official: bool
+    linked_started_at_us: int | None
     linked_completed_at_us: int | None
     linked_duration_ms: int | None
     linked_flag: str | None
@@ -581,17 +584,33 @@ def _load_result_last_facts(
                ledger.source_change_ordinal,ledger.observed_at_us,
                ledger.source_frame_id AS frame_id,
                ledger.source_message_ordinal AS message_ordinal,
-               ledger.sectors_json,ledger.linked_lap_id,
-               lap.lap_number AS linked_lap_number,
-               lap.completed_at_us AS linked_completed_at_us,
-               lap.duration_ms AS linked_duration_ms,
+               ledger.sectors_json,
+               COALESCE(ledger.linked_canonical_lap_id,ledger.linked_lap_id) AS linked_lap_id,
+               COALESCE(canonical_lap.lap_number,lap.lap_number) AS linked_lap_number,
+               CASE
+                 WHEN canonical_lap.id IS NOT NULL THEN canonical_lap.coverage_complete
+                 WHEN lap.lap_number IS NOT NULL THEN 1
+                 ELSE 0
+               END AS linked_lap_number_is_official,
+               canonical_lap.started_at_us AS linked_started_at_us,
+               COALESCE(canonical_lap.finished_at_us,lap.completed_at_us) AS linked_completed_at_us,
+               COALESCE(canonical_lap.source_duration_ms,lap.duration_ms) AS linked_duration_ms,
                lap.flag AS linked_flag,
-               lap.is_in_lap AS linked_is_in_lap,
-               lap.is_out_lap AS linked_is_out_lap,
-               lap.crosses_pit AS linked_crosses_pit,
+               COALESCE(lap.is_in_lap,finish_boundary.boundary_kind = 'PIT_FINISH') AS linked_is_in_lap,
+               COALESCE(
+                 lap.is_out_lap,
+                 start_boundary.boundary_kind = 'PIT_FINISH' AND finish_boundary.boundary_kind = 'MAIN_FINISH'
+               ) AS linked_is_out_lap,
+               COALESCE(lap.crosses_pit,canonical_lap.is_pit_lap) AS linked_crosses_pit,
                lap.is_clean AS linked_is_clean
         FROM result_last_cell_ledger AS ledger
         LEFT JOIN laps AS lap ON lap.id = ledger.linked_lap_id
+        LEFT JOIN canonical_laps AS canonical_lap
+          ON canonical_lap.source_last_cell_observation_id = ledger.source_cell_observation_id
+        LEFT JOIN canonical_lap_boundaries AS start_boundary
+          ON start_boundary.id = canonical_lap.start_boundary_id
+        LEFT JOIN canonical_lap_boundaries AS finish_boundary
+          ON finish_boundary.id = canonical_lap.finish_boundary_id
         WHERE ledger.source_heat_id = ?
           AND ledger.participant_id IS NOT NULL
           AND ledger.source_handle = 'r_c'
@@ -653,6 +672,8 @@ def _load_result_last_facts(
             sectors_json=row["sectors_json"],
             linked_lap_id=row["linked_lap_id"],
             linked_lap_number=_int(row["linked_lap_number"]),
+            linked_lap_number_is_official=bool(row["linked_lap_number_is_official"]),
+            linked_started_at_us=_int(row["linked_started_at_us"]),
             linked_completed_at_us=_int(row["linked_completed_at_us"]),
             linked_duration_ms=_int(row["linked_duration_ms"]),
             linked_flag=row["linked_flag"],
@@ -886,11 +907,52 @@ def _load_raw_result_last_laps(
         if linked_duration_matches:
             lap_number = event.linked_lap_number
             completed_at_us = event.linked_completed_at_us
-            flag = event.linked_flag
+            flag = event.linked_flag or _flag_at(periods, observed_at_us=completed_at_us)
             is_in_lap = bool(event.linked_is_in_lap)
             is_out_lap = bool(event.linked_is_out_lap)
             crosses_pit = bool(event.linked_crosses_pit)
-            is_clean = bool(event.linked_is_clean)
+            if event.linked_is_clean is not None:
+                is_clean = bool(event.linked_is_clean)
+            else:
+                started_at_us = event.linked_started_at_us
+                has_gap = bool(
+                    started_at_us is not None
+                    and any(
+                        _interval_overlaps(
+                            started_at_us,
+                            completed_at_us,
+                            gap_started_at_us,
+                            gap_ended_at_us,
+                        )
+                        for gap_started_at_us, gap_ended_at_us in gaps
+                    )
+                )
+                crosses_pit = crosses_pit or bool(
+                    started_at_us is not None
+                    and any(
+                        stop.completed
+                        and _interval_overlaps(
+                            started_at_us,
+                            completed_at_us,
+                            stop.entered_at_us,
+                            stop.exited_at_us,
+                        )
+                        for stop in pits_by_participant.get(participant_id, ())
+                    )
+                )
+                is_clean = bool(
+                    started_at_us is not None
+                    and state_kind == "ON_TRACK"
+                    and not is_in_lap
+                    and not is_out_lap
+                    and not crosses_pit
+                    and not has_gap
+                    and _green_covers_interval(
+                        periods,
+                        started_at_us=started_at_us,
+                        ended_at_us=completed_at_us,
+                    )
+                )
         else:
             lap_number = None
             completed_at_us = event.observed_at_us
@@ -936,6 +998,7 @@ def _load_raw_result_last_laps(
                 source_frame_id=event.frame_id,
                 source_message_ordinal=event.message_ordinal,
                 source_change_ordinal=event.source_change_ordinal,
+                lap_number_is_official=event.linked_lap_number_is_official,
             )
         )
         previous_at_us[participant_id] = event.observed_at_us

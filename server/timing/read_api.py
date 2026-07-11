@@ -1168,7 +1168,26 @@ def _participants(connection: sqlite3.Connection, heat_id: int) -> list[dict[str
                diff_fact.target_state_kind AS diff_fact_target_state_kind,diff_fact.target_laps AS diff_fact_target_laps,
                diff_fact.relation_kind AS diff_fact_relation_kind,
                i.driver_name_raw AS identity_driver_name,i.source_message_id AS identity_source_message_id,
-               i.source_key AS identity_source_key,i.observed_at_us AS identity_observed_at_us
+               i.source_key AS identity_source_key,i.observed_at_us AS identity_observed_at_us,
+               lap_count.completed_laps AS canonical_completed_laps,
+               lap_count.observed_laps AS canonical_observed_laps,
+               lap_count.coverage_complete AS canonical_coverage_complete,
+               lap_count.exact_laps AS canonical_exact_laps,
+               lap_count.latest_finished_at_provider_us AS canonical_latest_finished_at_provider_us,
+               gap_coordinate.raw_gap_value AS coordinate_raw_gap_value,
+               gap_coordinate.display_value_kind AS coordinate_display_value_kind,
+               gap_coordinate.lap_group_completed_laps AS coordinate_lap_group_completed_laps,
+               gap_coordinate.time_from_lap_group_leader_ms AS coordinate_group_time_ms,
+               gap_coordinate.lap_group_leader_participant_id AS coordinate_group_leader_id,
+               gap_coordinate.lap_group_leader_position_overall AS coordinate_group_leader_position,
+               gap_coordinate.gap_to_overall_leader_laps AS coordinate_gap_laps,
+               gap_coordinate.gap_to_overall_leader_residual_ms AS coordinate_gap_residual_ms,
+               gap_coordinate.coordinate_status,gap_coordinate.source_cell_observation_id AS coordinate_source_cell_id,
+               gap_coordinate.source_cell_message_id AS coordinate_source_cell_message_id,
+               gap_coordinate.source_cell_key AS coordinate_source_cell_key,
+               gap_coordinate.source_cell_observed_at_us AS coordinate_source_cell_observed_at_us,
+               gap_snapshot.id AS coordinate_snapshot_id,gap_snapshot.observed_at_us AS coordinate_observed_at_us,
+               gap_snapshot.completeness AS coordinate_snapshot_completeness
             FROM participants p
             LEFT JOIN participant_state_current c
               ON c.source_heat_id = p.source_heat_id AND c.participant_id = p.id
@@ -1176,6 +1195,23 @@ def _participants(connection: sqlite3.Connection, heat_id: int) -> list[dict[str
             LEFT JOIN participant_interval_source_facts AS diff_fact ON diff_fact.id = c.diff_interval_fact_id
             LEFT JOIN participant_identity_segments i
           ON i.source_heat_id = p.source_heat_id AND i.participant_id = p.id AND i.ended_at_us IS NULL
+            LEFT JOIN (
+              SELECT source_heat_id,participant_id,MAX(lap_number) AS completed_laps,
+                     COUNT(*) AS observed_laps,MIN(coverage_complete) AS coverage_complete,
+                     SUM(CASE WHEN duration_reconciliation = 'EXACT' THEN 1 ELSE 0 END) AS exact_laps,
+                     MAX(finished_at_provider_us) AS latest_finished_at_provider_us
+              FROM canonical_laps
+              GROUP BY source_heat_id,participant_id
+            ) AS lap_count
+              ON lap_count.source_heat_id = p.source_heat_id AND lap_count.participant_id = p.id
+            LEFT JOIN gap_coordinate_snapshots AS gap_snapshot
+              ON gap_snapshot.id = (
+                SELECT latest_gap.id FROM gap_coordinate_snapshots AS latest_gap
+                WHERE latest_gap.source_heat_id = p.source_heat_id
+                ORDER BY latest_gap.observed_second DESC,latest_gap.id DESC LIMIT 1
+              )
+            LEFT JOIN participant_gap_coordinates AS gap_coordinate
+              ON gap_coordinate.snapshot_id = gap_snapshot.id AND gap_coordinate.participant_id = p.id
         WHERE p.source_heat_id = ?
         ORDER BY
           CASE WHEN c.position_class IS NULL THEN 1 ELSE 0 END,
@@ -1265,6 +1301,43 @@ def _participants(connection: sqlite3.Connection, heat_id: int) -> list[dict[str
                 "active": bool(row["active"]),
                 "first_seen_at_us": row["first_seen_at_us"],
                 "last_seen_at_us": row["last_seen_at_us"],
+                "lap_count": (
+                    {
+                        "completed_laps": int(row["canonical_completed_laps"])
+                        if row["canonical_completed_laps"] is not None
+                        else None,
+                        "observed_complete_laps": int(row["canonical_observed_laps"]),
+                        "coverage_complete": bool(row["canonical_coverage_complete"]),
+                        "exact_last_laps": int(row["canonical_exact_laps"] or 0),
+                        "latest_finished_at_provider_us": row["canonical_latest_finished_at_provider_us"],
+                    }
+                    if row["canonical_observed_laps"] is not None
+                    else None
+                ),
+                "gap_coordinate": (
+                    {
+                        "snapshot_id": int(row["coordinate_snapshot_id"]),
+                        "observed_at_us": int(row["coordinate_observed_at_us"]),
+                        "snapshot_completeness": row["coordinate_snapshot_completeness"],
+                        "status": row["coordinate_status"],
+                        "raw_gap_value": row["coordinate_raw_gap_value"],
+                        "display_value_kind": row["coordinate_display_value_kind"],
+                        "lap_group_completed_laps": row["coordinate_lap_group_completed_laps"],
+                        "time_from_lap_group_leader_ms": row["coordinate_group_time_ms"],
+                        "lap_group_leader_participant_id": row["coordinate_group_leader_id"],
+                        "lap_group_leader_position_overall": row["coordinate_group_leader_position"],
+                        "gap_to_overall_leader_laps": row["coordinate_gap_laps"],
+                        "gap_to_overall_leader_residual_ms": row["coordinate_gap_residual_ms"],
+                        "source": {
+                            "cell_observation_id": row["coordinate_source_cell_id"],
+                            "message_id": row["coordinate_source_cell_message_id"],
+                            "key": row["coordinate_source_cell_key"],
+                            "observed_at_us": row["coordinate_source_cell_observed_at_us"],
+                        },
+                    }
+                    if row["coordinate_snapshot_id"] is not None
+                    else None
+                ),
                 "identity_source": identity_source,
                 "state": state,
             }
@@ -1824,8 +1897,18 @@ def _dashboard_lap_series(
                  ledger.observed_at_us,ledger.duration_ms,ledger.classification,
                  ledger.linked_lap_id,ledger.sectors_json,
                  ledger.sectors_source_cell_observation_ids_json,
-                 lap.lap_number,lap.completed_at_us,lap.flag,lap.is_in_lap,
-                 lap.is_out_lap,lap.crosses_pit,lap.is_clean,
+                 COALESCE(canonical_lap.lap_number,lap.lap_number) AS lap_number,
+                 COALESCE(canonical_lap.finished_at_us,lap.completed_at_us) AS completed_at_us,
+                 canonical_lap.id AS canonical_lap_id,
+                 canonical_lap.started_at_provider_us,canonical_lap.finished_at_provider_us,
+                 lap.flag,
+                 COALESCE(lap.is_in_lap,finish_boundary.boundary_kind = 'PIT_FINISH') AS is_in_lap,
+                 COALESCE(
+                   lap.is_out_lap,
+                   start_boundary.boundary_kind = 'PIT_FINISH' AND finish_boundary.boundary_kind = 'MAIN_FINISH'
+                 ) AS is_out_lap,
+                 COALESCE(lap.crosses_pit,canonical_lap.is_pit_lap) AS crosses_pit,
+                 lap.is_clean,
                  ROW_NUMBER() OVER (
                    PARTITION BY ledger.participant_id
                    ORDER BY ledger.source_frame_id,ledger.source_message_ordinal,
@@ -1833,6 +1916,12 @@ def _dashboard_lap_series(
                  ) AS capture_lap_index
           FROM result_last_cell_ledger AS ledger
           LEFT JOIN laps AS lap ON lap.id = ledger.linked_lap_id
+          LEFT JOIN canonical_laps AS canonical_lap
+            ON canonical_lap.source_last_cell_observation_id = ledger.source_cell_observation_id
+          LEFT JOIN canonical_lap_boundaries AS start_boundary
+            ON start_boundary.id = canonical_lap.start_boundary_id
+          LEFT JOIN canonical_lap_boundaries AS finish_boundary
+            ON finish_boundary.id = canonical_lap.finish_boundary_id
           WHERE ledger.source_heat_id = ?
             AND ledger.participant_id IN ({placeholders})
             AND ledger.classification = 'CONFIRMED_LAP'
@@ -1863,7 +1952,9 @@ def _dashboard_lap_series(
         source_counts[participant_id] += 1
         grouped[participant_id].append(
             {
-                "capture_at_us": int(row["observed_at_us"]),
+                "capture_at_us": int(row["completed_at_us"])
+                if row["canonical_lap_id"] is not None and row["completed_at_us"] is not None
+                else int(row["observed_at_us"]),
                 "completed_at_us": int(row["completed_at_us"]) if row["completed_at_us"] is not None else None,
                 "capture_lap_index": int(row["capture_lap_index"]),
                 "lap_number": int(row["lap_number"]) if row["lap_number"] is not None else None,
@@ -1875,10 +1966,19 @@ def _dashboard_lap_series(
                 ),
                 "driver_name": row["driver_name"],
                 "flag": row["flag"],
-                "is_in_lap": bool(row["is_in_lap"]) if row["linked_lap_id"] is not None else None,
-                "is_out_lap": bool(row["is_out_lap"]) if row["linked_lap_id"] is not None else None,
-                "crosses_pit": bool(row["crosses_pit"]) if row["linked_lap_id"] is not None else None,
+                "is_in_lap": bool(row["is_in_lap"])
+                if row["linked_lap_id"] is not None or row["canonical_lap_id"] is not None
+                else None,
+                "is_out_lap": bool(row["is_out_lap"])
+                if row["linked_lap_id"] is not None or row["canonical_lap_id"] is not None
+                else None,
+                "crosses_pit": bool(row["crosses_pit"])
+                if row["linked_lap_id"] is not None or row["canonical_lap_id"] is not None
+                else None,
                 "is_clean": bool(row["is_clean"]) if row["linked_lap_id"] is not None else None,
+                "canonical_lap_id": row["canonical_lap_id"],
+                "started_at_provider_us": row["started_at_provider_us"],
+                "finished_at_provider_us": row["finished_at_provider_us"],
                 "source": {
                     "cell_observation_id": int(row["source_cell_observation_id"]),
                     "message_id": int(row["source_message_id"]),
@@ -4150,6 +4250,291 @@ def _fact_filters(
     return (" AND " + " AND ".join(clauses)) if clauses else "", parameters
 
 
+def _canonical_lap_counts(connection: sqlite3.Connection, heat_id: int) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT participant.id AS participant_id,participant.start_number,participant.team_name,
+               participant.car_name,participant.class_name,participant.class_name_key,
+               participant.is_ours,state.position_overall,state.position_class,
+               COUNT(lap.id) AS observed_complete_laps,MAX(lap.lap_number) AS completed_laps,
+               MIN(lap.coverage_complete) AS coverage_complete,
+               SUM(CASE WHEN lap.duration_reconciliation = 'EXACT' THEN 1 ELSE 0 END) AS exact_last_laps,
+               SUM(CASE WHEN lap.duration_reconciliation <> 'EXACT' THEN 1 ELSE 0 END) AS unmatched_laps
+        FROM participants AS participant
+        LEFT JOIN participant_state_current AS state
+          ON state.source_heat_id = participant.source_heat_id AND state.participant_id = participant.id
+        LEFT JOIN canonical_laps AS lap
+          ON lap.source_heat_id = participant.source_heat_id AND lap.participant_id = participant.id
+        WHERE participant.source_heat_id = ?
+        GROUP BY participant.id
+        ORDER BY CASE WHEN state.position_overall IS NULL THEN 1 ELSE 0 END,
+                 state.position_overall,participant.start_number,participant.id
+        """,
+        (heat_id,),
+    ).fetchall()
+    return [
+        {
+            "participant_id": row["participant_id"],
+            "start_number": row["start_number"],
+            "team_name": row["team_name"],
+            "car_name": row["car_name"],
+            "class_name": row["class_name"],
+            "class_key": row["class_name_key"] or _class_key(row["class_name"]),
+            "is_ours": bool(row["is_ours"]),
+            "position_overall": row["position_overall"],
+            "position_class": row["position_class"],
+            "completed_laps": int(row["completed_laps"]) if row["completed_laps"] is not None else None,
+            "observed_complete_laps": int(row["observed_complete_laps"]),
+            "coverage_complete": bool(row["coverage_complete"])
+            if row["coverage_complete"] is not None
+            else False,
+            "exact_last_laps": int(row["exact_last_laps"] or 0),
+            "unmatched_laps": int(row["unmatched_laps"] or 0),
+        }
+        for row in rows
+    ]
+
+
+def _read_canonical_laps(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+    heat: sqlite3.Row,
+    participant_id: str | None,
+    from_at_us: int | None,
+    to_at_us: int | None,
+    limit: int,
+) -> dict[str, Any]:
+    heat_id = int(heat["id"])
+    suffix, parameters = _fact_filters(
+        participant_id=participant_id,
+        from_at_us=from_at_us,
+        to_at_us=to_at_us,
+        time_column="COALESCE(f.finished_at_us,f.finish_observed_at_us)",
+    )
+    rows = connection.execute(
+        f"""
+        SELECT f.*,participant.start_number,participant.team_name,participant.car_name,
+               participant.class_name,
+               start_boundary.boundary_kind AS start_boundary_kind,
+               start_boundary.source_kind AS start_source_kind,
+               start_boundary.passing_observation_id AS start_passing_observation_id,
+               start_boundary.corroborating_passing_observation_id AS start_corroborating_passing_id,
+               start_boundary.provider_passed_at_raw AS start_provider_raw,
+               start_boundary.source_message_id AS start_source_message_id,
+               start_boundary.source_key AS start_source_key,
+               finish_boundary.boundary_kind AS finish_boundary_kind,
+               finish_boundary.source_kind AS finish_source_kind,
+               finish_boundary.passing_observation_id AS finish_passing_observation_id,
+               finish_boundary.provider_passed_at_raw AS finish_provider_raw,
+               finish_boundary.source_message_id AS finish_source_message_id,
+               finish_boundary.source_key AS finish_source_key,
+               last_cell.raw_value_json AS source_last_raw_json,
+               last_cell.value_text AS source_last_value_text,
+               last_cell.source_message_id AS source_last_message_id,
+               last_cell.source_key AS source_last_key,
+               (
+                 SELECT flag FROM track_flag_periods AS flag
+                 WHERE flag.source_heat_id = f.source_heat_id
+                   AND flag.started_at_us <= COALESCE(f.finished_at_us,f.finish_observed_at_us)
+                   AND (flag.ended_at_us IS NULL OR flag.ended_at_us > COALESCE(f.finished_at_us,f.finish_observed_at_us))
+                 ORDER BY flag.started_at_us DESC,flag.id DESC LIMIT 1
+               ) AS flag
+        FROM canonical_laps AS f
+        JOIN participants AS participant ON participant.id = f.participant_id
+        JOIN canonical_lap_boundaries AS start_boundary ON start_boundary.id = f.start_boundary_id
+        JOIN canonical_lap_boundaries AS finish_boundary ON finish_boundary.id = f.finish_boundary_id
+        LEFT JOIN participant_result_cell_observations AS last_cell
+          ON last_cell.id = f.source_last_cell_observation_id
+        WHERE f.source_heat_id = ?{suffix}
+        ORDER BY COALESCE(f.finished_at_us,f.finish_observed_at_us) DESC,f.lap_ordinal DESC
+        LIMIT ?
+        """,
+        (heat_id, *parameters, limit),
+    ).fetchall()
+    chronological = list(reversed(rows))
+    lap_ids = [str(row["id"]) for row in chronological]
+    sectors_by_lap: dict[str, list[dict[str, Any]]] = {lap_id: [] for lap_id in lap_ids}
+    passings_by_lap: dict[str, list[dict[str, Any]]] = {lap_id: [] for lap_id in lap_ids}
+    if lap_ids:
+        placeholders = ",".join("?" for _ in lap_ids)
+        sector_rows = connection.execute(
+            f"""
+            SELECT sector.*,source.raw_value_json AS source_raw_value_json,
+                   tracker_start.raw_passing_json AS tracker_start_raw_json,
+                   tracker_finish.raw_passing_json AS tracker_finish_raw_json
+            FROM canonical_lap_sectors AS sector
+            LEFT JOIN participant_result_cell_observations AS source
+              ON source.id = sector.source_cell_observation_id
+            LEFT JOIN tracker_passing_observations AS tracker_start
+              ON tracker_start.id = sector.tracker_start_passing_observation_id
+            LEFT JOIN tracker_passing_observations AS tracker_finish
+              ON tracker_finish.id = sector.tracker_finish_passing_observation_id
+            WHERE sector.canonical_lap_id IN ({placeholders})
+            ORDER BY sector.canonical_lap_id,sector.sector_number
+            """,
+            tuple(lap_ids),
+        ).fetchall()
+        for row in sector_rows:
+            sectors_by_lap[str(row["canonical_lap_id"])].append(
+                {
+                    "sector_number": int(row["sector_number"]),
+                    "source_duration_raw": row["source_duration_raw"],
+                    "source_duration_us": row["source_duration_us"],
+                    "source_duration_ms": row["source_duration_ms"],
+                    "source_cell_observation_id": row["source_cell_observation_id"],
+                    "source_raw_value": _json_value(
+                        row["source_raw_value_json"], context="canonical sector source raw"
+                    )
+                    if row["source_raw_value_json"] is not None
+                    else None,
+                    "tracker_started_at_provider_us": row["tracker_started_at_provider_us"],
+                    "tracker_finished_at_provider_us": row["tracker_finished_at_provider_us"],
+                    "tracker_duration_us": row["tracker_duration_us"],
+                    "tracker_duration_ms": row["tracker_duration_ms"],
+                    "tracker_start_passing_observation_id": row[
+                        "tracker_start_passing_observation_id"
+                    ],
+                    "tracker_finish_passing_observation_id": row[
+                        "tracker_finish_passing_observation_id"
+                    ],
+                    "tracker_start_raw": _json_value(
+                        row["tracker_start_raw_json"], context="canonical sector tracker start raw"
+                    )
+                    if row["tracker_start_raw_json"] is not None
+                    else None,
+                    "tracker_finish_raw": _json_value(
+                        row["tracker_finish_raw_json"], context="canonical sector tracker finish raw"
+                    )
+                    if row["tracker_finish_raw_json"] is not None
+                    else None,
+                    "reconciliation": row["duration_reconciliation"],
+                }
+            )
+        passing_rows = connection.execute(
+            f"""
+            SELECT link.canonical_lap_id,link.passing_ordinal,link.role,observation.*
+            FROM canonical_lap_tracker_passings AS link
+            JOIN tracker_passing_observations AS observation
+              ON observation.id = link.passing_observation_id
+            WHERE link.canonical_lap_id IN ({placeholders})
+            ORDER BY link.canonical_lap_id,link.passing_ordinal
+            """,
+            tuple(lap_ids),
+        ).fetchall()
+        for row in passing_rows:
+            passings_by_lap[str(row["canonical_lap_id"])].append(
+                {
+                    "passing_observation_id": int(row["id"]),
+                    "ordinal": int(row["passing_ordinal"]),
+                    "role": row["role"],
+                    "provider_passed_at_raw": row["provider_passed_at_raw"],
+                    "provider_passed_at_provider_us": row["provider_passed_at_provider_us"],
+                    "passed_at_us": row["passed_at_us"],
+                    "observed_at_us": int(row["observed_at_us"]),
+                    "start_distance_mm": row["start_distance_mm"],
+                    "stop_distance_mm": row["stop_distance_mm"],
+                    "sector_id": row["sector_id"],
+                    "is_in_pit": bool(row["is_in_pit"]) if row["is_in_pit"] is not None else None,
+                    "raw": _json_value(row["raw_passing_json"], context="canonical tracker passing raw"),
+                    "source": {"message_id": row["source_message_id"], "key": row["source_key"]},
+                }
+            )
+    items: list[dict[str, Any]] = []
+    for row in chronological:
+        lap_id = str(row["id"])
+        sector_facts = sectors_by_lap[lap_id]
+        items.append(
+            {
+                "lap_id": lap_id,
+                "participant_id": row["participant_id"],
+                "start_number": row["start_number"],
+                "team_name": row["team_name"],
+                "car_name": row["car_name"],
+                "class_name": row["class_name"],
+                "lap_ordinal": int(row["lap_ordinal"]),
+                "lap_number": int(row["lap_number"]) if row["lap_number"] is not None else None,
+                "coverage_complete": bool(row["coverage_complete"]),
+                "started_at_us": row["started_at_us"],
+                "completed_at_us": row["finished_at_us"],
+                "started_at_provider_us": int(row["started_at_provider_us"]),
+                "finished_at_provider_us": int(row["finished_at_provider_us"]),
+                "tracker_duration_us": int(row["tracker_duration_us"]),
+                "tracker_duration_ms": int(row["tracker_duration_ms"]),
+                "duration_ms": row["source_duration_ms"],
+                "source_duration_raw": row["source_duration_raw"],
+                "source_duration_us": row["source_duration_us"],
+                "duration_reconciliation": row["duration_reconciliation"],
+                "sectors": {
+                    f"sector_{sector['sector_number']}": sector["source_duration_raw"]
+                    for sector in sector_facts
+                },
+                "sector_facts": sector_facts,
+                "tracker_passings": passings_by_lap[lap_id],
+                "flag": row["flag"],
+                "is_in_lap": row["finish_boundary_kind"] == "PIT_FINISH",
+                "is_out_lap": row["start_boundary_kind"] == "PIT_FINISH"
+                and row["finish_boundary_kind"] == "MAIN_FINISH",
+                "crosses_pit": bool(row["is_pit_lap"]),
+                "is_clean": None,
+                "start_boundary": {
+                    "boundary_id": row["start_boundary_id"],
+                    "kind": row["start_boundary_kind"],
+                    "source_kind": row["start_source_kind"],
+                    "provider_passed_at_raw": row["start_provider_raw"],
+                    "provider_passed_at_provider_us": int(row["started_at_provider_us"]),
+                    "passed_at_us": row["started_at_us"],
+                    "passing_observation_id": row["start_passing_observation_id"],
+                    "corroborating_passing_observation_id": row["start_corroborating_passing_id"],
+                    "source": {
+                        "message_id": row["start_source_message_id"],
+                        "key": row["start_source_key"],
+                    },
+                },
+                "finish_boundary": {
+                    "boundary_id": row["finish_boundary_id"],
+                    "kind": row["finish_boundary_kind"],
+                    "source_kind": row["finish_source_kind"],
+                    "provider_passed_at_raw": row["finish_provider_raw"],
+                    "provider_passed_at_provider_us": int(row["finished_at_provider_us"]),
+                    "passed_at_us": row["finished_at_us"],
+                    "passing_observation_id": row["finish_passing_observation_id"],
+                    "source": {
+                        "message_id": row["finish_source_message_id"],
+                        "key": row["finish_source_key"],
+                    },
+                },
+                "source": {
+                    "last_cell_observation_id": row["source_last_cell_observation_id"],
+                    "last_raw_value": _json_value(
+                        row["source_last_raw_json"], context="canonical LAST source raw"
+                    )
+                    if row["source_last_raw_json"] is not None
+                    else None,
+                    "last_value_text": row["source_last_value_text"],
+                    "message_id": row["source_last_message_id"],
+                    "key": row["source_last_key"],
+                },
+                "provenance": "source_last_with_tracker_chronology",
+            }
+        )
+    return {
+        "session_id": session_id,
+        "heat": _heat_payload(heat),
+        "participant_id": participant_id,
+        "limit": limit,
+        "lap_counts": _canonical_lap_counts(connection, heat_id),
+        "items": items,
+        "semantics": {
+            "lap_number": "exact only when Tracker coverage is corroborated from the official green flag",
+            "duration_ms": "authoritative result-grid LAST; never calculated from Tracker",
+            "tracker_duration_ms": "difference between raw provider boundary timestamps",
+            "sectors": "authoritative result-grid SECT values with independent Tracker reconciliation",
+        },
+        "provenance_contract": _provenance_contract(),
+    }
+
+
 def read_laps(
     session_id: str,
     *,
@@ -4180,6 +4565,19 @@ def read_laps(
             }
         heat_id = int(heat["id"])
         participant_id = _validate_participant_filter(connection, heat_id=heat_id, participant_id=participant_id)
+        canonical_available = connection.execute(
+            "SELECT 1 FROM canonical_laps WHERE source_heat_id = ? LIMIT 1", (heat_id,)
+        ).fetchone()
+        if canonical_available is not None:
+            return _read_canonical_laps(
+                connection,
+                session_id=session_id,
+                heat=heat,
+                participant_id=participant_id,
+                from_at_us=from_at_us,
+                to_at_us=to_at_us,
+                limit=limit,
+            )
         suffix, parameters = _fact_filters(
             participant_id=participant_id,
             from_at_us=from_at_us,

@@ -1,6 +1,7 @@
 # Current Live Field Audit
 
-Observed from the active Igora SignalR capture on 2026-07-10. The production
+Observed from the active Igora SignalR captures on 2026-07-10 and the race on
+2026-07-11. The production
 source contract is the current result-table schema below. The normalizer still
 resolves headers rather than trusting column indexes, so an upstream fault or
 schema drift is retained as raw evidence and fails closed instead of silently
@@ -41,19 +42,22 @@ for every raw layout as `time-service-result-grid-v1`, stored in
 | `CurrentDriver` | `DRIVER IN CAR` | current state + identity segment `driver_name_raw` | A change opens a new automatic driver segment |
 | `class` | `CLS` | participant + identity segment `class_name` | `CN PRO` scopes tactics and competitor selection |
 | `position_in_class` | `PIC` | `participant_state_current.position_class` | Position within class; drives class-only tactical comparisons |
-| `hole` | `GAP` | immutable `participant_interval_source_facts(GAP)` + current pointer | Exact source cell with message, time, subject/target position, state and lap context; only this fact may feed a gap metric |
+| `hole` | `GAP` | immutable source fact + one-Hz full-table `participant_gap_coordinates` | Same-lap values are cumulative from the first car in their completed-lap group; `-- N laps --` starts a new group. Mixed lap/time coordinates are reconstructed before class filtering |
 | `fastestRoundTime` | `BEST` | `best_lap_ms` | Invalid source sentinel remains raw-only |
-| `lastRoundTime` | `LAST` | current `last_lap_ms` plus immutable `LAST` cell ledger | The only source of a lap duration; every canonical source cell is retained with an explicit admission status before it can enter timing analytics |
+| `lastRoundTime` | `LAST` | current `last_lap_ms`, immutable ledger and `canonical_laps.source_duration_*` | The only source of a lap duration. Exact Tracker chronology may identify a new lap even when two consecutive `LAST` values are equal |
 | `CurrentDriverStintTime` | `STINT` | `current_driver_stint_raw` | Source-specific driver-stint representation, preserved independently from tyre logic |
 | `PitTime` | `L-PIT` | `pit_time_raw`, source pit facts and computed `pit_stops` | Pit-lane source field; it is not stationary service time |
 | `pitstops` | `PIT` | provider pit count plus reconciled `pit_stops` | Counter corroborates automatic pit cycles; it cannot manufacture a completed stop |
-| `SectorTimes`, `p=1/2/3` | `SECT 1/2/3` | `last_sectors_json` / `laps.sectors_json` | Per-sector values are retained with exact source cells and linked only to a provable `LAST` boundary |
+| `SectorTimes`, `p=1/2/3` | `SECT 1/2/3` | source cells plus `canonical_lap_sectors` | Source values remain authoritative; raw Tracker sector boundaries and durations are stored independently for reconciliation |
 
-`CAR`, `LAPS` and `DIFF` are recognized optional source fields but are absent
-from the current wire layout. Their absence is explicit rather than inferred:
-car identity can still arrive from Statistics identity facts, official lap
-totals stay unavailable until a real `LAPS` column appears, and no DIFF value
-is synthesized. `sectionMarker` is a currently observed optional display field.
+`CAR`, `LAPS` and `DIFF` are recognized optional source fields. `LAPS` was
+absent at race start and was added by a live `r_l` layout update during the
+2026-07-11 race; `CAR` and `DIFF` remained absent. The reducer remaps retained
+cells by canonical header identity across that update and accepts subsequent
+sparse `r_c` messages without waiting for an `r_i` that the provider does not
+send. Car identity can still arrive from Statistics facts, Tracker independently
+reconstructs the completed-lap total, and no DIFF value is synthesized.
+`sectionMarker` is a currently observed optional display field.
 Additional fields remain queryable raw facts, but they do not change the
 meaning of the fixed timing fields above.
 
@@ -73,21 +77,51 @@ timestamps. Every canonical `LAST` cell is written to the immutable
 - `UNCONFIRMED`: incomplete or ambiguous evidence, retained for audit only;
 - `INVALID`: a sentinel or invalid duration, retained raw only.
 
-A sparse changed (or first observed) `r_c LAST` after the accepted `r_i`
-baseline for the same connection is a confirmed timing event. Equal sparse
-values remain unconfirmed: equal consecutive real laps are possible. A dense
+A sparse `r_c LAST` is first matched to one still-unlinked canonical Tracker
+lap by exact provider duration and a bounded observation window. This makes
+equal consecutive real laps distinct when each has its own physical boundary.
+The legacy fallback still treats an unmatched equal sparse value as
+unconfirmed. A dense
 aggregate block has at least two transmitted rows and at least 95% of the
 current layout columns for those rows. Only an equal `LAST` in that block is a
 `REFRESH_REPEAT`; a changed or new value still fails closed as unconfirmed.
 
-`LAPS`, when present in the current source schema, remains the official lap
-count. When it is absent, the archive's capture counter and tyre age count only
-confirmed ledger events since the relevant capture/stint boundary; that local
-count is never presented as an official total. The horizontal coordinate of a
-`LAST` fact is the time that the table observation arrived, not an invented
-finish-crossing timestamp. `r_i` is an audit baseline, while tracker `t_p` or
-an explicit `LAPS` cell may attach a provider lap number to the same confirmed
-`LAST` source cell without replacing its duration.
+`LAPS`, when present, remains a direct provider count. When it is absent, the
+official green timestamp from Statistics starts lap 1 and each subsequent
+main-finish or pit-finish Tracker boundary increments the exact completed-lap
+count. A capture that starts after green is explicitly partial: it exposes only
+an observed lower bound and never promotes its local ordinal to an official
+total. `LAST` supplies duration, `SECT 1/2/3` supply sector duration, and Tracker
+supplies exact raw provider start/end timestamps. None is substituted for
+another.
+
+### Canonical Tracker chronology
+
+The `t_i` topology defines the main finish, sector loops and pit path. Every
+physical `t_p` observation is retained. A lap boundary is only a passing whose
+start distance is zero and whose destination is either the main timing loop or
+the pit timing loop; a pit exit is not a completed lap. The initial
+service/start passing is only corroboration for the Statistics green timestamp.
+
+`canonical_laps` stores the exact provider start/end, calibrated UTC where
+available, coverage status and source `LAST` reconciliation. Every `t_p` inside
+the interval is linked in `canonical_lap_tracker_passings`; all three source and
+Tracker sector facts remain separately queryable in `canonical_lap_sectors`.
+The projection is deterministically rebuildable from immutable RAW data.
+
+### Mixed GAP coordinates
+
+During the race the provider groups the absolute table by completed laps. A
+row such as `-- 41 laps --` means that the row starts the 41-completed-lap
+group, not that the participant is 41 laps behind. Numeric rows below it are
+cumulative offsets from that group's first car, not pairwise values to sum.
+
+The reducer snapshots the full absolute table once per receive second before
+selecting `CN PRO`. Each participant therefore has a lexicographic coordinate:
+whole completed-lap deficit to the absolute leader plus the source time within
+its own lap group. The dashboard formats both components, for example
+`18 кругов + 6:20.111`. It never sums all visible numeric GAP rows and never
+silently converts a lap marker to zero milliseconds.
 
 ## STATE interpretation contract
 

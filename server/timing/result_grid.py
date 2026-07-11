@@ -84,6 +84,52 @@ class ResultGrid:
         self.layout_generation += 1
 
     @staticmethod
+    def _column_identity(column: ResultColumn) -> tuple[str, str, str | None]:
+        if column.key is not None:
+            return ("canonical", column.key, None)
+        return ("raw", column.source_name, column.source_parameter)
+
+    def apply_layout_update(self, layout: Any) -> None:
+        """Install an authoritative ``r_l`` and remap retained cells by identity.
+
+        Time Service can add or reorder columns during a running heat and then
+        immediately continue with sparse ``r_c`` messages, without another
+        full ``r_i``. Old numeric indexes cannot survive that transition, but
+        canonical header identities can. Ambiguous duplicate identities remain
+        fail-closed and raw messages are still retained by the writer.
+        """
+
+        previous_columns = self.columns
+        previous_rows = self.rows if self.schema_ready else {}
+        next_layout = copy.deepcopy(layout)
+        next_columns = result_columns(next_layout)
+        next_conflicts = self._schema_conflicts(next_columns)
+        next_indexes: dict[tuple[str, str, str | None], list[int]] = {}
+        for index, column in next_columns.items():
+            next_indexes.setdefault(self._column_identity(column), []).append(index)
+
+        remapped: dict[int, dict[int, ResultCell]] = {}
+        if not next_conflicts:
+            for row_index, cells in previous_rows.items():
+                next_cells: dict[int, ResultCell] = {}
+                for old_index, cell in cells.items():
+                    old_column = previous_columns.get(old_index)
+                    if old_column is None:
+                        continue
+                    candidates = next_indexes.get(self._column_identity(old_column), ())
+                    if len(candidates) == 1:
+                        next_cells[candidates[0]] = copy.deepcopy(cell)
+                if next_cells:
+                    remapped[row_index] = next_cells
+
+        self.layout = next_layout
+        self.columns = next_columns
+        self.rows = remapped
+        self.schema_pending = False
+        self.schema_conflicts = next_conflicts
+        self.layout_generation += 1
+
+    @staticmethod
     def _change_rows(value: Any) -> tuple[Sequence[Any], ...]:
         if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
             return ()

@@ -20,6 +20,12 @@ from dataclasses import dataclass
 from typing import Any, Iterator
 
 from .config import now_us
+from .canonical_laps import (
+    attach_last_cell as attach_canonical_last_cell,
+    linked_lap_for_last_cell as linked_canonical_lap_for_last_cell,
+    match_last_cell as match_canonical_last_cell,
+    record_tracker_passing as record_canonical_tracker_passing,
+)
 from .db import (
     CheckpointError,
     RUNTIME_CHECKPOINT_FORMAT,
@@ -27,6 +33,7 @@ from .db import (
     decode_checkpoint,
     runtime_checkpoint_rows,
 )
+from .gap_coordinates import GapCoordinateInput, parse_gap_display, write_gap_coordinate_snapshot
 from .ingest_store import ProcessedFrameCheckpoint, StoredFrame
 from .lifecycle import OUR_START_NUMBER, OUR_TEAM_NAME
 from .metric_runner import TimingMetricRunner
@@ -51,7 +58,7 @@ from .result_grid import ResultGrid, ResultGridStateError
 
 
 NORMALIZER_VERSION = "timeservice-normalizer-v1"
-RUNTIME_CHECKPOINT_REDUCER_VERSION = "timeservice-normalizer-checkpoint-v1"
+RUNTIME_CHECKPOINT_REDUCER_VERSION = "timeservice-normalizer-checkpoint-v2"
 RUNTIME_CHECKPOINT_PAYLOAD_FORMAT = "balchug.timing.normalizer-checkpoint"
 RUNTIME_CHECKPOINT_PAYLOAD_VERSION = 1
 RUNTIME_CHECKPOINT_INTERVAL_US = 30 * 1_000_000
@@ -272,9 +279,9 @@ def _event_ts_time(value: Any) -> int | None:
 
 
 def _gap_ms(value: Any) -> int | None:
-    """The current GAP/DIFF cells are decimal seconds, never a TsTime."""
-    number = _number(value)
-    return round(number * 1_000) if number is not None and number >= 0 else None
+    """Return only TIME display forms; lap-group markers deliberately stay null."""
+    parsed = parse_gap_display(value)
+    return parsed.time_ms if parsed.kind == "TIME" else None
 
 
 def _payload_mapping(value: Any) -> Mapping[str, Any] | None:
@@ -409,6 +416,7 @@ class TimingNormalizer:
                 # chronology is complete, so tyre/stint ledgers are invariant.
                 self._reconcile_frame_pit_events(connection)
                 self._finalize_last_cell_ledger(connection, frame.id)
+                self._write_gap_coordinate_snapshot(connection, frame.id, contexts[-1])
         finally:
             self._pending_pit_events = []
             self._pending_last_schema_baseline_ids = {}
@@ -1011,13 +1019,16 @@ class TimingNormalizer:
                         self._write_immediate_flag(connection, context, new_flag)
             return
         if handle == "r_l":
-            self.grid.set_layout(payload)
+            self.grid.apply_layout_update(payload)
             self._layout_id = None
-            # A provider layout announcement invalidates every connection's
-            # preceding snapshot until each connection sends a fresh ``r_i``.
+            # r_l is an authoritative schema message. Retained cells are
+            # remapped by canonical header identity, never by old index.
             self._schema_baselines.clear()
             if write:
-                self._ensure_layout(connection, context)
+                layout_id = self._ensure_layout(connection, context)
+                self._record_schema_baseline(connection, context, layout_id)
+            else:
+                self._restore_schema_baseline(connection, context)
             return
         if handle == "r_i":
             self.grid.apply_snapshot(payload)
@@ -1350,7 +1361,7 @@ class TimingNormalizer:
         context: FrameMessage,
         layout_id: int | None,
     ) -> None:
-        """Persist an accepted r_i without requiring a participant LAST cell."""
+        """Persist an accepted r_i/r_l schema anchor without requiring LAST."""
 
         if layout_id is None or not self.grid.schema_ready:
             return
@@ -1437,7 +1448,7 @@ class TimingNormalizer:
         context: FrameMessage,
         layout_id: int,
     ) -> ResultSchemaBaseline | None:
-        """Return the latest same-connection r_i strictly before ``context``."""
+        """Return the latest same-connection schema anchor before ``context``."""
 
         if not self.grid.schema_ready:
             return None
@@ -1672,11 +1683,32 @@ class TimingNormalizer:
                 and candidate["predecessor"]["value_text"] == candidate["value_text"]
             )
             candidate["linked_lap"] = self._linked_lap_for_last_cell(connection, cell_id)
+            candidate["linked_canonical_lap"] = linked_canonical_lap_for_last_cell(
+                connection,
+                source_heat_id=self.heat_id,
+                source_cell_observation_id=cell_id,
+            )
+            if (
+                candidate["linked_canonical_lap"] is None
+                and candidate["duration_ms"] is not None
+                and candidate["source_handle"] == "r_c"
+                and candidate["schema_baseline_id"] is not None
+                and not candidate["is_full_grid_refresh"]
+                and self._participant_identity_is_resolved(candidate)
+            ):
+                candidate["linked_canonical_lap"] = match_canonical_last_cell(
+                    connection,
+                    source_heat_id=self.heat_id,
+                    participant_id=candidate["participant_id"],
+                    duration_raw=candidate["value_text"],
+                    observed_at_us=int(candidate["observed_at_us"]),
+                )
             candidates.append(candidate)
         for candidate in candidates:
             duration_ms = candidate["duration_ms"]
             predecessor = candidate["predecessor"]
             linked_lap = candidate["linked_lap"]
+            linked_canonical_lap = candidate["linked_canonical_lap"]
             if duration_ms is None:
                 classification, reason = "INVALID", "INVALID_DURATION"
             elif bool(candidate["has_duplicate_canonical_last"]):
@@ -1691,6 +1723,8 @@ class TimingNormalizer:
                 )
             elif candidate["schema_baseline_id"] is None:
                 classification, reason = "UNCONFIRMED", "SCHEMA_BASELINE_MISSING"
+            elif linked_canonical_lap is not None:
+                classification, reason = "CONFIRMED_LAP", "CANONICAL_TRACKER_DURATION_MATCH"
             elif linked_lap is not None and linked_lap["duration_source_kind"] == "RESULT_GRID_LAST":
                 classification, reason = "CONFIRMED_LAP", "SOURCE_LAP_BOUNDARY"
             elif candidate["is_full_grid_refresh"]:
@@ -1709,8 +1743,28 @@ class TimingNormalizer:
             sectors_json = None
             sector_source_ids_json = None
             linked_lap_id = None
+            linked_canonical_lap_id = None
             if classification == "CONFIRMED_LAP":
-                if linked_lap is not None and linked_lap["duration_source_kind"] == "RESULT_GRID_LAST":
+                if linked_canonical_lap is not None and isinstance(candidate["participant_id"], str):
+                    linked_canonical_lap_id = linked_canonical_lap.id
+                    if linked_lap is not None and linked_lap["duration_source_kind"] == "RESULT_GRID_LAST":
+                        linked_lap_id = linked_lap["id"]
+                    source_sectors = self._result_sectors_for_lap(
+                        connection,
+                        participant_id=candidate["participant_id"],
+                        last_cell=candidate,
+                    )
+                    if source_sectors:
+                        sectors_json = _json({key: value[0] for key, value in source_sectors.items()})
+                        sector_source_ids_json = _json({key: value[1] for key, value in source_sectors.items()})
+                    attach_canonical_last_cell(
+                        connection,
+                        match=linked_canonical_lap,
+                        source_cell_observation_id=int(candidate["source_cell_observation_id"]),
+                        duration_raw=candidate["value_text"],
+                        source_sectors=source_sectors,
+                    )
+                elif linked_lap is not None and linked_lap["duration_source_kind"] == "RESULT_GRID_LAST":
                     linked_lap_id = linked_lap["id"]
                     sectors_json = linked_lap["sectors_json"]
                     sector_source_ids_json = linked_lap["sectors_source_cell_observation_ids_json"]
@@ -1746,6 +1800,7 @@ class TimingNormalizer:
                     ),
                     "schema_baseline_id": candidate["schema_baseline_id"],
                     "linked_lap_id": linked_lap_id,
+                    "linked_canonical_lap_id": linked_canonical_lap_id,
                     "sectors_json": sectors_json,
                     "sectors_source_cell_observation_ids_json": sector_source_ids_json,
                     "created_at_us": now_us(),
@@ -2206,6 +2261,89 @@ class TimingNormalizer:
                 (context.received_at_us, self.analysis_session_id),
             )
         return participant_id
+
+    def _write_gap_coordinate_snapshot(
+        self,
+        connection: sqlite3.Connection,
+        source_frame_id: int,
+        context: FrameMessage,
+    ) -> None:
+        """Project the mixed GAP column across the absolute table at one Hz."""
+
+        grid_rows = self.grid.all_rows()
+        if not grid_rows or not any("gap" in row for row in grid_rows.values()):
+            return
+        inputs: list[GapCoordinateInput] = []
+        for row in grid_rows.values():
+            start_number_key = _key(row.get("start_number"))
+            team_name_key = _key(row.get("team_name"))
+            participant = connection.execute(
+                """
+                SELECT id FROM participants
+                WHERE source_heat_id = ?
+                  AND ((? IS NOT NULL AND start_number_key = ?)
+                    OR (? IS NULL AND ? IS NOT NULL AND team_name_key = ?))
+                ORDER BY is_ours DESC,last_seen_at_us DESC,id
+                LIMIT 1
+                """,
+                (
+                    self.heat_id,
+                    start_number_key,
+                    start_number_key,
+                    start_number_key,
+                    team_name_key,
+                    team_name_key,
+                ),
+            ).fetchone()
+            if participant is None:
+                continue
+            participant_id = str(participant["id"])
+            source = connection.execute(
+                """
+                SELECT fact.source_cell_observation_id,fact.source_message_id,
+                       fact.source_key,fact.observed_at_us
+                FROM participant_state_current AS state
+                LEFT JOIN participant_interval_source_facts AS fact
+                  ON fact.id = state.gap_interval_fact_id
+                WHERE state.source_heat_id = ? AND state.participant_id = ?
+                """,
+                (self.heat_id, participant_id),
+            ).fetchone()
+            inputs.append(
+                GapCoordinateInput(
+                    participant_id=participant_id,
+                    position_overall=_integer(row.get("position_overall"), minimum=1),
+                    position_class=_integer(row.get("position_class"), minimum=1),
+                    raw_gap_value=_text(row.get("gap")),
+                    source_cell_observation_id=(
+                        int(source["source_cell_observation_id"])
+                        if source is not None and source["source_cell_observation_id"] is not None
+                        else None
+                    ),
+                    source_cell_message_id=(
+                        int(source["source_message_id"])
+                        if source is not None and source["source_message_id"] is not None
+                        else None
+                    ),
+                    source_cell_key=source["source_key"] if source is not None else None,
+                    source_cell_observed_at_us=(
+                        int(source["observed_at_us"])
+                        if source is not None and source["observed_at_us"] is not None
+                        else None
+                    ),
+                )
+            )
+        if not inputs:
+            return
+        write_gap_coordinate_snapshot(
+            connection,
+            source_heat_id=self.heat_id,
+            source_frame_id=source_frame_id,
+            source_message_id=context.id,
+            source_key=context.source_key,
+            observed_at_us=context.received_at_us,
+            rows=inputs,
+        )
 
     def _emit_stream_event(
         self,
@@ -3567,16 +3705,22 @@ class TimingNormalizer:
                 allow_lap_completion
                 and is_new_observation
                 and participant_id is not None
-                and passing.sector_id in self._finish_sector_ids
             ):
-                self._complete_lap_from_tracker(
+                canonical_lap = record_canonical_tracker_passing(
                     connection,
-                    context,
-                    participant_id,
-                    event_fingerprint,
-                    passed_at_us,
-                    passing_observation_id,
+                    source_heat_id=self.heat_id,
+                    observation_id=int(passing_observation_id),
                 )
+                if canonical_lap is not None:
+                    self._complete_lap_from_tracker(
+                        connection,
+                        context,
+                        participant_id,
+                        event_fingerprint,
+                        passed_at_us,
+                        passing_observation_id,
+                        canonical_lap.lap_number or canonical_lap.lap_ordinal,
+                    )
 
     def _complete_lap_from_tracker(
         self,
@@ -3586,6 +3730,7 @@ class TimingNormalizer:
         event_fingerprint: str,
         completed_at_us: int | None,
         completion_passing_observation_id: int | None,
+        canonical_lap_number: int,
     ) -> None:
         """Count a lap only when the active layout has no explicit LAPS value."""
         state = connection.execute(
@@ -3597,15 +3742,7 @@ class TimingNormalizer:
         ).fetchone()
         if state is None or state["laps"] is not None:
             return
-        previous = connection.execute(
-            """
-            SELECT lap_number,completed_at_us FROM laps
-            WHERE source_heat_id = ? AND participant_id = ?
-            ORDER BY lap_number DESC LIMIT 1
-            """,
-            (self.heat_id, participant_id),
-        ).fetchone()
-        lap_number = int(previous["lap_number"]) + 1 if previous is not None else 1
+        lap_number = canonical_lap_number
         source_completed_at_us = completed_at_us if completed_at_us is not None else context.received_at_us
         inserted = _insert_ignore(
             connection,
