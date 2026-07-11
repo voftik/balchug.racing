@@ -1,5 +1,7 @@
 import json
 import tempfile
+import time
+import tracemalloc
 import unittest
 from pathlib import Path
 
@@ -11,7 +13,34 @@ from timing.replay import replay_file
 class RecordingReplayTests(unittest.TestCase):
     def test_versioned_fixture_covers_pit_reconnect_and_heat_reset(self):
         fixture = Path(__file__).parent.parent / "fixtures" / "signalr-replay-v1.ndjson"
+        records = [json.loads(line) for line in fixture.read_text(encoding="utf-8").splitlines()]
+        messages = [
+            message
+            for record in records
+            if record.get("kind") == "decoded"
+            for message in record.get("messages", [])
+        ]
+        flags = [
+            message["args"][0]["f"]
+            for message in messages
+            if message["handle"] in {"h_i", "h_h"} and "f" in message["args"][0]
+        ]
+        result_values = [
+            change[2]
+            for message in messages
+            if message["handle"] == "r_c"
+            for batch in message["args"]
+            for change in batch
+        ]
         reducer = replay_file(fixture)
+
+        self.assertEqual(sum(record["kind"] == "connected" for record in records), 2)
+        self.assertEqual(sum(record["kind"] == "disconnected" for record in records), 1)
+        self.assertIn(3, flags)
+        self.assertGreaterEqual(flags.count(6), 2)
+        self.assertIn("4", result_values)
+        self.assertIn("In Pit", result_values)
+        self.assertIn("OutLap", result_values)
         self.assertEqual(reducer.latest_heat["n"], "Race Heat 2")
         self.assertEqual(reducer.result_rows()[1]["laps"], "0")
         self.assertEqual(len(reducer.tracker_passings), 2)
@@ -71,6 +100,69 @@ class RecordingReplayTests(unittest.TestCase):
 
 
 class ReconnectTests(unittest.IsolatedAsyncioTestCase):
+    async def test_four_hour_virtual_soak_reconnects_and_replays_deterministically(self):
+        class VirtualClock:
+            def __init__(self):
+                self.value = 0.0
+
+            def __call__(self):
+                return self.value
+
+            async def sleep(self, seconds):
+                self.value += seconds
+                await __import__("asyncio").sleep(0)
+
+        class FourHourClient:
+            def __init__(self, clock):
+                self.clock = clock
+                self.calls = 0
+
+            async def raw_frames(self):
+                self.calls += 1
+                bootstrap = Bootstrap("https://example.test", f"tid-{self.calls}", None)
+                while self.clock.value < 4 * 60 * 60:
+                    self.clock.value += 1
+                    raw = json.dumps(
+                        {"C": str(int(self.clock.value)), "M": [["s_t", int(self.clock.value)]]},
+                        separators=(",", ":"),
+                    )
+                    yield bootstrap, raw
+                    if self.calls == 1 and self.clock.value >= 2 * 60 * 60:
+                        return
+
+        clock = VirtualClock()
+        client = FourHourClient(clock)
+        tracemalloc.start()
+        started = time.perf_counter()
+        try:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "capture"
+                writer = RecordingWriter(root, "https://example.test", "test", ("s",))
+                stop_reason = await record_with_reconnect(
+                    client,
+                    writer,
+                    4 * 60 * 60,
+                    backoff=(1,),
+                    clock=clock,
+                    sleep=clock.sleep,
+                )
+                writer.close(stop_reason)
+                first = replay_file(root / "events.ndjson")
+                second = replay_file(root / "events.ndjson")
+                manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+        finally:
+            _, peak_bytes = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+
+        self.assertEqual(stop_reason, "duration_reached")
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(manifest["connections"], 2)
+        self.assertGreaterEqual(manifest["frames"], 14_000)
+        self.assertEqual(first.state_hash(), second.state_hash())
+        self.assertEqual(first.latest_server_time, 4 * 60 * 60)
+        self.assertLess(time.perf_counter() - started, 20)
+        self.assertLess(peak_bytes, 64 * 1024 * 1024)
+
     async def test_reconnects_after_socket_close_and_records_gap(self):
         class FakeClient:
             def __init__(self):

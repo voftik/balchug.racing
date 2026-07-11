@@ -7,6 +7,7 @@ import os
 import time
 import asyncio
 import base64
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -169,6 +170,8 @@ async def record_with_reconnect(
     seconds: float,
     *,
     backoff: tuple[float, ...] = (1, 2, 5, 10, 30),
+    clock: Callable[[], float] | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> str:
     """Record one source for a bounded duration with explicit reconnect gaps.
 
@@ -177,16 +180,17 @@ async def record_with_reconnect(
     continuous across a socket reconnect.
     """
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + seconds
+    now = clock or loop.time
+    deadline = now() + seconds
     failures = 0
-    while loop.time() < deadline:
+    while now() < deadline:
         raw_stream = getattr(client, "raw_frames", None)
         stream = (raw_stream() if raw_stream is not None else client.frames()).__aiter__()
         connected = False
         reason = "socket_closed"
         try:
             while True:
-                remaining = deadline - loop.time()
+                remaining = deadline - now()
                 if remaining <= 0:
                     return "duration_reached"
                 try:
@@ -224,11 +228,11 @@ async def record_with_reconnect(
             if close is not None:
                 await close()
 
-        if loop.time() >= deadline:
+        if now() >= deadline:
             return "duration_reached"
         if connected and reason == "socket_closed":
             writer.disconnected(reason)
         delay = backoff[min(failures, len(backoff) - 1)]
         failures += 1
-        await asyncio.sleep(min(delay, max(0, deadline - loop.time())))
+        await sleep(min(delay, max(0, deadline - now())))
     return "duration_reached"

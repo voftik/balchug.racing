@@ -37,16 +37,28 @@ becomes an explicit `disconnected` event, and each reconnect fetches a fresh
 bootstrap and SignalR token. This keeps a source gap visible instead of
 inventing data.
 
-## Current known handles
+## Versioned handle policy
 
-- `h_h`: heat/flag state
+Recording format `v1` preserves the raw SignalR envelope before decoding. The
+current adapter recognizes these provider handles:
+
+- `s_i`, `s_t`: server-time bootstrap/update
+- `h_i`, `h_h`: heat/flag snapshot and patch
 - `r_l`, `r_i`, `r_c`, `r_d`: dynamic results layout/snapshot/cell deltas
 - `t_i`, `t_p`: tracker snapshot and loop/pit passings
-- `a_i`, `a_u`: aggregate statistics
-- `s_i`, `s_t`: server time
+- `a_i`, `a_u`, `a_r`: aggregate statistics snapshot/update/reset
+- `m_i`, `m_c`, `m_d`, `m_a`: Race Control message snapshot/change/delete/add
 
 Unknown handles are retained in raw recording and counted by the replay reducer;
-they do not crash recording.
+they do not crash recording or mutate typed state. A known handle with an
+unrecognized shape is likewise retained as raw evidence and fails closed in
+normalization. The observed field shapes and unresolved semantics are versioned
+in `FIELD_AUDIT.md`; no browser-client JavaScript is copied into the adapter.
+
+There is no confirmed independent HTTP endpoint containing an authoritative
+result-grid snapshot. The client therefore uses HTTP only for bootstrap and
+SignalR negotiation on connect/reconnect; reconciliation comes from the fresh
+compressed SignalR initial snapshot. It never polls dashboard HTML at 1 Hz.
 
 ## Timing database
 
@@ -80,10 +92,17 @@ PYTHONPATH=server python3 -m timing.backup \
 
 ## Capacity planning
 
-The active Igora Practice capture measured roughly 1.2 MB in 25 minutes, or
-about 70 MB of raw WebSocket data over 24 hours at that cadence. Race traffic
-is deliberately budgeted much higher: reserve 500 MB of raw data and 1 GB total
-for a 24-hour analysis session, then keep at least 10 GB free under
+The 2026-07-11 Igora qualifying capture ran for 4,722 seconds, persisted 2,820
+raw frames over 17 provider connections and recorded 530,213 bytes of SignalR
+payload with zero decode failures (about 0.40 MB/hour). The ingest service used
+128 seconds of CPU and peaked at 74.7 MB RAM during that production interval.
+The accelerated four-hour recorder/replay soak in `test_recording_replay.py`
+adds a forced reconnect, writes more than 14,000 frames, verifies an identical
+state hash on two replays, and enforces a 64 MB Python allocation ceiling.
+
+Race traffic is deliberately budgeted much higher than the observed session:
+reserve 500 MB of raw data and 1 GB total for a 24-hour analysis session, then
+keep at least 10 GB free under
 `/var/lib/balchug` before race day. The seven-day raw-retention policy is only
 applied to stopped sessions after a checkpoint and a durable archive-playback
 projection exist for every captured heat; normalized analytics, playback
