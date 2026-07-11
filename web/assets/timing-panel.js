@@ -7,6 +7,7 @@
   var PANEL_STATE_KEY = "balchug_timing_panel";
   var LIVE_HISTORY_OVERLAP_US = 300000000;
   var SECTOR_KINDS = ["sector_1", "sector_2", "sector_3"];
+  var chartMath = window.BalchugTimingChartMath;
   var TAB_TITLES = {
     overview: "Тактический обзор",
     pace: "Темп по кругам",
@@ -1087,6 +1088,7 @@
     if (liveHistory) {
       if (kind === "pace") {
         series = participants.map(function (participant) { return livePaceSeries(history, participant); });
+        if (chartMath) series = chartMath.filterPaceSeries(series).series;
       } else if (isSectorKind(kind)) {
         series = participants.map(function (participant) { return liveSectorSeries(history, participant, kind); });
       } else {
