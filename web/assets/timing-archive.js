@@ -81,6 +81,8 @@
     eventWindowKey: "",
     chartBase: null,
     chartBaseKey: "",
+    chartGeometry: null,
+    selectedLapPoint: null,
     pitBase: null,
     pitBaseKey: "",
     pitVisual: null,
@@ -112,6 +114,8 @@
     bodyOverflow: null,
     coverage: null
   };
+
+  var COMPETITOR_COLORS = ["#007B91", "#526276", "#D08000", "#7D55B8", "#16824F", "#A44469"];
 
   function asObject(value) { return value && typeof value === "object" ? value : {}; }
   function valueOrDash(value) { return value === null || value === undefined || value === "" ? "—" : String(value); }
@@ -280,19 +284,46 @@
     return { sourceAvailable: sourceAvailable, ticks: ticks };
   }
 
-  function renderTimelineAxis(element, geometry) {
+  function timelineLapTicks(range, laps) {
+    var entries = [];
+    (Array.isArray(laps) ? laps : []).forEach(function (lap) {
+      var atUs = numericValue(lap && lap.completed_at_us);
+      var lapNumber = numericValue(lap && lap.lap_number);
+      if (atUs === null || lapNumber === null || atUs < range.first_at_us || atUs > range.last_at_us) return;
+      entries.push({ atUs: atUs, lapNumber: Math.round(lapNumber) });
+    });
+    entries.sort(function (left, right) { return left.atUs - right.atUs || left.lapNumber - right.lapNumber; });
+    return entries.map(function (entry, index) {
+      var isEndpoint = index === 0 || index === entries.length - 1;
+      var major = isEndpoint || entry.lapNumber % 5 === 0;
+      return {
+        ratio: (entry.atUs - range.first_at_us) / Math.max(1, range.last_at_us - range.first_at_us),
+        lapNumber: entry.lapNumber,
+        major: major,
+        label: major ? "#" + entry.lapNumber : ""
+      };
+    });
+  }
+
+  function renderTimelineAxis(element, geometry, ownLaps) {
     if (!element || !geometry || !geometry.range) return;
     var width = geometry.width || element.getBoundingClientRect().width || 1;
     var axis = timelineAxisTicks(geometry.range, width);
+    var lapTicks = timelineLapTicks(geometry.range, ownLaps);
     var key = [
       geometry.range.first_at_us, geometry.range.last_at_us, Math.round(width), geometry.left, geometry.right,
-      axis.sourceAvailable, axis.ticks.map(function (tick) { return tick.text; }).join("|")
+      axis.sourceAvailable, axis.ticks.map(function (tick) { return tick.text; }).join("|"),
+      lapTicks.map(function (tick) { return tick.lapNumber + ":" + tick.major; }).join("|")
     ].join(":");
     if (element.dataset.axisKey === key) return;
     element.dataset.axisKey = key;
     element.hidden = false;
     element.dataset.axisLabel = axis.sourceAvailable ? "Время табло" : "Время записи";
-    element.title = axis.sourceAvailable ? "Отметки времени Time Service из потока табло" : "Время получения записи";
+    element.dataset.lapLabel = lapTicks.length ? "Круги BALCHUG" : "";
+    element.classList.toggle("has-lap-axis", lapTicks.length > 0);
+    element.title = axis.sourceAvailable ?
+      "Верхняя шкала: время Time Service из потока табло. Нижняя: каждый круг BALCHUG Racing, подпись через пять кругов." :
+      "Верхняя шкала: время получения записи. Нижняя: каждый круг BALCHUG Racing, подпись через пять кругов.";
     element.style.setProperty("--axis-left", Math.round(geometry.left) + "px");
     element.style.setProperty("--axis-right", Math.round(geometry.right) + "px");
     element.replaceChildren();
@@ -306,6 +337,23 @@
       plot.appendChild(label);
     });
     element.appendChild(plot);
+    if (lapTicks.length) {
+      var lapPlot = document.createElement("div");
+      lapPlot.className = "ta-stream-lap-plot";
+      lapTicks.forEach(function (tick) {
+        var marker = document.createElement("span");
+        marker.className = "ta-stream-lap-tick" + (tick.major ? " major" : "");
+        marker.style.left = (tick.ratio * 100) + "%";
+        marker.title = "Круг #" + tick.lapNumber;
+        if (tick.label) {
+          var label = document.createElement("b");
+          label.textContent = tick.label;
+          marker.appendChild(label);
+        }
+        lapPlot.appendChild(marker);
+      });
+      element.appendChild(lapPlot);
+    }
   }
 
   function formatEntryDate(atUs, timezone) {
@@ -567,25 +615,53 @@
     return number + team + car + driver;
   }
 
+  function comparisonCompetitors() {
+    var oursId = comparisonOursId();
+    return comparisonParticipants().filter(function (participant) {
+      return participant && participant.participant_id !== oursId;
+    });
+  }
+
+  function competitorColor(participantId) {
+    var index = comparisonCompetitors().findIndex(function (participant) {
+      return participant.participant_id === participantId;
+    });
+    return COMPETITOR_COLORS[index >= 0 ? index % COMPETITOR_COLORS.length : 0];
+  }
+
   function renderComparisonLegend() {
     var response = state.comparison;
     if (state.comparisonSelection === "ours" || !response || !response.comparison || !response.comparison.available) {
       elements.comparisonLegend.hidden = true;
+      elements.comparisonLegend.replaceChildren();
       return;
     }
     var comparison = response.comparison;
-    var className = comparison.class_name || "класса";
-    elements.comparisonLegend.hidden = false;
-    if (comparison.mode === "participant") {
-      var participant = comparisonParticipant(comparison.participant_id);
-      elements.comparisonLegendKey.className = "ta-legend-key competitor";
-      elements.comparisonLegendTitle.textContent = participant ? comparisonOptionLabel(participant) : "Соперник";
-      elements.comparisonLegendText.textContent = "Темп выбранной машины того же класса";
-    } else {
-      elements.comparisonLegendKey.className = "ta-legend-key aggregate";
-      elements.comparisonLegendTitle.textContent = "Медиана соперников " + className;
-      elements.comparisonLegendText.textContent = "Только подтверждённый темп едущих соперников; #21 исключён";
+    var participants = comparison.mode === "participant" ?
+      [comparisonParticipant(comparison.participant_id)].filter(Boolean) : comparisonCompetitors();
+    if (!participants.length) {
+      elements.comparisonLegend.hidden = true;
+      elements.comparisonLegend.replaceChildren();
+      return;
     }
+    elements.comparisonLegend.replaceChildren();
+    elements.comparisonLegend.hidden = false;
+    participants.forEach(function (participant) {
+      var item = document.createElement("li");
+      var key = document.createElement("i");
+      key.className = "ta-legend-key competitor";
+      key.style.background = competitorColor(participant.participant_id);
+      var copy = document.createElement("span");
+      var title = document.createElement("b");
+      title.textContent = comparisonOptionLabel(participant);
+      var detail = document.createElement("small");
+      detail.textContent = "Реальные значения каждого круга";
+      copy.appendChild(title);
+      copy.appendChild(detail);
+      item.appendChild(key);
+      item.appendChild(copy);
+      elements.comparisonLegend.appendChild(item);
+    });
   }
 
   function renderComparisonSelector() {
@@ -609,7 +685,7 @@
     elements.comparison.appendChild(ours);
     var aggregate = document.createElement("option");
     aggregate.value = "all";
-    aggregate.textContent = "Все соперники " + (comparison.class_name || "класса") + " · медиана";
+    aggregate.textContent = "Все соперники " + (comparison.class_name || "класса") + " · наложение";
     elements.comparison.appendChild(aggregate);
     var group = document.createElement("optgroup");
     group.label = "Отдельный соперник";
@@ -727,6 +803,8 @@
     state.eventWindowKey = "";
     state.chartBase = null;
     state.chartBaseKey = "";
+    state.chartGeometry = null;
+    state.selectedLapPoint = null;
     state.pitBase = null;
     state.pitBaseKey = "";
     state.pitVisual = null;
@@ -1003,67 +1081,11 @@
   }
 
   function renderBenchmark(payload) {
-    var response = state.comparison;
-    if (state.comparisonSelection === "ours" || !response || !response.comparison || !response.comparison.available) {
-      elements.benchmark.hidden = true;
-      state.benchmarkValues = null;
-      return;
-    }
-    var comparison = response.comparison;
-    var snapshot = asObject(payload);
-    var session = asObject(asObject(snapshot.computed).session);
-    var oursId = comparison.ours_participant_id;
-    var participants = snapshotClassParticipants(snapshot);
-    var ownPace = session.current_state === "ON_TRACK" ? numericValue(session.pace_5_ms) : null;
-    var benchmarkPace = null;
-    var contextValue = "—";
-    var contextLabel = "В бенчмарке";
-    var titleText;
-    var noteText;
-    if (comparison.mode === "participant") {
-      var selected = participants.find(function (participant) { return participant.participantId === comparison.participant_id; });
-      var selectedMeta = comparisonParticipant(comparison.participant_id);
-      var selectedHasPace = (response.points || []).some(function (point) {
-        return numericValue(point && point.benchmark_pace_5_ms) !== null;
-      });
-      benchmarkPace = onTrackPace(selected);
-      titleText = selectedMeta ? comparisonOptionLabel(selectedMeta) : "Выбранный соперник";
-      noteText = selectedHasPace ? "Темп выбранной машины за пять чистых кругов" : "Недостаточно пяти чистых кругов для темпа";
-      contextLabel = "Позиция в классе";
-      contextValue = selected && selected.positionClass !== null && selected.positionClass !== undefined ? "P" + selected.positionClass : "—";
-    } else {
-      var competitorPaces = participants.filter(function (participant) {
-        return participant.participantId !== oursId;
-      }).map(onTrackPace).filter(function (pace) { return pace !== null; });
-      benchmarkPace = median(competitorPaces);
-      titleText = "Медиана соперников " + (comparison.class_name || "класса");
-      noteText = "Только едущие соперники с подтверждённым темпом";
-      contextValue = formatNounCount(competitorPaces.length, "машина", "машины", "машин");
-    }
-    var delta = ownPace !== null && benchmarkPace !== null ? ownPace - benchmarkPace : null;
-    var values = {
-      ours: formatLap(ownPace),
-      benchmark: formatLap(benchmarkPace),
-      delta: formatPaceDelta(delta),
-      context: contextValue
-    };
-    var previous = state.benchmarkValues;
+    // Raw laps are the primary comparison surface.  Do not substitute them
+    // with a rolling or cross-car aggregate in the archive player.
     elements.benchmark.replaceChildren();
-    var title = document.createElement("div");
-    title.className = "ta-benchmark-title";
-    title.textContent = titleText;
-    var note = document.createElement("small");
-    note.textContent = noteText;
-    title.appendChild(note);
-    elements.benchmark.appendChild(title);
-    var deltaClass = delta === null ? "" : (delta < 0 ? "delta-fast" : (delta > 0 ? "delta-slow" : ""));
-    elements.benchmark.appendChild(benchmarkMetric("Темп BALCHUG", values.ours, "ours", !!previous && previous.ours !== values.ours));
-    elements.benchmark.appendChild(benchmarkMetric("Темп бенчмарка", values.benchmark, "benchmark", !!previous && previous.benchmark !== values.benchmark));
-    elements.benchmark.appendChild(benchmarkMetric(contextLabel, values.context, "context", !!previous && previous.context !== values.context));
-    var deltaMetric = benchmarkMetric("Разница темпа", values.delta, "delta", !!previous && previous.delta !== values.delta, deltaClass);
-    elements.benchmark.insertBefore(deltaMetric, elements.benchmark.children[3]);
-    state.benchmarkValues = values;
-    elements.benchmark.hidden = false;
+    elements.benchmark.hidden = true;
+    state.benchmarkValues = null;
   }
 
   function renderSnapshot(payload, effectiveAtUs) {
@@ -1089,7 +1111,11 @@
       { id: "laps", label: "Круги", value: firstDefined(session.completed_laps, oursState.laps) },
       { id: "state", label: "Состояние", value: firstDefined(session.current_state, oursState.state_kind, oursState.state) },
       { id: "last", label: "Последний круг", value: formatLap(firstDefined(session.last_lap_ms, oursState.last_lap_ms)) },
-      { id: "pace5", label: "Темп (5 кр.)", value: formatLap(session.pace_5_ms) },
+      { id: "last_to_best", label: "К лучшему кругу", value: formatGap(
+        numericValue(firstDefined(session.last_lap_ms, oursState.last_lap_ms)) !== null &&
+        numericValue(firstDefined(session.best_lap_ms, oursState.best_lap_ms)) !== null ?
+          numericValue(firstDefined(session.last_lap_ms, oursState.last_lap_ms)) - numericValue(firstDefined(session.best_lap_ms, oursState.best_lap_ms)) : null
+      ) },
       { id: "ahead", label: "До соперника впереди", value: formatGap(session.gap_to_ahead_ms) },
       { id: "behind", label: "До соперника сзади", value: formatGap(session.gap_to_behind_ms) },
       { id: "tyres", label: "Возраст шин", value: formatLapCount(firstDefined(session.tyre_age_laps, oursState.tyre_age_laps)) },
@@ -1356,7 +1382,7 @@
       state.pitLastPlayheadX = null;
     }
     var geometry = state.pitGeometry;
-    renderTimelineAxis(elements.pitAxis, geometry);
+    renderTimelineAxis(elements.pitAxis, geometry, data.lap_series && (data.lap_series.ours_raw || data.lap_series.ours));
     var total = Math.max(1, geometry.range.last_at_us - geometry.range.first_at_us);
     var playhead = geometry.left + (state.atUs - geometry.range.first_at_us) / total * Math.max(1, surface.width - geometry.left - geometry.right);
     var playheadPixel = Math.round(playhead);
@@ -1431,6 +1457,80 @@
     return result;
   }
 
+  function rawLapStatus(point) {
+    if (!point) return "";
+    if (point.value === null) return "время не передано источником";
+    var labels = [];
+    if (point.crossesPit) labels.push("через пит-стоп");
+    if (point.isInLap) labels.push("in lap");
+    if (point.isOutLap) labels.push("out lap");
+    if (point.flag && point.flag !== "GREEN") labels.push("флаг " + flagLabel(point.flag));
+    if (!point.isClean && !labels.length) labels.push("неподтверждённый круг");
+    return labels.length ? labels.join(" · ") : "боевой круг";
+  }
+
+  function rawLapPoints(laps, participant) {
+    return (Array.isArray(laps) ? laps : []).map(function (lap) {
+      var atUs = numericValue(lap && lap.completed_at_us);
+      if (atUs === null) return null;
+      var duration = numericValue(lap.duration_ms);
+      return {
+        id: [lap.participant_id || participant && participant.participant_id || "", lap.lap_number, atUs].join(":"),
+        atUs: atUs,
+        value: duration,
+        lapNumber: numericValue(lap.lap_number),
+        participantId: lap.participant_id || participant && participant.participant_id || null,
+        startNumber: lap.start_number || participant && participant.start_number || null,
+        teamName: lap.team_name || participant && participant.team_name || null,
+        isOurs: !!(participant && participant.is_ours),
+        isClean: !!lap.is_clean && duration !== null,
+        crossesPit: !!lap.crosses_pit,
+        isInLap: !!lap.is_in_lap,
+        isOutLap: !!lap.is_out_lap,
+        flag: lap.flag || null
+      };
+    }).filter(Boolean);
+  }
+
+  function rawCompetitorSeries(data) {
+    var lapSeries = asObject(data && data.lap_series);
+    var roster = comparisonParticipants();
+    var byId = Object.create(null);
+    roster.forEach(function (participant) { byId[participant.participant_id] = participant; });
+    var entries = Array.isArray(lapSeries.competitors) ? lapSeries.competitors : [];
+    var selectedId = state.comparisonSelection.indexOf("participant:") === 0 ?
+      state.comparisonSelection.slice("participant:".length) : null;
+    var selectedEntries = entries.filter(function (entry) {
+      return !selectedId || entry && entry.participant_id === selectedId;
+    });
+    if (!selectedEntries.length && selectedId && Array.isArray(lapSeries.benchmark)) {
+      selectedEntries = [{ participant_id: selectedId, laps: lapSeries.benchmark }];
+    }
+    return selectedEntries.map(function (entry) {
+      var participant = byId[entry.participant_id] || {
+        participant_id: entry.participant_id,
+        start_number: entry.start_number,
+        team_name: entry.team_name,
+        is_ours: false
+      };
+      return {
+        participant: participant,
+        color: competitorColor(participant.participant_id),
+        points: rawLapPoints(entry.laps, participant)
+      };
+    });
+  }
+
+  function rawPointKey(point) {
+    return point ? point.id : "";
+  }
+
+  function rawPointFromGeometry(geometry, point) {
+    if (!geometry || !point) return null;
+    var key = rawPointKey(point);
+    return (geometry.allPoints || []).find(function (candidate) { return rawPointKey(candidate) === key; }) || null;
+  }
+
   function lapMomentLabel(point) {
     if (!point) return "";
     var moment = timelineClockAt(point.atUs);
@@ -1452,36 +1552,38 @@
 
   function renderLapReadout(data, geometry) {
     if (!elements.lapReadout || !geometry) return;
+    var selected = rawPointFromGeometry(geometry, state.selectedLapPoint);
     var own = latestLapPoint(geometry.own, state.atUs);
-    var benchmark = latestLapPoint(geometry.benchmark, state.atUs);
-    var aggregate = geometry.aggregate;
-    var comparison = asObject(data.comparison);
-    var competitor = comparison.mode === "participant" ? comparisonParticipant(comparison.participant_id) : null;
-    var ownValue = own ? "Круг #" + valueOrDash(own.lapNumber) + " · " + formatLap(own.value) : "Нет чистого круга";
-    var ownDetail = own ? lapMomentLabel(own) : "до курсора";
-    var benchmarkLabel = aggregate ? "Медиана соперников" : (competitor ? comparisonOptionLabel(competitor) : "Выбранный соперник");
-    var benchmarkValue;
-    var benchmarkDetail;
-    if (benchmark) {
-      benchmarkValue = aggregate ? "Медиана · " + formatLap(benchmark.value) :
-        "Круг #" + valueOrDash(benchmark.lapNumber) + " · " + formatLap(benchmark.value);
-      benchmarkDetail = lapMomentLabel(benchmark);
-      if (aggregate && benchmark.count !== null) benchmarkDetail += " · " + formatNounCount(benchmark.count, "машина", "машины", "машин");
-    } else if (aggregate) {
-      benchmarkValue = "Нет чистого круга";
-      benchmarkDetail = "соперников до курсора";
-    } else {
-      benchmarkValue = "Нет чистого круга";
-      benchmarkDetail = "темп 5 кругов недоступен";
+    var competitorPoints = (geometry.competitors || []).reduce(function (items, series) {
+      return items.concat(series.points || []);
+    }, []);
+    var competitor = selected && !selected.isOurs ? selected : latestLapPoint(competitorPoints, state.atUs);
+    function pointValue(point) {
+      if (!point) return "Нет круга";
+      return "Круг #" + valueOrDash(point.lapNumber) + " · " + (point.value === null ? "время не передано" : formatLap(point.value));
     }
-    var key = [state.comparisonSelection, own && own.atUs, benchmark && benchmark.atUs, ownValue, benchmarkValue].join("|");
+    function pointDetail(point) {
+      return point ? lapMomentLabel(point) + " · " + rawLapStatus(point) : "до курсора";
+    }
+    var ownValue = pointValue(own);
+    var competitorLabel = competitor ?
+      (competitor.isOurs ? "BALCHUG Racing" : (competitor.startNumber ? "#" + competitor.startNumber + " · " : "") + (competitor.teamName || "Соперник")) :
+      (state.comparisonSelection === "all" ? "Соперники" : "Выбранный соперник");
+    var competitorValue = pointValue(competitor);
+    var key = [state.comparisonSelection, rawPointKey(selected), rawPointKey(own), rawPointKey(competitor), ownValue, competitorValue].join("|");
     if (key === state.lapReadoutKey) return;
     state.lapReadoutKey = key;
     elements.lapReadout.style.gridTemplateColumns = state.comparisonSelection === "ours" ? "1fr" : "";
     elements.lapReadout.replaceChildren();
-    elements.lapReadout.appendChild(lapReadoutItem("BALCHUG Racing", ownValue, ownDetail, "ours"));
+    if (selected) {
+      var selectedLabel = selected.isOurs ? "Выбрано · BALCHUG Racing" : "Выбрано · " + competitorLabel;
+      var selectedItem = lapReadoutItem(selectedLabel, pointValue(selected), pointDetail(selected), selected.isOurs ? "ours" : "competitor");
+      selectedItem.classList.add("selected");
+      elements.lapReadout.appendChild(selectedItem);
+    }
+    elements.lapReadout.appendChild(lapReadoutItem("BALCHUG Racing", ownValue, pointDetail(own), "ours"));
     if (state.comparisonSelection !== "ours") {
-      elements.lapReadout.appendChild(lapReadoutItem(benchmarkLabel, benchmarkValue, benchmarkDetail, aggregate ? "aggregate" : "competitor"));
+      elements.lapReadout.appendChild(lapReadoutItem(competitorLabel, competitorValue, pointDetail(competitor), "competitor"));
     }
     elements.lapReadout.hidden = false;
   }
@@ -1621,7 +1723,7 @@
       state.lapLastPlayheadX = null;
     }
     var geometry = state.lapGeometry;
-    renderTimelineAxis(elements.lapAxis, geometry);
+    renderTimelineAxis(elements.lapAxis, geometry, data.lap_series && (data.lap_series.ours_raw || data.lap_series.ours));
     renderLapReadout(data, geometry);
     var total = Math.max(1, geometry.range.last_at_us - geometry.range.first_at_us);
     var playhead = geometry.left + (state.atUs - geometry.range.first_at_us) / total * Math.max(1, surface.width - geometry.left - geometry.right);
@@ -1642,13 +1744,12 @@
   }
 
   function drawComparisonVisuals() {
-    // Keep the primary chart at native animation speed.  These two canvases
-    // only need a readable playhead, so 20 fps avoids expensive redraws at 64x.
+    // The lap chart is the primary canvas. The pit timeline only needs a
+    // readable playhead, so avoid redrawing it at every animation frame.
     var now = performance.now();
     if (state.playing && now - state.visualsLastDrawMs < 50) return;
     state.visualsLastDrawMs = now;
     drawPitTimeline();
-    drawLapChart();
   }
 
   function drawStaticChart(context, width, height) {
@@ -1803,6 +1904,163 @@
     });
   }
 
+  function rawChartDomain(points) {
+    var timed = points.filter(function (point) { return point.value !== null; });
+    var reference = timed.filter(function (point) { return point.isClean; });
+    var values = (reference.length ? reference : timed).map(function (point) { return point.value; });
+    if (!values.length) return null;
+    var min = Math.min.apply(Math, values);
+    var max = Math.max.apply(Math, values);
+    if (min === max) {
+      var singlePadding = Math.max(1000, min * 0.03);
+      return { min: Math.max(0, min - singlePadding), max: max + singlePadding };
+    }
+    var padding = Math.max(1000, (max - min) * 0.18);
+    return { min: Math.max(0, min - padding), max: max + padding };
+  }
+
+  function rawPointY(geometry, point) {
+    if (!geometry || !point) return null;
+    if (point.value === null) return geometry.untimedY;
+    if (point.value < geometry.domain.min) return geometry.top;
+    if (point.value > geometry.domain.max) return geometry.bottom;
+    return geometry.yAt(point.value);
+  }
+
+  function drawRawPoint(context, point, geometry, color) {
+    var x = geometry.xAt(point.atUs);
+    var y = rawPointY(geometry, point);
+    if (y === null) return;
+    context.save();
+    context.strokeStyle = color;
+    context.fillStyle = color;
+    context.lineWidth = 1.8;
+    if (point.value === null) {
+      context.beginPath();
+      context.moveTo(x - 3, y - 3); context.lineTo(x + 3, y + 3);
+      context.moveTo(x + 3, y - 3); context.lineTo(x - 3, y + 3);
+      context.stroke();
+      context.restore();
+      return;
+    }
+    var overflow = point.value < geometry.domain.min ? "fast" : (point.value > geometry.domain.max ? "slow" : null);
+    if (overflow) {
+      context.beginPath();
+      if (overflow === "slow") {
+        context.moveTo(x, y + 1); context.lineTo(x - 4, y - 6); context.lineTo(x + 4, y - 6);
+      } else {
+        context.moveTo(x, y - 1); context.lineTo(x - 4, y + 6); context.lineTo(x + 4, y + 6);
+      }
+      context.closePath();
+      context.fill();
+      var text = formatLap(point.value);
+      context.font = "9px Arial";
+      var textWidth = context.measureText(text).width;
+      var labelX = Math.max(geometry.left, Math.min(geometry.width - geometry.right - textWidth, x + 5));
+      var labelY = overflow === "slow" ? y - 8 : y + 12;
+      context.fillText(text, labelX, labelY);
+      context.restore();
+      return;
+    }
+    if (point.isClean) {
+      context.beginPath(); context.arc(x, y, 2.7, 0, Math.PI * 2); context.fill();
+    } else {
+      context.fillStyle = "#fff";
+      context.fillRect(x - 3, y - 3, 6, 6);
+      context.strokeRect(x - 3, y - 3, 6, 6);
+    }
+    context.restore();
+  }
+
+  function drawRawLapChartBase(context, data, width, height) {
+    var range = state.manifest.range;
+    var left = 42;
+    var right = 10;
+    var top = 16;
+    var bottom = height - 26;
+    var untimedY = height - 8;
+    var usableWidth = Math.max(1, width - left - right);
+    var total = Math.max(1, range.last_at_us - range.first_at_us);
+    var xAt = function (atUs) { return left + (atUs - range.first_at_us) / total * usableWidth; };
+    var oursParticipant = comparisonParticipants().find(function (participant) { return participant.is_ours; }) || {
+      participant_id: comparisonOursId(), team_name: "BALCHUG Racing", is_ours: true
+    };
+    var own = rawLapPoints(asObject(data.lap_series).ours_raw || asObject(data.lap_series).ours, oursParticipant).filter(function (point) {
+      return point.atUs >= range.first_at_us && point.atUs <= range.last_at_us;
+    });
+    var competitors = state.comparisonSelection === "ours" ? [] : rawCompetitorSeries(data);
+    competitors.forEach(function (series) {
+      series.points = series.points.filter(function (point) {
+        return point.atUs >= range.first_at_us && point.atUs <= range.last_at_us;
+      });
+    });
+    var allPoints = own.concat(competitors.reduce(function (items, series) { return items.concat(series.points); }, []));
+    var domain = rawChartDomain(allPoints);
+    drawTimelineFlags(context, xAt, width, height, range, left, right);
+    context.strokeStyle = "#E4E9F0";
+    context.lineWidth = 1;
+    [0.25, 0.5, 0.75].forEach(function (ratio) {
+      var y = Math.round(top + (bottom - top) * ratio) + 0.5;
+      context.beginPath(); context.moveTo(left, y); context.lineTo(width - right, y); context.stroke();
+    });
+    if (!domain) {
+      context.fillStyle = "#6E7E98";
+      context.font = "11px Arial";
+      context.fillText("В сохранённой части нет кругов с переданным временем", left, Math.round(height / 2));
+      return {
+        left: left, right: right, range: range, width: width, height: height, top: top, bottom: bottom,
+        untimedY: untimedY, xAt: xAt, yAt: null, pointY: function () { return untimedY; }, domain: null,
+        own: own, competitors: competitors, allPoints: allPoints
+      };
+    }
+    var yAt = function (value) { return top + (value - domain.min) / (domain.max - domain.min) * (bottom - top); };
+    context.fillStyle = "#6E7E98";
+    context.font = "10px Arial";
+    context.fillText("Время", 2, top + 10);
+    context.fillText(formatLap(domain.min), width - right - 48, top + 10);
+    context.fillText(formatLap(domain.max), width - right - 48, bottom);
+    context.font = "8.5px Arial";
+    context.fillText("x", 4, untimedY + 3);
+    context.fillStyle = "#6E7E98";
+    competitors.forEach(function (series) {
+      series.points.forEach(function (point) { drawRawPoint(context, point, {
+        left: left, right: right, width: width, top: top, bottom: bottom, untimedY: untimedY, xAt: xAt, yAt: yAt, domain: domain
+      }, series.color); });
+    });
+    own.forEach(function (point) { drawRawPoint(context, point, {
+      left: left, right: right, width: width, top: top, bottom: bottom, untimedY: untimedY, xAt: xAt, yAt: yAt, domain: domain
+    }, "#F0143D"); });
+    return {
+      left: left, right: right, range: range, width: width, height: height, top: top, bottom: bottom,
+      untimedY: untimedY, xAt: xAt, yAt: yAt, domain: domain, own: own, competitors: competitors, allPoints: allPoints,
+      pointY: function (point) { return rawPointY(this, point); }
+    };
+  }
+
+  function drawSelectedRawPoint(context, point, geometry) {
+    if (!point || !geometry || !geometry.domain) return;
+    var x = geometry.xAt(point.atUs);
+    var y = rawPointY(geometry, point);
+    if (y === null) return;
+    var color = point.isOurs ? "#F0143D" : competitorColor(point.participantId);
+    context.save();
+    context.strokeStyle = color;
+    context.fillStyle = "#fff";
+    context.lineWidth = 2.2;
+    context.beginPath(); context.arc(x, y, 5, 0, Math.PI * 2); context.fill(); context.stroke();
+    var prefix = (point.startNumber ? "#" + point.startNumber + " " : "") + "круг #" + valueOrDash(point.lapNumber) + " ";
+    var label = prefix + (point.value === null ? "без времени" : formatLap(point.value));
+    context.font = "10px Arial";
+    var labelWidth = Math.ceil(context.measureText(label).width) + 8;
+    var labelX = Math.max(geometry.left, Math.min(geometry.width - geometry.right - labelWidth, x + 8));
+    var labelY = Math.max(13, Math.min(geometry.height - 7, y - 8));
+    context.fillStyle = "rgba(5,8,13,.88)";
+    context.fillRect(labelX - 3, labelY - 10, labelWidth, 14);
+    context.fillStyle = "#fff";
+    context.fillText(label, labelX + 1, labelY);
+    context.restore();
+  }
+
   function drawChart() {
     if (!state.manifest) return;
     var canvas = elements.chart;
@@ -1815,6 +2073,8 @@
       canvas.height = height * ratio;
     }
     var range = state.manifest.range;
+    var comparisonData = comparisonVisualData();
+    var rawData = comparisonData || { lap_series: { ours: [], competitors: [] } };
     var baseKey = [
       state.manifest.heat && state.manifest.heat.source_heat_id,
       range.first_at_us,
@@ -1835,25 +2095,29 @@
       var baseContext = base.getContext("2d");
       baseContext.setTransform(ratio, 0, 0, ratio, 0, 0);
       baseContext.clearRect(0, 0, width, height);
-      drawStaticChart(baseContext, width, height);
+      state.chartGeometry = drawRawLapChartBase(baseContext, rawData, width, height);
       state.chartBase = base;
       state.chartBaseKey = baseKey;
     }
-    renderTimelineAxis(elements.chartAxis, { left: 42, right: 10, range: range, width: width });
+    var geometry = state.chartGeometry;
+    renderTimelineAxis(elements.chartAxis, geometry || { left: 42, right: 10, range: range, width: width },
+      comparisonData && comparisonData.lap_series && (comparisonData.lap_series.ours_raw || comparisonData.lap_series.ours));
     var context = canvas.getContext("2d");
     context.setTransform(ratio, 0, 0, ratio, 0, 0);
     context.clearRect(0, 0, width, height);
     context.drawImage(state.chartBase, 0, 0, width, height);
-    var padding = { left: 42, right: 10 };
-    var usableWidth = Math.max(1, width - padding.left - padding.right);
-    var total = Math.max(1, range.last_at_us - range.first_at_us);
-    var xAt = function (atUs) { return padding.left + (atUs - range.first_at_us) / total * usableWidth; };
-    var playheadX = xAt(state.atUs);
+    var playheadX = geometry ? geometry.xAt(state.atUs) : 42;
     context.strokeStyle = "#122846";
     context.lineWidth = 1.5;
     context.setLineDash([4, 3]);
     context.beginPath(); context.moveTo(playheadX, 0); context.lineTo(playheadX, height); context.stroke();
     context.setLineDash([]);
+    if (comparisonData && geometry) {
+      renderLapReadout(comparisonData, geometry);
+      drawSelectedRawPoint(context, rawPointFromGeometry(geometry, state.selectedLapPoint), geometry);
+    } else {
+      elements.lapReadout.hidden = true;
+    }
     var chartRangeText = formatElapsed((state.atUs - range.first_at_us) / 1000000) + " / " + formatElapsed((range.last_at_us - range.first_at_us) / 1000000);
     if (chartRangeText !== state.chartRangeText) {
       state.chartRangeText = chartRangeText;
@@ -2092,8 +2356,28 @@
   elements.chart.addEventListener("click", function (event) {
     if (!state.manifest) return;
     var rect = elements.chart.getBoundingClientRect();
-    var ratio = Math.max(0, Math.min(1, (event.clientX - rect.left - 42) / Math.max(1, rect.width - 52)));
-    stopPlayback(); setAt(state.manifest.range.first_at_us + ratio * (state.manifest.range.last_at_us - state.manifest.range.first_at_us), true);
+    var geometry = state.chartGeometry;
+    var x = event.clientX - rect.left;
+    var y = event.clientY - rect.top;
+    var nearest = null;
+    if (geometry && geometry.domain) {
+      (geometry.allPoints || []).forEach(function (point) {
+        var pointX = geometry.xAt(point.atUs);
+        var pointY = rawPointY(geometry, point);
+        if (pointY === null) return;
+        var distance = Math.hypot(pointX - x, pointY - y);
+        if (distance <= 18 && (!nearest || distance < nearest.distance)) nearest = { point: point, distance: distance };
+      });
+    }
+    stopPlayback();
+    if (nearest) {
+      state.selectedLapPoint = nearest.point;
+      setAt(nearest.point.atUs, true);
+      return;
+    }
+    state.selectedLapPoint = null;
+    var ratio = Math.max(0, Math.min(1, (x - 42) / Math.max(1, rect.width - 52)));
+    setAt(state.manifest.range.first_at_us + ratio * (state.manifest.range.last_at_us - state.manifest.range.first_at_us), true);
   });
   elements.lapChart.addEventListener("click", function (event) {
     if (!state.manifest || !state.lapGeometry) return;

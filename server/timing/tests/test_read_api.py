@@ -452,6 +452,11 @@ class TimingReadModelTests(unittest.TestCase):
         self.assertEqual(aggregate["lap_series"]["benchmark_kind"], "minute_median")
         self.assertEqual(aggregate["lap_series"]["benchmark"][0]["median_duration_ms"], 109_900.0)
         self.assertEqual(aggregate["lap_series"]["benchmark"][0]["participant_count"], 2)
+        self.assertEqual(
+            [lap["lap_number"] for lap in aggregate["lap_series"]["ours_raw"]],
+            [11, 12],
+        )
+        self.assertIn("without averaging or decimation", aggregate["semantics"]["lap_series_ours_raw"])
         raw_competitors = aggregate["lap_series"]["competitors"]
         self.assertEqual(
             [competitor["participant_id"] for competitor in raw_competitors],

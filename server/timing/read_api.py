@@ -2017,7 +2017,13 @@ def read_archive_comparison(
                 "participants": [],
                 "points": [],
                 "pit_stops": [],
-                "lap_series": {"ours": [], "benchmark": [], "benchmark_kind": None, "competitors": []},
+                "lap_series": {
+                    "ours": [],
+                    "ours_raw": [],
+                    "benchmark": [],
+                    "benchmark_kind": None,
+                    "competitors": [],
+                },
                 "semantics": {
                     "series": "step",
                     "lap_series_competitors": (
@@ -2103,8 +2109,18 @@ def read_archive_comparison(
             include_unplaced=True,
             clip_to_archive_range=False,
         )
+        raw_ours_laps = _archive_comparison_lap_rows(
+            connection,
+            heat_id=int(heat["id"]),
+            participant_ids=[ours_id],
+            first_at_us=first_at_us,
+            last_at_us=last_at_us,
+            include_unplaced=True,
+            clip_to_archive_range=False,
+        )
         lap_series = {
             "ours": _bounded_archive_lap_rows(raw_lap_rows.get(ours_id, [])),
+            "ours_raw": [dict(lap) for lap in raw_ours_laps.get(ours_id, ())],
             "benchmark": (
                 _bounded_archive_lap_rows(raw_lap_rows.get(str(participant_id), []))
                 if mode == "participant"
@@ -2167,6 +2183,10 @@ def read_archive_comparison(
                     if mode == "all"
                     else "unaggregated raw lap facts for the selected competitor, ordered by lap number; includes "
                     "non-clean laps and duration_ms=null rows without averaging or decimation"
+                ),
+                "lap_series_ours_raw": (
+                    "unaggregated raw lap facts for BALCHUG Racing; includes non-clean laps and duration_ms=null "
+                    "rows without averaging or decimation"
                 ),
                 "pit_stops": "confirmed pit in/out facts clipped only for timeline display; pit_lane_ms remains the measured full duration",
                 "missing_values": "null values are not interpolated or converted to zero",
