@@ -73,7 +73,7 @@ class MetricStoreTests(unittest.TestCase):
         self._insert_participant(
             heat_id,
             participant_id="leader",
-            number="9",
+            number="99",
             team="Competitor",
             car="Norma",
             class_name="CN PRO",
@@ -601,6 +601,59 @@ class MetricStoreTests(unittest.TestCase):
 
         ours = load_heat_metric_input(self.connection, self.source_heat_id).our_participant
         self.assertNotIn(cell_id, [lap.timing_event_id for lap in ours.laps if lap.timing_event_id is not None])
+
+    def test_no_laps_r_c_requires_a_last_snapshot_for_the_same_participant(self):
+        self._seed_no_laps_last_history()
+        layout_id = self.connection.execute(
+            "SELECT id FROM result_layout_versions WHERE layout_fingerprint = 'raw-no-laps'"
+        ).fetchone()[0]
+        self._insert_participant(
+            self.source_heat_id,
+            participant_id="other",
+            number="9",
+            team="Competitor",
+            car="Norma",
+            class_name="CN PRO",
+            ours=False,
+            position_class=1,
+            position_overall=1,
+            laps=None,
+            state_kind="ON_TRACK",
+        )
+        _, snapshot_message_id = self._insert_raw_result_message(
+            sequence=1,
+            observed_at_us=6_500_000,
+            handle="r_i",
+            connection_id="other-connection",
+        )
+        self.connection.execute(
+            """INSERT INTO participant_result_cell_observations(
+              source_heat_id,participant_id,layout_version_id,provider_row_index,column_index,
+              raw_value_json,value_text,source_message_id,source_key,source_change_ordinal,
+              observed_at_us,created_at_us
+            ) VALUES (?,'other',?,0,0,'["107000000"]','107000000',?,'raw:other-snapshot',0,6500000,6500000)""",
+            (self.source_heat_id, layout_id, snapshot_message_id),
+        )
+        _, message_id = self._insert_raw_result_message(
+            sequence=2,
+            observed_at_us=7_000_000,
+            handle="r_c",
+            connection_id="other-connection",
+        )
+        self.connection.execute(
+            """
+            INSERT INTO participant_result_cell_observations(
+              source_heat_id,participant_id,layout_version_id,provider_row_index,column_index,
+              raw_value_json,value_text,source_message_id,source_key,source_change_ordinal,
+              observed_at_us,created_at_us
+            ) VALUES (?,'ours',?,0,0,'["106900000"]','106900000',?,'raw:other-connection',0,7000000,7000000)
+            """,
+            (self.source_heat_id, layout_id, message_id),
+        )
+        self.connection.commit()
+
+        ours = load_heat_metric_input(self.connection, self.source_heat_id).our_participant
+        self.assertNotIn(106_900, [lap.duration_ms for lap in ours.laps if lap.timing_event_id is not None])
 
     def test_rejects_missing_heat(self):
         with self.assertRaisesRegex(MetricStoreError, "does not exist"):

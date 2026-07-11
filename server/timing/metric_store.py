@@ -464,15 +464,15 @@ def _load_result_last_facts(
         SELECT observation.id AS timing_event_id,observation.participant_id,observation.value_text,
                observation.source_message_id,observation.source_key,observation.source_change_ordinal,
                observation.observed_at_us,frame.id AS frame_id,message.ordinal AS message_ordinal
-        FROM participant_result_cell_observations AS observation
-        JOIN result_column_definitions AS definition
-          ON definition.layout_version_id = observation.layout_version_id
-         AND definition.column_index = observation.column_index
+        FROM result_column_definitions AS definition
+        CROSS JOIN participant_result_cell_observations AS observation
         JOIN feed_messages AS message ON message.id = observation.source_message_id
         JOIN feed_frames AS frame ON frame.id = message.frame_id
-        WHERE observation.source_heat_id = ?
+        WHERE definition.canonical_key = 'last_lap'
+          AND observation.source_heat_id = ?
           AND observation.participant_id IS NOT NULL
-          AND definition.canonical_key = 'last_lap'
+          AND observation.layout_version_id = definition.layout_version_id
+          AND observation.column_index = definition.column_index
           AND message.handle = 'r_c'
           AND NOT EXISTS (
             SELECT 1
@@ -492,8 +492,13 @@ def _load_result_last_facts(
             FROM participant_result_cell_observations AS snapshot_cell
             JOIN feed_messages AS snapshot_message ON snapshot_message.id = snapshot_cell.source_message_id
             JOIN feed_frames AS snapshot_frame ON snapshot_frame.id = snapshot_message.frame_id
+            JOIN result_column_definitions AS snapshot_definition
+              ON snapshot_definition.layout_version_id = snapshot_cell.layout_version_id
+             AND snapshot_definition.column_index = snapshot_cell.column_index
             WHERE snapshot_cell.source_heat_id = observation.source_heat_id
+              AND snapshot_cell.participant_id = observation.participant_id
               AND snapshot_cell.layout_version_id = observation.layout_version_id
+              AND snapshot_definition.canonical_key = 'last_lap'
               AND snapshot_message.handle = 'r_i'
               -- A reconnect needs its own authoritative grid snapshot. An
               -- r_i from a previous socket cannot make an early r_c from the
@@ -534,15 +539,15 @@ def _load_result_state_facts(
         """
         SELECT observation.id,observation.participant_id,observation.value_text,
                observation.source_change_ordinal,frame.id AS frame_id,message.ordinal AS message_ordinal
-        FROM participant_result_cell_observations AS observation
-        JOIN result_column_definitions AS definition
-          ON definition.layout_version_id = observation.layout_version_id
-         AND definition.column_index = observation.column_index
+        FROM result_column_definitions AS definition
+        CROSS JOIN participant_result_cell_observations AS observation
         JOIN feed_messages AS message ON message.id = observation.source_message_id
         JOIN feed_frames AS frame ON frame.id = message.frame_id
-        WHERE observation.source_heat_id = ?
+        WHERE definition.canonical_key = 'state'
+          AND observation.source_heat_id = ?
           AND observation.participant_id IS NOT NULL
-          AND definition.canonical_key = 'state'
+          AND observation.layout_version_id = definition.layout_version_id
+          AND observation.column_index = definition.column_index
           AND NOT EXISTS (
             SELECT 1
             FROM result_column_definitions AS duplicate_state

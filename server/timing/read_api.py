@@ -2117,7 +2117,15 @@ def _archive_raw_last_or_lap_rows(
     last_at_us: int,
     clip_to_archive_range: bool,
 ) -> dict[str, list[dict[str, Any]]]:
-    """Prefer source LAST observations; retain legacy lap facts as a fallback."""
+    """Use source LAST timing when present, otherwise retain legacy laps.
+
+    An ``r_i`` reconnect snapshot is an audit baseline, not evidence that the
+    source stream contains timing events for this participant. It therefore
+    cannot hide already-confirmed legacy laps from a pre-provenance archive.
+    Once a valid ``r_c`` LAST or a source-linked confirmed lap exists, that
+    source stream remains authoritative and legacy duration projections stay
+    out to avoid duplicating the same physical lap.
+    """
 
     source_rows = _archive_result_last_rows(
         connection,
@@ -2136,10 +2144,26 @@ def _archive_raw_last_or_lap_rows(
         include_unplaced=True,
         clip_to_archive_range=clip_to_archive_range,
     )
-    return {
-        participant_id: source_rows.get(participant_id, fallback.get(participant_id, ()))
-        for participant_id in participant_ids
-    }
+    result: dict[str, list[dict[str, Any]]] = {}
+    for participant_id in participant_ids:
+        source = source_rows.get(participant_id, ())
+        has_timed_source = any(
+            row.get("timeline_kind") == "confirmed_lap"
+            or (
+                row.get("timeline_kind") == "table_observation"
+                and row.get("duration_ms") is not None
+            )
+            for row in source
+        )
+        if has_timed_source:
+            result[participant_id] = list(source)
+        elif source:
+            # Retain the visible reconnect baseline for audit, then preserve
+            # old confirmed lap facts that have no source LAST timing stream.
+            result[participant_id] = [*source, *fallback.get(participant_id, ())]
+        else:
+            result[participant_id] = list(fallback.get(participant_id, ()))
+    return result
 
 
 def _archive_raw_lap_competitors(

@@ -15,6 +15,7 @@ from timing.read_api import (
     ScopeNotFoundError,
     TimingReadModel,
     _archive_result_last_rows,
+    _archive_raw_last_or_lap_rows,
     _bounded_archive_lap_rows,
 )
 
@@ -805,6 +806,21 @@ class TimingReadModelTests(unittest.TestCase):
             ),
             {},
         )
+
+    def test_archive_baseline_last_does_not_hide_confirmed_legacy_laps(self):
+        self._add_result_last_cells((("r_i", "108000000", 10_500_000),))
+        self.connection.commit()
+
+        rows = _archive_raw_last_or_lap_rows(
+            self.connection,
+            heat_id=self.heat_id,
+            participant_ids=["ours"],
+            first_at_us=10_000_000,
+            last_at_us=13_000_000,
+            clip_to_archive_range=True,
+        )["ours"]
+        self.assertEqual(rows[0]["timeline_kind"], "snapshot_baseline")
+        self.assertEqual([row["lap_number"] for row in rows[1:]], [11, 12])
 
     def test_bounded_archive_laps_keep_breaks_when_non_clean_rows_are_decimated(self):
         laps = [
