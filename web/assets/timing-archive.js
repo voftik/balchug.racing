@@ -318,7 +318,7 @@
     element.dataset.axisKey = key;
     element.hidden = false;
     element.dataset.axisLabel = axis.sourceAvailable ? "Время табло" : "Время записи";
-    element.dataset.lapLabel = lapTicks.length ? "Круги BALCHUG" : "";
+    element.dataset.lapLabel = lapTicks.length ? "Пройдено кругов" : "";
     element.classList.toggle("has-lap-axis", lapTicks.length > 0);
     element.title = axis.sourceAvailable ?
       "Верхняя шкала: время Time Service из потока табло. Нижняя: каждый круг BALCHUG Racing, подпись через пять кругов." :
@@ -1952,12 +1952,6 @@
       }
       context.closePath();
       context.fill();
-      var text = formatLap(point.value);
-      context.font = "9px Arial";
-      var textWidth = context.measureText(text).width;
-      var labelX = Math.max(geometry.left, Math.min(geometry.width - geometry.right - textWidth, x + 5));
-      var labelY = overflow === "slow" ? y - 8 : y + 12;
-      context.fillText(text, labelX, labelY);
       context.restore();
       return;
     }
