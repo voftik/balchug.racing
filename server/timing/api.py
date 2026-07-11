@@ -13,7 +13,7 @@ import os
 from contextlib import asynccontextmanager
 from typing import Annotated, Any, Literal
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, model_validator
 
@@ -438,6 +438,30 @@ def metric_history(
             _read_model().metric_history(
                 session_id,
                 scope=MetricScopeRequest(scope_kind, scope_key),
+                from_at_us=from_at_us,
+                to_at_us=to_at_us,
+                max_points=max_points,
+            )
+        )
+    except TimingReadError as error:
+        _raise_read_error(error)
+
+
+@app.get("/sessions/{session_id}/dashboard/history", response_model=TimingReadResponse)
+def dashboard_history(
+    session_id: str,
+    participant_id: Annotated[list[str] | None, Query()] = None,
+    from_at_us: int | None = None,
+    to_at_us: int | None = None,
+    max_points: int = MAX_CHART_POINTS,
+) -> JSONResponse:
+    """Return one coherent live chart payload for BALCHUG and selected cars."""
+
+    try:
+        return _live_payload(
+            _read_model().dashboard_history(
+                session_id,
+                participant_ids=participant_id or (),
                 from_at_us=from_at_us,
                 to_at_us=to_at_us,
                 max_points=max_points,

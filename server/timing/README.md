@@ -152,6 +152,7 @@ GET /api/timing/sessions/{id}/state
 GET /api/timing/sessions/{id}/ingest-health
 GET /api/timing/sessions/{id}/metrics
 GET /api/timing/sessions/{id}/metrics/history?scope_kind=participant&scope_key={participant_id}
+GET /api/timing/sessions/{id}/dashboard/history?participant_id={ours}&participant_id={competitor}
 GET /api/timing/sessions/{id}/laps?participant_id={participant_id}&limit=200
 GET /api/timing/sessions/{id}/pit-stops?participant_id={participant_id}&limit=200
 GET /api/timing/sessions/{id}/stream
@@ -164,7 +165,12 @@ completed laps in that reconstructed stint). The API computes freshness when
 it reads: `LIVE` through 3 seconds, `STALE` through 10 seconds, then
 `OFFLINE`; an open source gap, Finish flag, or stopped/aborted analysis session
 is immediately offline. Historical charts are constrained to 24 hours and at
-most 720 points; lap and pit detail requests are bounded to 500 rows.
+most 720 points; lap and pit detail requests are bounded to 500 rows. The
+combined dashboard history accepts BALCHUG plus at most three selected
+participants. Its lap series contains every ledger-confirmed sparse `LAST`
+change without averaging; source clock anchors, flags, pit intervals and ingest
+gaps share the same capture-time range. A provider lap number remains null when
+the exact `LAST` cell has no proven lap link.
 
 `/stream` is server-sent events. Its first response is a `snapshot`; reconnect
 with the browser's `Last-Event-ID` to receive only unseen durable `state`,

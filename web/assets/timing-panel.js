@@ -135,6 +135,10 @@
     view: null,
     stream: null,
     refreshTimer: null,
+    historyTimer: null,
+    historyRequestSerial: 0,
+    historyRequestKey: null,
+    history: null,
     clockTimer: null,
     lastSnapshotAt: 0,
     busy: false,
@@ -147,6 +151,8 @@
     viewReady: {},
     charts: {},
     chartObservers: {},
+    chartPayloads: {},
+    chartSignatures: {},
     demoTick: 0,
     eventFilter: "all"
   };
@@ -296,7 +302,7 @@
       behind: behind,
       alerts: alerts,
       events: events,
-      history: null
+      history: state.history
     };
   }
 
@@ -615,16 +621,260 @@
     }).join("");
   }
 
+  function sourceClockAt(history, captureAtUs) {
+    var source = history && history.time_axes && history.time_axes.source;
+    var anchors = source && Array.isArray(source.anchors) ? source.anchors : [];
+    var maximumGap = source && isNumber(source.interpolation_max_gap_us)
+      ? source.interpolation_max_gap_us : 90000000;
+    var closest = null;
+    anchors.forEach(function (anchor) {
+      if (!isNumber(anchor.capture_at_us) || !isNumber(anchor.calibrated_utc_at_us)) return;
+      var distance = Math.abs(anchor.capture_at_us - captureAtUs);
+      if (distance <= maximumGap && (!closest || distance < closest.distance)) {
+        closest = { anchor: anchor, distance: distance };
+      }
+    });
+    return closest
+      ? closest.anchor.calibrated_utc_at_us + (captureAtUs - closest.anchor.capture_at_us)
+      : captureAtUs;
+  }
+
+  function chartClockLabel(history, captureSeconds) {
+    if (!isNumber(captureSeconds)) return "";
+    return formatClockAt(sourceClockAt(history, Math.round(captureSeconds * 1000000)));
+  }
+
+  function intervalOverlaps(startAtUs, endAtUs, leftAtUs, rightAtUs) {
+    var effectiveEnd = isNumber(endAtUs) ? endAtUs : rightAtUs;
+    return startAtUs < rightAtUs && effectiveEnd > leftAtUs;
+  }
+
+  function lapLineBreaks(history, participantId, previous, current) {
+    if (!previous || !current) return false;
+    if (isNumber(previous.lap_number) && isNumber(current.lap_number) && current.lap_number - previous.lap_number > 1) return true;
+    var leftAtUs = previous.capture_at_us;
+    var rightAtUs = current.capture_at_us;
+    var gaps = Array.isArray(history.ingest_gaps) ? history.ingest_gaps : [];
+    if (gaps.some(function (gap) {
+      return intervalOverlaps(gap.started_at_us, gap.ended_at_us, leftAtUs, rightAtUs);
+    })) return true;
+    var pits = Array.isArray(history.pit_stops) ? history.pit_stops : [];
+    return pits.some(function (pit) {
+      return pit.participant_id === participantId && intervalOverlaps(pit.entered_at_us, pit.exited_at_us, leftAtUs, rightAtUs);
+    });
+  }
+
+  function livePaceSeries(history, participant) {
+    var payload = history.lap_series && history.lap_series[participant.id];
+    var points = payload && Array.isArray(payload.points) ? payload.points : [];
+    var x = [];
+    var y = [];
+    var meta = [];
+    var previous = null;
+    points.forEach(function (point) {
+      if (!isNumber(point.capture_at_us) || !isNumber(point.duration_ms)) return;
+      if (lapLineBreaks(history, participant.id, previous, point)) {
+        x.push((previous.capture_at_us + point.capture_at_us) / 2000000);
+        y.push(null);
+        meta.push(null);
+      }
+      x.push(point.capture_at_us / 1000000);
+      y.push(point.duration_ms);
+      meta.push(point);
+      previous = point;
+    });
+    return { participant: participant, x: x, y: y, meta: meta };
+  }
+
+  function liveIntervalSeries(history, participants) {
+    var points = history.interval_series && Array.isArray(history.interval_series.points)
+      ? history.interval_series.points : [];
+    var byParticipant = {};
+    participants.forEach(function (participant) {
+      byParticipant[participant.id] = { participant: participant, x: [], y: [], meta: [] };
+    });
+    points.forEach(function (point) {
+      if (point.participant_id && isNumber(point.signed_ms)) {
+        var exactSeries = byParticipant[point.participant_id];
+        if (!exactSeries) return;
+        exactSeries.x.push(point.observed_at_us / 1000000);
+        exactSeries.y.push(point.signed_ms);
+        exactSeries.meta.push({
+          capture_at_us: point.observed_at_us,
+          lap_number: point.ours_laps,
+          capture_lap_index: point.ours_laps,
+          flag: point.flag,
+          interval_relation: point.relation
+        });
+        return;
+      }
+      var targetId = null;
+      var value = null;
+      if (point.ahead_participant_id && isNumber(point.ahead_ms)) {
+        targetId = point.ahead_participant_id;
+        value = point.ahead_ms;
+      }
+      if (point.behind_participant_id && isNumber(point.behind_ms)) {
+        var behindSeries = byParticipant[point.behind_participant_id];
+        if (behindSeries) {
+          behindSeries.x.push(point.observed_at_us / 1000000);
+          behindSeries.y.push(-point.behind_ms);
+          behindSeries.meta.push({
+            capture_at_us: point.observed_at_us,
+            lap_number: point.ours_laps,
+            capture_lap_index: point.ours_laps,
+            flag: point.flag,
+            interval_relation: "behind"
+          });
+        }
+      }
+      var targetSeries = byParticipant[targetId];
+      if (targetSeries) {
+        targetSeries.x.push(point.observed_at_us / 1000000);
+        targetSeries.y.push(value);
+        targetSeries.meta.push({
+          capture_at_us: point.observed_at_us,
+          lap_number: point.ours_laps,
+          capture_lap_index: point.ours_laps,
+          flag: point.flag,
+          interval_relation: "ahead"
+        });
+      }
+    });
+    var competitorSeries = participants.filter(function (participant) { return !participant.isOurs; }).map(function (participant) {
+      return byParticipant[participant.id];
+    });
+    var referenceX = [];
+    competitorSeries.forEach(function (series) {
+      series.x.forEach(function (value) { if (referenceX.indexOf(value) === -1) referenceX.push(value); });
+    });
+    referenceX.sort(function (left, right) { return left - right; });
+    var ours = participants.find(function (participant) { return participant.isOurs; });
+    var oursSeries = {
+      participant: ours,
+      x: referenceX,
+      y: referenceX.map(function () { return 0; }),
+      meta: referenceX.map(function (value) { return { capture_at_us: value * 1000000, interval_relation: "reference" }; })
+    };
+    return [oursSeries].concat(competitorSeries);
+  }
+
   function chartData(kind) {
     var view = state.view;
     if (!view || !view.history || !view.ours) return null;
-    var selected = [view.ours].concat(selectedParticipants());
-    var source = kind === "pace" ? view.history.pace : view.history.intervals;
+    var participants = [view.ours].concat(selectedParticipants());
+    var history = view.history;
+    var liveHistory = history.lap_series && history.range;
+    var series;
+    var timeBased = Boolean(liveHistory);
+    if (liveHistory) {
+      series = kind === "pace"
+        ? participants.map(function (participant) { return livePaceSeries(history, participant); })
+        : liveIntervalSeries(history, participants);
+    } else {
+      var source = kind === "pace" ? history.pace : history.intervals;
+      series = participants.map(function (participant) {
+        var values = source[participant.id] || history.laps.map(function () { return null; });
+        return {
+          participant: participant,
+          x: history.laps.slice(),
+          y: values,
+          meta: history.laps.map(function (lap) { return { lap_number: lap, capture_lap_index: lap }; })
+        };
+      });
+    }
+    var hasValues = series.some(function (item) { return item.y.some(isNumber); });
+    if (!hasValues) return null;
+    var oursPoints = liveHistory && history.lap_series[view.ours.id]
+      ? history.lap_series[view.ours.id].points : [];
     return {
-      participants: selected,
-      values: [view.history.laps].concat(selected.map(function (participant) {
-        return source[participant.id] || view.history.laps.map(function () { return null; });
-      }))
+      kind: kind,
+      history: history,
+      participants: participants,
+      series: series,
+      timeBased: timeBased,
+      oursPoints: oursPoints,
+      signature: kind + ":" + (timeBased ? "time:" : "lap:") + participants.map(function (participant) { return participant.id; }).join(","),
+      values: [null].concat(series.map(function (item) { return [item.x, item.y]; }))
+    };
+  }
+
+  function nearestIndex(values, target) {
+    if (!values.length) return -1;
+    var low = 0;
+    var high = values.length - 1;
+    while (low < high) {
+      var middle = Math.floor((low + high) / 2);
+      if (values[middle] < target) low = middle + 1; else high = middle;
+    }
+    if (low > 0 && Math.abs(values[low - 1] - target) <= Math.abs(values[low] - target)) return low - 1;
+    return low;
+  }
+
+  function lapAxisSplits(name, minimum, maximum) {
+    var payload = state.chartPayloads[name];
+    if (!payload || !payload.timeBased) return [];
+    return payload.oursPoints.filter(function (point) {
+      var seconds = point.capture_at_us / 1000000;
+      return isNumber(point.lap_number) && seconds >= minimum && seconds <= maximum;
+    }).map(function (point) { return point.capture_at_us / 1000000; });
+  }
+
+  function lapAxisValues(name, values) {
+    var payload = state.chartPayloads[name];
+    if (!payload) return values.map(function () { return ""; });
+    return values.map(function (value) {
+      var point = payload.oursPoints.find(function (candidate) {
+        return Math.abs(candidate.capture_at_us / 1000000 - value) < 0.0001;
+      });
+      var lap = point && point.lap_number;
+      return isNumber(lap) && lap % 5 === 0 ? String(lap) : "";
+    });
+  }
+
+  function chartTimelinePlugin(name) {
+    return {
+      hooks: {
+        drawClear: [function (plot) {
+          var payload = state.chartPayloads[name];
+          if (!payload || !payload.timeBased) return;
+          var history = payload.history;
+          var ratio = window.uPlot.pxRatio || window.devicePixelRatio || 1;
+          var context = plot.ctx;
+          var top = plot.bbox.top;
+          var height = plot.bbox.height;
+          function xPosition(atUs) { return plot.valToPos(atUs / 1000000, "x", true); }
+          context.save();
+          (history.flags || []).forEach(function (flag) {
+            var start = xPosition(flag.started_at_us);
+            var end = xPosition(flag.ended_at_us || history.range.last_at_us);
+            var color = flag.flag === "GREEN" ? "rgba(31, 157, 85, 0.08)" :
+              (flag.flag === "YELLOW" || flag.flag === "FULL_COURSE_YELLOW" || flag.flag === "SAFETY_CAR") ? "rgba(244, 188, 41, 0.13)" :
+                flag.flag === "RED" ? "rgba(240, 20, 61, 0.10)" : "rgba(110, 126, 152, 0.06)";
+            context.fillStyle = color;
+            context.fillRect(Math.min(start, end), top, Math.max(ratio, Math.abs(end - start)), height);
+          });
+          (history.ingest_gaps || []).forEach(function (gap) {
+            var start = xPosition(gap.started_at_us);
+            var end = xPosition(gap.ended_at_us || history.range.last_at_us);
+            context.fillStyle = "rgba(31, 47, 75, 0.16)";
+            context.fillRect(Math.min(start, end), top, Math.max(2 * ratio, Math.abs(end - start)), height);
+          });
+          (history.pit_stops || []).forEach(function (pit) {
+            if (!payload.participants.some(function (participant) { return participant.id === pit.participant_id; })) return;
+            var key = pit.participant_id === state.view.oursId ? "ours" : state.colors[pit.participant_id] || "blue";
+            context.strokeStyle = SERIES_COLORS[key];
+            context.lineWidth = pit.participant_id === state.view.oursId ? 2 * ratio : ratio;
+            context.setLineDash([4 * ratio, 4 * ratio]);
+            var x = xPosition(pit.entered_at_us);
+            context.beginPath();
+            context.moveTo(x, top);
+            context.lineTo(x, top + height);
+            context.stroke();
+          });
+          context.restore();
+        }]
+      }
     };
   }
 
@@ -638,40 +888,47 @@
       return;
     }
     if (empty) empty.hidden = true;
-    var needsRebuild = !state.charts[name] || state.charts[name].series.length !== payload.values.length;
+    var needsRebuild = !state.charts[name] || state.chartSignatures[name] !== payload.signature;
     if (needsRebuild) {
       destroyChart(name);
+      state.chartPayloads[name] = payload;
       all(".chart-point-tooltip", container).forEach(function (node) { node.remove(); });
       var pointTooltip = document.createElement("div");
       pointTooltip.className = "chart-point-tooltip";
       pointTooltip.hidden = true;
       container.appendChild(pointTooltip);
-      var series = [{ label: "Круг" }].concat(payload.participants.map(function (participant) {
+      var series = [{}].concat(payload.series.map(function (item) {
+        var participant = item.participant;
         var key = participant.isOurs ? "ours" : state.colors[participant.id] || "blue";
         return {
           label: participantLabel(participant),
           stroke: SERIES_COLORS[key],
           width: participant.isOurs ? 2.5 : 2,
           spanGaps: false,
+          facets: [{ scale: "x", auto: true, sorted: 1 }, { scale: "y", auto: true }],
           points: { show: true, size: participant.isOurs ? 6 : 5, width: 1.5 }
         };
       }));
       var options = {
+        mode: 2,
         width: Math.max(280, container.clientWidth), height: container.clientHeight,
         padding: [12, 8, 0, 2],
         cursor: { drag: { x: true, y: false }, sync: { key: "balchug-live-charts" } },
         legend: { show: false },
         scales: { x: { time: false }, y: { auto: true } },
         axes: [
-          { stroke: "#6E7E98", grid: { stroke: "#E4E9F0", width: 1 }, label: "Пройдено кругов", labelSize: 18, font: "10px sans-serif", size: 42 },
+          { scale: "x", stroke: "#6E7E98", grid: { stroke: "#E4E9F0", width: 1 }, label: payload.timeBased ? "Время табло" : "Пройдено кругов", labelSize: 18, font: "10px sans-serif", size: 42, values: function (plot, values) { return values.map(function (value) { return payload.timeBased ? chartClockLabel(state.chartPayloads[name].history, value) : String(Math.round(value)); }); } },
+          { show: payload.timeBased, scale: "x", side: 2, stroke: "#6E7E98", grid: { show: false }, ticks: { show: true, size: 4, width: 1, stroke: "#A9B4C5" }, label: "Пройдено кругов", labelSize: 18, font: "10px sans-serif", size: 38, space: 1, splits: function (plot, axisIndex, minimum, maximum) { return lapAxisSplits(name, minimum, maximum); }, values: function (plot, values) { return lapAxisValues(name, values); } },
           { stroke: "#6E7E98", grid: { stroke: "#E4E9F0", width: 1 }, font: "10px sans-serif", size: 58, values: kind === "pace" ? function (plot, values) { return values.map(function (value) { return formatLap(value); }); } : function (plot, values) { return values.map(function (value) { return (value / 1000).toFixed(1) + "с"; }); } }
         ],
         series: series,
+        plugins: [chartTimelinePlugin(name)],
         hooks: {
-          setCursor: [function (plot) { renderChartPointTooltip(plot, pointTooltip, payload, kind, container); }]
+          setCursor: [function (plot) { renderChartPointTooltip(plot, pointTooltip, state.chartPayloads[name], kind, container); }]
         }
       };
       state.charts[name] = new window.uPlot(options, payload.values, container);
+      state.chartSignatures[name] = payload.signature;
       if (window.ResizeObserver) {
         state.chartObservers[name] = new ResizeObserver(function () {
           if (!state.charts[name] || !container.clientWidth) return;
@@ -680,31 +937,48 @@
         state.chartObservers[name].observe(container);
       }
     } else {
+      state.chartPayloads[name] = payload;
       state.charts[name].setData(payload.values, false);
     }
   }
 
   function renderChartPointTooltip(plot, tooltip, payload, kind, container) {
-    var index = plot.cursor && plot.cursor.idx;
-    if (!isNumber(index) || index < 0 || !payload.values[0] || index >= payload.values[0].length) {
+    if (!plot.cursor || !isNumber(plot.cursor.left) || plot.cursor.left < 0) {
       tooltip.hidden = true;
       return;
     }
-    var lap = payload.values[0][index];
-    var rows = [];
-    payload.participants.forEach(function (participant, participantIndex) {
-      var value = payload.values[participantIndex + 1][index];
-      if (!isNumber(value)) return;
-      var formatted = kind === "pace"
-        ? formatLap(value)
-        : value === 0 ? "базовая линия" : Math.abs(value / 1000).toFixed(3) + " с · " + (value > 0 ? "впереди" : "сзади");
-      rows.push('<span><b>' + html(participantLabel(participant)) + '</b> · ' + html(formatted) + '</span>');
+    var targetX = plot.posToVal(plot.cursor.left, "x");
+    var closest = null;
+    payload.series.forEach(function (series) {
+      var index = nearestIndex(series.x, targetX);
+      if (index < 0 || !isNumber(series.y[index])) return;
+      var pointX = plot.valToPos(series.x[index], "x");
+      var pointY = plot.valToPos(series.y[index], "y");
+      var distance = Math.pow(pointX - plot.cursor.left, 2) + Math.pow(pointY - plot.cursor.top, 2);
+      if (!closest || distance < closest.distance) {
+        closest = { series: series, index: index, distance: distance };
+      }
     });
-    if (!rows.length) { tooltip.hidden = true; return; }
-    tooltip.innerHTML = '<strong>Круг ' + html(lap) + '</strong>' + rows.join("");
+    if (!closest) { tooltip.hidden = true; return; }
+    var participant = closest.series.participant;
+    var value = closest.series.y[closest.index];
+    var point = closest.series.meta[closest.index] || {};
+    var captureAtUs = point.capture_at_us || closest.series.x[closest.index] * 1000000;
+    var lap = point.lap_number;
+    var captureLapIndex = point.capture_lap_index;
+    var formatted = kind === "pace" ? formatLap(value) :
+      value === 0 ? "Базовая линия BALCHUG" : Math.abs(value / 1000).toFixed(3) + " с · " + (value > 0 ? "впереди" : "сзади");
+    tooltip.innerHTML = '<span class="chart-tooltip-kicker">Время табло</span>' +
+      '<strong>' + html(payload.timeBased ? chartClockLabel(payload.history, captureAtUs / 1000000) : "Круг " + lap) + '</strong>' +
+      '<b class="chart-tooltip-team">' + html(participantLabel(participant)) + '</b>' +
+      '<span class="chart-tooltip-value">' + html(formatted) + '</span>' +
+      (isNumber(lap) ? '<span>Круг ' + html(lap) + '</span>' :
+        (isNumber(captureLapIndex) ? '<span>Подтверждённое событие LAST №' + html(captureLapIndex) + ' · номер круга не передан</span>' : '<span>Номер круга не передан табло</span>')) +
+      (point.driver_name ? '<span>' + html(point.driver_name) + '</span>' : '') +
+      (point.flag ? '<span>Флаг: ' + html(normalizeFlag(point.flag)) + '</span>' : '');
     tooltip.hidden = false;
-    var left = (plot.cursor.left || 0) + 18;
-    var top = (plot.cursor.top || 0) + 18;
+    var left = plot.over.offsetLeft + (plot.cursor.left || 0) + 18;
+    var top = plot.over.offsetTop + (plot.cursor.top || 0) + 18;
     var width = tooltip.offsetWidth;
     var height = tooltip.offsetHeight;
     if (left + width > container.clientWidth - 8) left = Math.max(8, (plot.cursor.left || 0) - width - 18);
@@ -718,6 +992,8 @@
     if (state.charts[name]) state.charts[name].destroy();
     delete state.chartObservers[name];
     delete state.charts[name];
+    delete state.chartPayloads[name];
+    delete state.chartSignatures[name];
   }
 
   function renderPits(element) {
@@ -828,6 +1104,7 @@
       state.viewReady[name] = false;
       destroyChart(name);
     });
+    scheduleHistoryRefresh(true);
   }
 
   function announce(message) {
@@ -951,6 +1228,8 @@
 
   function loadActiveSession() {
     closeStream();
+    state.history = null;
+    state.historyRequestKey = null;
     state.viewReady = {};
     resetComparisonViews();
     if (state.demo) {
@@ -990,8 +1269,14 @@
 
   function applySnapshot(snapshot) {
     var previousSessionId = state.view && state.view.sessionId;
+    var nextSessionId = snapshot && snapshot.session && snapshot.session.id;
+    if (previousSessionId && nextSessionId !== previousSessionId) {
+      state.history = null;
+      state.historyRequestKey = null;
+    }
     state.snapshot = snapshot;
     state.view = snapshotToView(snapshot);
+    state.view.history = state.history;
     state.lastSnapshotAt = Date.now();
     if (state.view.sessionId !== previousSessionId) restoreDisplayState();
     assignColors();
@@ -999,6 +1284,57 @@
       state.selected = state.selected.slice(0, 3);
     }
     render();
+    scheduleHistoryRefresh(false);
+  }
+
+  function historyParticipantIds() {
+    if (!state.view || !state.view.ours) return [];
+    return [state.view.ours].concat(selectedParticipants()).map(function (participant) {
+      return participant.id;
+    }).filter(function (participantId, index, values) {
+      return participantId && values.indexOf(participantId) === index;
+    }).slice(0, 4);
+  }
+
+  function dashboardHistoryKey(sessionId, participantIds) {
+    return sessionId + ":" + participantIds.join(",");
+  }
+
+  function loadDashboardHistory() {
+    if (state.demo || !state.activeSession || !state.view || !state.view.ours) return Promise.resolve(null);
+    var sessionId = state.activeSession.id;
+    var participantIds = historyParticipantIds();
+    if (!participantIds.length) return Promise.resolve(null);
+    var requestKey = dashboardHistoryKey(sessionId, participantIds);
+    var serial = ++state.historyRequestSerial;
+    var queryString = participantIds.map(function (participantId) {
+      return "participant_id=" + encodeURIComponent(participantId);
+    }).join("&");
+    return fetchJson(API + "/sessions/" + encodeURIComponent(sessionId) + "/dashboard/history?" + queryString)
+      .then(function (payload) {
+        if (serial !== state.historyRequestSerial || !state.activeSession || state.activeSession.id !== sessionId) return null;
+        if (dashboardHistoryKey(sessionId, historyParticipantIds()) !== requestKey) return null;
+        state.history = payload;
+        state.historyRequestKey = requestKey;
+        if (state.view && state.view.sessionId === sessionId) state.view.history = payload;
+        renderView(false);
+        return payload;
+      }).catch(function (error) {
+        if (serial === state.historyRequestSerial) announce("История телеметрии временно недоступна: " + error.message);
+        return null;
+      });
+  }
+
+  function scheduleHistoryRefresh(immediate) {
+    if (state.demo || !state.activeSession || !state.view || !state.view.ours) return;
+    var participantIds = historyParticipantIds();
+    var requestKey = dashboardHistoryKey(state.activeSession.id, participantIds);
+    if (!immediate && state.historyRequestKey === requestKey && state.history) return;
+    if (state.historyTimer) window.clearTimeout(state.historyTimer);
+    state.historyTimer = window.setTimeout(function () {
+      state.historyTimer = null;
+      loadDashboardHistory();
+    }, immediate ? 0 : 120);
   }
 
   function scheduleSnapshotRefresh() {
@@ -1018,8 +1354,14 @@
         try { applySnapshot(JSON.parse(event.data)); } catch (error) { scheduleSnapshotRefresh(); }
       });
     });
-    ["state", "metric", "lap", "flag", "pit", "alert", "quality"].forEach(function (type) {
+    ["state", "metric", "alert"].forEach(function (type) {
       state.stream.addEventListener(type, scheduleSnapshotRefresh);
+    });
+    ["lap", "flag", "pit", "quality"].forEach(function (type) {
+      state.stream.addEventListener(type, function () {
+        scheduleSnapshotRefresh();
+        scheduleHistoryRefresh(true);
+      });
     });
     state.stream.onerror = function () {
       if (state.view && Date.now() - state.lastSnapshotAt > 10000) {
@@ -1027,6 +1369,7 @@
         renderSummary();
       }
     };
+    scheduleHistoryRefresh(false);
   }
 
   function closeStream() {
@@ -1034,6 +1377,8 @@
     state.stream = null;
     if (state.refreshTimer) window.clearTimeout(state.refreshTimer);
     state.refreshTimer = null;
+    if (state.historyTimer) window.clearTimeout(state.historyTimer);
+    state.historyTimer = null;
   }
 
   function startDemoClock() {

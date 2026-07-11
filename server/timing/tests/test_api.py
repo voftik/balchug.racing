@@ -332,6 +332,18 @@ class TimingApiTests(unittest.IsolatedAsyncioTestCase):
             404,
         )
 
+        dashboard = await self.client.get(
+            f"/sessions/{session_id}/dashboard/history?participant_id=ours"
+        )
+        self.assertEqual(dashboard.status_code, 200)
+        self.assertEqual(dashboard.headers["cache-control"], "no-store")
+        self.assertEqual(dashboard.json()["participants"][0]["participant_id"], "ours")
+        self.assertEqual(dashboard.json()["lap_series"]["ours"]["points"], [])
+        self.assertEqual(
+            (await self.client.get(f"/sessions/{session_id}/dashboard/history")).status_code,
+            422,
+        )
+
         laps = await self.client.get(f"/sessions/{session_id}/laps?participant_id=ours&limit=1")
         pits = await self.client.get(f"/sessions/{session_id}/pit-stops?participant_id=ours&limit=1")
         self.assertEqual(laps.json()["items"][0]["lap_number"], 8)

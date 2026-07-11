@@ -35,6 +35,8 @@ LIVE_FRESHNESS_US = 3 * US_PER_SECOND
 STALE_FRESHNESS_US = 10 * US_PER_SECOND
 MAX_HISTORY_RANGE_US = US_PER_DAY
 MAX_CHART_POINTS = 720
+MAX_DASHBOARD_PARTICIPANTS = 4
+MAX_DASHBOARD_LAPS_PER_PARTICIPANT = 2_000
 DEFAULT_FACT_LIMIT = 200
 MAX_FACT_LIMIT = 500
 LIVE_SCHEMA_VERSION = "timing-live.v1"
@@ -190,6 +192,26 @@ class TimingReadModel:
             session_id,
             database=self.database,
             scope=scope,
+            from_at_us=from_at_us,
+            to_at_us=to_at_us,
+            max_points=max_points,
+            now_at_us=self.clock() if now_at_us is None else now_at_us,
+        )
+
+    def dashboard_history(
+        self,
+        session_id: str,
+        *,
+        participant_ids: Sequence[str],
+        from_at_us: int | None = None,
+        to_at_us: int | None = None,
+        max_points: int = MAX_CHART_POINTS,
+        now_at_us: int | None = None,
+    ) -> dict[str, Any]:
+        return read_dashboard_history(
+            session_id,
+            database=self.database,
+            participant_ids=participant_ids,
             from_at_us=from_at_us,
             to_at_us=to_at_us,
             max_points=max_points,
@@ -1715,6 +1737,431 @@ def read_metric_history(
                 }
                 for row in rows
             ],
+            "provenance_contract": _provenance_contract(),
+        }
+
+
+def _dashboard_participant_ids(
+    connection: sqlite3.Connection,
+    *,
+    heat_id: int,
+    participant_ids: Sequence[str],
+) -> list[str]:
+    if isinstance(participant_ids, (str, bytes)):
+        raise ReadValidationError("participant_ids must be a sequence")
+    unique: list[str] = []
+    for participant_id in participant_ids:
+        validated = _validate_participant_filter(
+            connection,
+            heat_id=heat_id,
+            participant_id=participant_id,
+        )
+        assert validated is not None
+        if validated not in unique:
+            unique.append(validated)
+    if not unique:
+        raise ReadValidationError("at least one participant_id is required")
+    if len(unique) > MAX_DASHBOARD_PARTICIPANTS:
+        raise ReadValidationError(
+            f"no more than {MAX_DASHBOARD_PARTICIPANTS} participants may be displayed"
+        )
+    return unique
+
+
+def _dashboard_participants(
+    connection: sqlite3.Connection,
+    *,
+    heat_id: int,
+    participant_ids: Sequence[str],
+) -> list[dict[str, Any]]:
+    placeholders = ",".join("?" for _ in participant_ids)
+    rows = connection.execute(
+        f"""
+        SELECT participant.id,participant.start_number,participant.team_name,
+               participant.car_name,participant.class_name,participant.class_name_key,
+               participant.is_ours,participant.active,state.current_driver_name
+        FROM participants AS participant
+        LEFT JOIN participant_state_current AS state
+          ON state.source_heat_id = participant.source_heat_id
+         AND state.participant_id = participant.id
+        WHERE participant.source_heat_id = ?
+          AND participant.id IN ({placeholders})
+        """,
+        (heat_id, *participant_ids),
+    ).fetchall()
+    by_id = {
+        row["id"]: {
+            "participant_id": row["id"],
+            "start_number": row["start_number"],
+            "team_name": row["team_name"],
+            "car_name": row["car_name"],
+            "class_name": row["class_name"],
+            "class_key": row["class_name_key"] or _class_key(row["class_name"]),
+            "driver_name": row["current_driver_name"],
+            "is_ours": bool(row["is_ours"]),
+            "active": bool(row["active"]),
+        }
+        for row in rows
+    }
+    return [by_id[participant_id] for participant_id in participant_ids]
+
+
+def _dashboard_lap_series(
+    connection: sqlite3.Connection,
+    *,
+    heat_id: int,
+    participant_ids: Sequence[str],
+    first_at_us: int,
+    last_at_us: int,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, int]]:
+    placeholders = ",".join("?" for _ in participant_ids)
+    rows = connection.execute(
+        f"""
+        WITH ranked AS (
+          SELECT ledger.source_cell_observation_id,ledger.participant_id,
+                 ledger.source_message_id,ledger.source_key,ledger.source_change_ordinal,
+                 ledger.source_frame_id,ledger.source_message_ordinal,ledger.source_handle,
+                 ledger.observed_at_us,ledger.duration_ms,ledger.classification,
+                 ledger.linked_lap_id,ledger.sectors_json,
+                 ledger.sectors_source_cell_observation_ids_json,
+                 lap.lap_number,lap.completed_at_us,lap.flag,lap.is_in_lap,
+                 lap.is_out_lap,lap.crosses_pit,lap.is_clean,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY ledger.participant_id
+                   ORDER BY ledger.source_frame_id,ledger.source_message_ordinal,
+                            ledger.source_change_ordinal,ledger.source_cell_observation_id
+                 ) AS capture_lap_index
+          FROM result_last_cell_ledger AS ledger
+          LEFT JOIN laps AS lap ON lap.id = ledger.linked_lap_id
+          WHERE ledger.source_heat_id = ?
+            AND ledger.participant_id IN ({placeholders})
+            AND ledger.classification = 'CONFIRMED_LAP'
+            AND ledger.source_handle = 'r_c'
+            AND ledger.duration_ms IS NOT NULL AND ledger.duration_ms > 0
+        )
+        SELECT ranked.*,
+               (
+                 SELECT segment.driver_name_raw
+                 FROM participant_identity_segments AS segment
+                 WHERE segment.participant_id = ranked.participant_id
+                   AND segment.started_at_us <= ranked.observed_at_us
+                   AND (segment.ended_at_us IS NULL OR segment.ended_at_us > ranked.observed_at_us)
+                 ORDER BY segment.started_at_us DESC,segment.id DESC
+                 LIMIT 1
+               ) AS driver_name
+        FROM ranked
+        WHERE observed_at_us >= ? AND observed_at_us <= ?
+        ORDER BY source_frame_id,source_message_ordinal,source_change_ordinal,
+                 source_cell_observation_id
+        """,
+        (heat_id, *participant_ids, first_at_us, last_at_us),
+    ).fetchall()
+    grouped: dict[str, list[dict[str, Any]]] = {participant_id: [] for participant_id in participant_ids}
+    source_counts: dict[str, int] = {participant_id: 0 for participant_id in participant_ids}
+    for row in rows:
+        participant_id = str(row["participant_id"])
+        source_counts[participant_id] += 1
+        grouped[participant_id].append(
+            {
+                "capture_at_us": int(row["observed_at_us"]),
+                "completed_at_us": int(row["completed_at_us"]) if row["completed_at_us"] is not None else None,
+                "capture_lap_index": int(row["capture_lap_index"]),
+                "lap_number": int(row["lap_number"]) if row["lap_number"] is not None else None,
+                "duration_ms": int(row["duration_ms"]),
+                "sectors": _archive_source_proven_sectors(
+                    sectors_json=row["sectors_json"],
+                    source_cell_observation_ids_json=row["sectors_source_cell_observation_ids_json"],
+                    is_linked_to_last=True,
+                ),
+                "driver_name": row["driver_name"],
+                "flag": row["flag"],
+                "is_in_lap": bool(row["is_in_lap"]) if row["linked_lap_id"] is not None else None,
+                "is_out_lap": bool(row["is_out_lap"]) if row["linked_lap_id"] is not None else None,
+                "crosses_pit": bool(row["crosses_pit"]) if row["linked_lap_id"] is not None else None,
+                "is_clean": bool(row["is_clean"]) if row["linked_lap_id"] is not None else None,
+                "source": {
+                    "cell_observation_id": int(row["source_cell_observation_id"]),
+                    "message_id": int(row["source_message_id"]),
+                    "frame_id": int(row["source_frame_id"]),
+                    "message_ordinal": int(row["source_message_ordinal"]),
+                    "change_ordinal": int(row["source_change_ordinal"]),
+                    "handle": row["source_handle"],
+                    "key": row["source_key"],
+                    "classification": row["classification"],
+                },
+            }
+        )
+    for participant_id, events in grouped.items():
+        if len(events) > MAX_DASHBOARD_LAPS_PER_PARTICIPANT:
+            grouped[participant_id] = events[-MAX_DASHBOARD_LAPS_PER_PARTICIPANT:]
+    return grouped, source_counts
+
+
+def _dashboard_flags(
+    connection: sqlite3.Connection,
+    *,
+    heat_id: int,
+    first_at_us: int,
+    last_at_us: int,
+) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT flag,provider_code,provider_label,started_at_us,ended_at_us,
+               observed_started_at_us,observed_ended_at_us,
+               calibrated_started_at_us,calibrated_ended_at_us
+        FROM track_flag_periods
+        WHERE source_heat_id = ?
+          AND started_at_us <= ? AND (ended_at_us IS NULL OR ended_at_us >= ?)
+        ORDER BY started_at_us,id
+        LIMIT ?
+        """,
+        (heat_id, last_at_us, first_at_us, MAX_ARCHIVE_MARKERS),
+    ).fetchall()
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        started = next(
+            (
+                int(value)
+                for value in (
+                    row["calibrated_started_at_us"],
+                    row["observed_started_at_us"],
+                    row["started_at_us"],
+                )
+                if value is not None
+            ),
+            first_at_us,
+        )
+        ended = next(
+            (
+                int(value)
+                for value in (
+                    row["calibrated_ended_at_us"],
+                    row["observed_ended_at_us"],
+                    row["ended_at_us"],
+                )
+                if value is not None
+            ),
+            None,
+        )
+        result.append(
+            {
+                "flag": row["flag"],
+                "provider_code": row["provider_code"],
+                "provider_label": row["provider_label"],
+                "started_at_us": max(first_at_us, started),
+                "ended_at_us": min(last_at_us, ended) if ended is not None else None,
+                "carried_into_range": started < first_at_us,
+            }
+        )
+    return result
+
+
+def _dashboard_ingest_gaps(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+    heat_id: int,
+    first_at_us: int,
+    last_at_us: int,
+) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT id,started_at_us,ended_at_us,reason
+        FROM ingest_gaps
+        WHERE analysis_session_id = ? AND (source_heat_id = ? OR source_heat_id IS NULL)
+          AND started_at_us <= ? AND (ended_at_us IS NULL OR ended_at_us >= ?)
+        ORDER BY started_at_us,id
+        LIMIT ?
+        """,
+        (session_id, heat_id, last_at_us, first_at_us, MAX_ARCHIVE_MARKERS),
+    ).fetchall()
+    return [
+        {
+            "gap_id": int(row["id"]),
+            "started_at_us": max(first_at_us, int(row["started_at_us"])),
+            "ended_at_us": min(last_at_us, int(row["ended_at_us"])) if row["ended_at_us"] is not None else None,
+            "reason": row["reason"],
+            "carried_into_range": int(row["started_at_us"]) < first_at_us,
+        }
+        for row in rows
+    ]
+
+
+def _dashboard_interval_points(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+    heat_id: int,
+    first_at_us: int,
+    last_at_us: int,
+    max_points: int,
+) -> tuple[list[dict[str, Any]], int]:
+    scope = MetricScopeRequest("session", session_id)
+    rows, source_count = _sampled_metric_rows(
+        connection,
+        heat_id=heat_id,
+        scope=scope,
+        from_at_us=first_at_us,
+        to_at_us=last_at_us,
+        max_points=max_points,
+    )
+    points_by_source: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for row in rows:
+        values = _json_object(row["values_json"], context="dashboard session metric")
+        relations = values.get("relation_intervals")
+        relations = relations if isinstance(relations, Mapping) else {}
+        for relation_name, relation_key, sign in (
+            ("ahead", "class_ahead", 1),
+            ("behind", "class_behind", -1),
+        ):
+            relation = relations.get(relation_key)
+            relation = relation if isinstance(relation, Mapping) else None
+            if relation is not None:
+                value_ms = _comparison_number(relation.get("value_ms"))
+                target_id = relation.get("target_participant_id")
+                source_at_us = _comparison_number(relation.get("source_observed_at_us"))
+                if relation.get("status") != "VALID" or value_ms is None or source_at_us is None:
+                    continue
+                ours_laps = _comparison_number(relation.get("ours_laps"))
+            else:
+                value_ms = _comparison_number(values.get(f"gap_to_{relation_name}_ms"))
+                target_id = values.get(f"class_{relation_name}_id")
+                source_at_us = int(row["observed_at_us"])
+                ours_laps = _comparison_number(values.get("observed_lap_count"))
+            if not isinstance(target_id, str) or not target_id or value_ms is None:
+                continue
+            key = (relation_name, target_id, int(source_at_us), value_ms)
+            points_by_source[key] = {
+                "observed_at_us": int(source_at_us),
+                "participant_id": target_id,
+                "signed_ms": sign * value_ms,
+                "relation": relation_name,
+                "ours_laps": ours_laps,
+                "flag": values.get("track_flag"),
+            }
+    points = sorted(
+        points_by_source.values(),
+        key=lambda point: (point["observed_at_us"], point["participant_id"], point["relation"]),
+    )
+    return points, source_count
+
+
+def read_dashboard_history(
+    session_id: str,
+    *,
+    participant_ids: Sequence[str],
+    database: str | Path | None = None,
+    from_at_us: int | None = None,
+    to_at_us: int | None = None,
+    max_points: int = MAX_CHART_POINTS,
+    now_at_us: int | None = None,
+) -> dict[str, Any]:
+    """Return one bounded source-backed history payload for the live dashboard."""
+
+    session_id = _require_session_id(session_id)
+    max_points = _require_max_points(max_points)
+    evaluation_at_us = _require_now(now_at_us)
+    requested_start, requested_end = _validate_range(from_at_us=from_at_us, to_at_us=to_at_us)
+    with _readonly_snapshot(database) as connection:
+        session = _session_row(connection, session_id)
+        heat = _require_heat(_latest_heat_row(connection, session_id))
+        heat_id = int(heat["id"])
+        selected_ids = _dashboard_participant_ids(
+            connection,
+            heat_id=heat_id,
+            participant_ids=participant_ids,
+        )
+        last_at_us = evaluation_at_us if requested_end is None else requested_end
+        first_at_us = (
+            max(0, last_at_us - MAX_HISTORY_RANGE_US)
+            if requested_start is None
+            else requested_start
+        )
+        if requested_start is None:
+            first_at_us = max(first_at_us, min(int(heat["created_at_us"]), last_at_us))
+        if last_at_us < first_at_us or last_at_us - first_at_us > MAX_HISTORY_RANGE_US:
+            raise ReadValidationError("requested time range must not exceed 24 hours")
+
+        lap_series, lap_source_counts = _dashboard_lap_series(
+            connection,
+            heat_id=heat_id,
+            participant_ids=selected_ids,
+            first_at_us=first_at_us,
+            last_at_us=last_at_us,
+        )
+        ours_id = session["our_participant_id"]
+        interval_points, interval_source_count = _dashboard_interval_points(
+            connection,
+            session_id=session_id,
+            heat_id=heat_id,
+            first_at_us=first_at_us,
+            last_at_us=last_at_us,
+            max_points=max_points,
+        )
+        cursor = _stream_cursor(connection, session_id)
+        return {
+            "schema_version": LIVE_SCHEMA_VERSION,
+            "session_id": session_id,
+            "heat": _heat_payload(heat),
+            "range": {
+                "first_at_us": first_at_us,
+                "last_at_us": last_at_us,
+                "max_points": max_points,
+            },
+            "participants": _dashboard_participants(
+                connection,
+                heat_id=heat_id,
+                participant_ids=selected_ids,
+            ),
+            "lap_series": {
+                participant_id: {
+                    "source_point_count": lap_source_counts[participant_id],
+                    "truncated": lap_source_counts[participant_id] > len(lap_series[participant_id]),
+                    "points": lap_series[participant_id],
+                }
+                for participant_id in selected_ids
+            },
+            "interval_series": {
+                "source_point_count": interval_source_count,
+                "downsampled": interval_source_count > len(interval_points),
+                "points": interval_points,
+            },
+            "pit_stops": _archive_comparison_pit_stops(
+                connection,
+                heat_id=heat_id,
+                participant_ids=selected_ids,
+                ours_id=str(ours_id or ""),
+                first_at_us=first_at_us,
+                last_at_us=last_at_us,
+            ),
+            "flags": _dashboard_flags(
+                connection,
+                heat_id=heat_id,
+                first_at_us=first_at_us,
+                last_at_us=last_at_us,
+            ),
+            "ingest_gaps": _dashboard_ingest_gaps(
+                connection,
+                session_id=session_id,
+                heat_id=heat_id,
+                first_at_us=first_at_us,
+                last_at_us=last_at_us,
+            ),
+            "time_axes": _archive_time_axes(
+                connection,
+                heat_id=heat_id,
+                session=session,
+                first_at_us=first_at_us,
+                last_at_us=last_at_us,
+            ),
+            "cursor": {"stream_event_id": cursor},
+            "barrier": {"stream_event_id": cursor},
+            "semantics": {
+                "lap_series": "every confirmed sparse result-grid LAST event; values are neither averaged nor interpolated",
+                "capture_lap_index": "participant-local sequence of confirmed LAST events; lap_number remains null unless source-linked",
+                "interval_series": "computed only where source interval facts resolve the current class neighbour; null stays null",
+                "missing_values": "null values are never converted to zero or joined across an ingest gap",
+            },
             "provenance_contract": _provenance_contract(),
         }
 

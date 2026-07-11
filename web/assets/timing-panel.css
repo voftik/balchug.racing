@@ -507,16 +507,16 @@ body.admin .boris-btn::after { content: " · вкл"; }
 .chart-point-tooltip {
   position: absolute;
   z-index: 5;
-  width: min(250px, calc(100% - 16px));
-  padding: 9px 10px;
+  width: min(320px, calc(100% - 16px));
+  padding: 13px 14px;
   border: 1px solid #cbd5e1;
   border-left: 4px solid var(--navy);
   border-radius: 6px;
   background: rgba(255, 255, 255, .98);
   color: var(--navy);
   box-shadow: 0 12px 32px rgba(10, 25, 45, .2);
-  font-size: 11px;
-  line-height: 1.35;
+  font-size: 13px;
+  line-height: 1.4;
   pointer-events: none;
 }
 
@@ -530,12 +530,36 @@ body.admin .boris-btn::after { content: " · вкл"; }
 .chart-point-tooltip strong {
   margin-bottom: 4px;
   font-family: var(--display);
-  font-size: 12px;
+  font-size: 20px;
   font-variant-numeric: tabular-nums;
   letter-spacing: 0;
 }
 
 .chart-point-tooltip span + span { margin-top: 3px; }
+
+.chart-point-tooltip .chart-tooltip-kicker {
+  color: var(--muted);
+  font-family: var(--display);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.chart-point-tooltip .chart-tooltip-team {
+  display: block;
+  margin: 8px 0 3px;
+  color: var(--navy);
+  font-family: var(--display);
+  font-size: 15px;
+  line-height: 1.2;
+  text-transform: uppercase;
+}
+
+.chart-point-tooltip .chart-tooltip-value {
+  color: var(--red);
+  font-family: var(--display);
+  font-size: 22px;
+  font-variant-numeric: tabular-nums;
+}
 
 .chart-legend {
   display: flex;
