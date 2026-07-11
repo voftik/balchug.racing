@@ -1271,7 +1271,7 @@ class TimingNormalizer:
         return self._layout_id
 
     def _record_result_schema_contract(self, connection: sqlite3.Connection, layout_id: int) -> None:
-        """Persist the fixed live schema diagnostic alongside its raw layout."""
+        """Persist a known-binding diagnostic alongside the versioned raw layout."""
 
         layout = connection.execute(
             """
@@ -2503,7 +2503,8 @@ class TimingNormalizer:
             row=row,
             state_kind=current_state.kind,
         )
-        if gap_fact is None:
+        active_column_keys = {column.key for column in self.grid.columns.values()}
+        if gap_fact is None and "gap" in active_column_keys:
             gap_fact = self._current_interval_source_fact(
                 connection,
                 old,
@@ -2520,7 +2521,7 @@ class TimingNormalizer:
             row=row,
             state_kind=current_state.kind,
         )
-        if diff_fact is None:
+        if diff_fact is None and "diff" in active_column_keys:
             diff_fact = self._current_interval_source_fact(
                 connection,
                 old,

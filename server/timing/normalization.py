@@ -213,7 +213,7 @@ class ResultColumn:
 
 @dataclass(frozen=True)
 class ResultSchemaBinding:
-    """One source-name binding in the fixed current Time Service layout."""
+    """One known source-name binding in a versioned Time Service layout."""
 
     key: str
     source_name: str
@@ -239,7 +239,7 @@ class ResultSchemaContractValidation:
 
 
 CURRENT_RESULT_SCHEMA_CONTRACT = "time-service-result-grid-v1"
-"""Exact header contract observed on the current live Igora table."""
+"""Known semantic bindings used to diagnose each live layout version."""
 
 
 CURRENT_RESULT_SCHEMA_REQUIRED: tuple[ResultSchemaBinding, ...] = (
@@ -355,16 +355,25 @@ def result_columns(layout: Any) -> dict[int, ResultColumn]:
         if isinstance(header, Mapping):
             raw_name = header.get("n", index)
             raw_parameter = header.get("p")
+            raw_display_name = header.get("c")
         else:
             raw_name = header
             raw_parameter = None
+            raw_display_name = None
         source_name = str(raw_name).strip() if raw_name is not None else str(index)
         source_parameter = str(raw_parameter) if raw_parameter not in (None, "") else None
+        key = _result_field_key(source_name, source_parameter)
+        if key is None and raw_display_name not in (None, ""):
+            # `n` is the provider's preferred semantic identity. Some layouts
+            # introduce a new/empty wire name while retaining an explicit
+            # visible caption such as LAPS. That caption is safe as a fallback
+            # because duplicate canonical matches are rejected by ResultGrid.
+            key = _result_field_key(str(raw_display_name).strip(), source_parameter)
         columns[index] = ResultColumn(
             index=index,
             source_name=source_name,
             source_parameter=source_parameter,
-            key=_result_field_key(source_name, source_parameter),
+            key=key,
         )
     return columns
 
@@ -372,12 +381,12 @@ def result_columns(layout: Any) -> dict[int, ResultColumn]:
 def validate_current_result_schema(
     columns: Mapping[int, ResultColumn],
 ) -> ResultSchemaContractValidation:
-    """Validate the stable live layout without relying on column indexes.
+    """Diagnose one live layout version without relying on column indexes.
 
-    A result remains ``DEGRADED`` when a familiar alias such as ``POS`` is
-    supplied in place of the provider's current wire header.  The generic
-    normalizer may still retain that alias as a raw/header-based fact, while
-    the durable diagnostic makes a production contract change explicit.
+    A result remains ``DEGRADED`` when a familiar alias or display caption is
+    supplied in place of the known provider wire header. The generic reducer
+    can still use an unambiguous semantic match, while the durable diagnostic
+    makes that layout change explicit for audit and alerting.
     """
 
     bindings = (*CURRENT_RESULT_SCHEMA_REQUIRED, *CURRENT_RESULT_SCHEMA_OPTIONAL)

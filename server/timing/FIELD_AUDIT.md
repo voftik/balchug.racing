@@ -1,11 +1,12 @@
-# Current Live Field Audit
+# Versioned Live Field Audit
 
 Observed from the active Igora SignalR captures on 2026-07-10 and the race on
 2026-07-11. The production
-source contract is the current result-table schema below. The normalizer still
-resolves headers rather than trusting column indexes, so an upstream fault or
-schema drift is retained as raw evidence and fails closed instead of silently
-relabeling a metric.
+source emits a versioned result-table layout. There is no assumption that the
+current column set or order is final. The normalizer resolves each `r_i`/`r_l`
+header rather than trusting column indexes, so schema drift is retained as raw
+evidence and only the dependent metric fails closed instead of silently
+relabeling a field.
 
 ## Current source state
 
@@ -25,13 +26,16 @@ The engineer's selected mode (Practice, Qualifying or Race) is stored separately
 from the provider heat name. A race strategy session can therefore run against a
 provider heat whose display title is not itself called “Race”.
 
-## Result grid: fixed current wire contract
+## Result grid: dynamic versioned wire contract
 
-The visual dashboard labels and the provider wire header are different. The
-following `n`/`p` values are the stable production contract. It is validated
-for every raw layout as `time-service-result-grid-v1`, stored in
+The visual dashboard labels and the provider wire header can differ. The
+following `n`/`p` values are known semantic bindings, not a promise that every
+future layout contains them. Every raw layout is diagnosed as
+`time-service-result-grid-v1`, stored in
 `result_schema_contract_observations`, and reported as `CURRENT` or
-`DEGRADED`. The implementation never relies on the displayed column index.
+`DEGRADED`. A degraded layout still processes every unambiguous field actually
+present; an absent field disables only calculations that require it. The
+implementation never relies on the displayed column index.
 
 | Provider header (`n`, `p`) | Visual dashboard column | Persistent/query-ready destination | Notes |
 |---|---|---|---|
@@ -58,8 +62,11 @@ sparse `r_c` messages without waiting for an `r_i` that the provider does not
 send. Car identity can still arrive from Statistics facts, Tracker independently
 reconstructs the completed-lap total, and no DIFF value is synthesized.
 `sectionMarker` is a currently observed optional display field.
-Additional fields remain queryable raw facts, but they do not change the
-meaning of the fixed timing fields above.
+Additional fields remain queryable raw facts. A new provider name can use its
+explicit visible caption as a conservative semantic fallback; duplicate
+matches fail closed. On `r_l`, retained cells are remapped by semantic/raw
+identity, removed columns are dropped, and the following sparse `r_c` is
+interpreted only against that active version.
 
 Values in sparse `r_c` cells can be prefixed (`E`, `S`, `L`) and must remain raw
 until their per-column semantics are decoded; they are not universally integers.

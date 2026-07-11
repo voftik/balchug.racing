@@ -71,6 +71,65 @@ class ResultGridTests(unittest.TestCase):
             },
         )
 
+    def test_layout_update_drops_removed_field_and_remaps_unknown_field_by_identity(self):
+        grid = ResultGrid()
+        grid.apply_snapshot(
+            {
+                "l": {"h": [{"n": "NR"}, {"n": "LAPS"}, {"n": "futureMetric"}, {"n": "LAST"}]},
+                "r": [[0, 0, "21"], [0, 1, "28"], [0, 2, "raw fact"], [0, 3, "107200000"]],
+            }
+        )
+
+        grid.apply_layout_update(
+            {"h": [{"n": "LAST"}, {"n": "futureMetric"}, {"n": "NR"}]}
+        )
+        grid.apply_changes([[0, 0, "106900000"]])
+
+        self.assertEqual(
+            grid.row_values(0),
+            {
+                "last_lap": "106900000",
+                "unknown:futureMetric:": "raw fact",
+                "start_number": "21",
+            },
+        )
+        self.assertNotIn("laps", grid.row_values(0))
+
+    def test_display_caption_is_a_safe_fallback_for_a_new_provider_name(self):
+        grid = ResultGrid()
+        grid.apply_snapshot(
+            {
+                "l": {
+                    "h": [
+                        {"n": "startnumber", "c": "NR"},
+                        {"n": "completedLapCounterV2", "c": "LAPS"},
+                        {"n": "lastRoundTime", "c": "LAST"},
+                    ]
+                },
+                "r": [[0, 0, "21"], [0, 1, "29"], [0, 2, "107200000"]],
+            }
+        )
+
+        self.assertTrue(grid.schema_ready)
+        self.assertEqual(
+            grid.row_values(0),
+            {"start_number": "21", "laps": "29", "last_lap": "107200000"},
+        )
+
+        # Two visible LAPS captions are ambiguous even when their provider
+        # names differ, so neither is allowed into tactical state.
+        grid.apply_layout_update(
+            {
+                "h": [
+                    {"n": "completedLapCounterV2", "c": "LAPS"},
+                    {"n": "completedLapCounterV3", "c": "LAPS"},
+                ]
+            }
+        )
+        self.assertFalse(grid.schema_ready)
+        self.assertEqual(grid.schema_conflicts, {"laps": (0, 1)})
+        self.assertEqual(grid.rows, {})
+
     def test_layout_update_with_duplicate_canonical_headers_stays_fail_closed(self):
         grid = ResultGrid()
         grid.apply_snapshot({"l": {"h": [{"n": "NR"}]}, "r": [[0, 0, "21"]]})
