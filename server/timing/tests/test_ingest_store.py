@@ -90,6 +90,34 @@ class RawIngestStoreTests(unittest.TestCase):
         store.mark_processed(frame, processed_at_us=3_000_003)
         self.assertEqual(store.pending_decoded_frames(), ())
 
+    def test_replay_uses_persisted_messages_when_raw_payload_cannot_be_redecoded(self):
+        """A stored SignalR compression context is not available after restart."""
+
+        store = RawIngestStore(self.connection, analysis_session_id=self.session.id)
+        store.start_run(started_at_us=3_100_000)
+        upstream = store.open_connection(
+            Bootstrap("https://example.test/igora", "timekeeper", None), connected_at_us=3_100_001
+        )
+        frame = store.persist_raw_frame(
+            upstream,
+            sequence=1,
+            raw_text='{"M":[["r_i",{"l":{"h":[]},"r":[]}]]}',
+            received_at_us=3_100_002,
+            monotonic_ns=789,
+        )
+        self.assertEqual([message.handle for message in store.decode_frame(frame)], ["r_i"])
+        # Simulate an initial compressed invocation which re-decodes to no
+        # usable messages without its connection-local dictionary, while its
+        # decoded r_i was committed durably during live ingest.
+        self.connection.execute("UPDATE feed_frames SET raw_payload = ? WHERE id = ?", (b'{"M":[]}', frame.id))
+        self.connection.commit()
+        replayed = store.decode_frame(frame)
+        self.assertEqual([message.handle for message in replayed], ["r_i"])
+        self.assertEqual(
+            self.connection.execute("SELECT COUNT(*) FROM feed_messages WHERE frame_id = ?", (frame.id,)).fetchone()[0],
+            1,
+        )
+
     def test_inactive_session_cannot_start_a_live_writer(self):
         self.connection.execute("UPDATE analysis_sessions SET lifecycle = 'stopped' WHERE id = ?", (self.session.id,))
         self.connection.commit()

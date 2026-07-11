@@ -67,7 +67,7 @@ class TimingDatabaseTests(unittest.TestCase):
             path = Path(temporary) / "timing.db"
             self.assertEqual(
                 migrate(path),
-                ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011"],
+                ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012"],
             )
             self.assertEqual(migrate(path), [])
             connection = connect(path)
@@ -88,6 +88,8 @@ class TimingDatabaseTests(unittest.TestCase):
                         "stream_event_cursor_floors",
                         "playback_snapshots",
                         "participant_interval_source_facts",
+                        "result_schema_baselines",
+                        "result_last_cell_ledger",
                     }.issubset(tables)
                 )
             finally:
@@ -223,6 +225,36 @@ class TimingDatabaseTests(unittest.TestCase):
                         "target_state_kind",
                         "target_laps",
                     }.issubset(interval_fact_columns)
+                )
+                baseline_columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(result_schema_baselines)")
+                }
+                self.assertTrue(
+                    {
+                        "ingest_connection_id",
+                        "layout_version_id",
+                        "layout_generation",
+                        "source_frame_id",
+                        "source_message_id",
+                        "source_message_ordinal",
+                        "source_key",
+                    }.issubset(baseline_columns)
+                )
+                last_ledger_columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(result_last_cell_ledger)")
+                }
+                self.assertTrue(
+                    {
+                        "source_cell_observation_id",
+                        "duration_ms",
+                        "classification",
+                        "classification_reason",
+                        "predecessor_source_cell_observation_id",
+                        "schema_baseline_id",
+                        "linked_lap_id",
+                        "sectors_json",
+                        "sectors_source_cell_observation_ids_json",
+                    }.issubset(last_ledger_columns)
                 )
                 passing_columns = {row[1] for row in connection.execute("PRAGMA table_info(tracker_passings)")}
                 self.assertTrue(
@@ -422,7 +454,7 @@ class TimingDatabaseTests(unittest.TestCase):
 
             self.assertEqual(
                 migrate(path),
-                ["0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011"],
+                ["0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012"],
             )
             connection = connect(path)
             try:

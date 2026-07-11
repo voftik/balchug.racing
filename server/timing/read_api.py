@@ -1857,6 +1857,112 @@ def _archive_time_axes(
     }
 
 
+def _archive_manifest_ours_participant_id(
+    connection: sqlite3.Connection,
+    *,
+    heat_id: int,
+    session: Mapping[str, Any],
+) -> str | None:
+    """Resolve the one archived BALCHUG participant without reading a chart.
+
+    The archive manifest must be usable before the asynchronous comparison
+    request completes. The session's resolved identity is preferred, but a
+    historical replay can predate that field, so a single durable ``is_ours``
+    participant is an explicit fallback. Ambiguous fallback identities fail
+    closed rather than attaching another car's LAST events to BALCHUG.
+    """
+
+    candidate = session["our_participant_id"]
+    if isinstance(candidate, str) and candidate:
+        row = connection.execute(
+            """
+            SELECT id
+            FROM participants
+            WHERE source_heat_id = ? AND id = ?
+            """,
+            (heat_id, candidate),
+        ).fetchone()
+        if row is not None:
+            return str(row["id"])
+
+    rows = connection.execute(
+        """
+        SELECT id
+        FROM participants
+        WHERE source_heat_id = ? AND is_ours = 1
+        ORDER BY id
+        LIMIT 2
+        """,
+        (heat_id,),
+    ).fetchall()
+    return str(rows[0]["id"]) if len(rows) == 1 else None
+
+
+def _archive_capture_lap_events(
+    connection: sqlite3.Connection,
+    *,
+    heat_id: int,
+    participant_id: str | None,
+    first_at_us: int,
+    last_at_us: int,
+) -> list[dict[str, Any]]:
+    """Return exact confirmed ``LAST`` events for the archived BALCHUG car.
+
+    A raw result-grid value alone is not a lap event: ``r_i`` can replay a
+    whole table after a reconnect and sparse ``r_c`` observations can be
+    unrelated to a confirmed finish. The immutable LAST-cell ledger classifies
+    that source evidence before this read model sees it. A confirmed sparse
+    ``r_c`` LAST remains a real capture event even when the provider has not
+    supplied a lap number; its optional lap link is therefore never invented.
+    """
+
+    if participant_id is None:
+        return []
+    rows = connection.execute(
+        """
+        SELECT ledger.source_cell_observation_id,ledger.source_message_id,
+               ledger.source_key,ledger.source_change_ordinal,
+               ledger.source_frame_id,ledger.source_message_ordinal,
+               ledger.source_handle,ledger.observed_at_us,ledger.duration_ms,
+               ledger.classification,ledger.linked_lap_id,
+               lap.lap_number,lap.completed_at_us
+        FROM result_last_cell_ledger AS ledger
+        LEFT JOIN laps AS lap ON lap.id = ledger.linked_lap_id
+        WHERE ledger.source_heat_id = ?
+          AND ledger.participant_id = ?
+          AND ledger.observed_at_us >= ? AND ledger.observed_at_us <= ?
+          AND ledger.classification = 'CONFIRMED_LAP'
+          AND ledger.source_handle = 'r_c'
+          AND ledger.duration_ms IS NOT NULL AND ledger.duration_ms > 0
+        ORDER BY ledger.source_frame_id,ledger.source_message_ordinal,
+                 ledger.source_change_ordinal,ledger.source_cell_observation_id
+        """,
+        (heat_id, participant_id, first_at_us, last_at_us),
+    ).fetchall()
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        events.append(
+            {
+                "capture_at_us": int(row["observed_at_us"]),
+                "completed_at_us": int(row["completed_at_us"]) if row["completed_at_us"] is not None else None,
+                "lap_number": int(row["lap_number"]) if row["lap_number"] is not None else None,
+                "duration_ms": int(row["duration_ms"]),
+                "timeline_kind": "confirmed_lap",
+                "source": {
+                    "cell_observation_id": int(row["source_cell_observation_id"]),
+                    "message_id": int(row["source_message_id"]),
+                    "frame_id": int(row["source_frame_id"]),
+                    "message_ordinal": int(row["source_message_ordinal"]),
+                    "change_ordinal": int(row["source_change_ordinal"]),
+                    "handle": row["source_handle"],
+                    "key": row["source_key"],
+                    "classification": row["classification"],
+                },
+            }
+        )
+    return events
+
+
 def _comparison_number(value: Any) -> int | float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         return None
@@ -2989,6 +3095,18 @@ def read_archive_manifest(
             first_at_us=first_at_us,
             last_at_us=last_at_us,
         )
+        ours_participant_id = _archive_manifest_ours_participant_id(
+            connection,
+            heat_id=int(heat["id"]),
+            session=session,
+        )
+        capture_lap_events = _archive_capture_lap_events(
+            connection,
+            heat_id=int(heat["id"]),
+            participant_id=ours_participant_id,
+            first_at_us=first_at_us,
+            last_at_us=last_at_us,
+        )
         return {
             "schema_version": ARCHIVE_SCHEMA_VERSION,
             "session": _session_payload(session),
@@ -3021,11 +3139,13 @@ def read_archive_manifest(
                 first_at_us=first_at_us,
                 last_at_us=last_at_us,
             ),
+            "capture_lap_events": capture_lap_events,
             "time_axes": time_axes,
             "semantics": {
                 "state": "last_observed",
                 "series": "step",
                 "time_axes": "playback uses durable receive time; source uses explicit Time Service clock anchors and may only be interpolated within one connection",
+                "capture_lap_events": "exact LAST-cell-ledger events for BALCHUG Racing only; each is a CONFIRMED_LAP r_c delta, while REFRESH_REPEAT table refreshes and unconfirmed observations are excluded; a provider lap number is null when that exact source cell has no linked completed lap",
             },
             "system_assumption": _system_assumptions(),
         }

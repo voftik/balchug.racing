@@ -87,6 +87,7 @@ class LapSample:
 
     participant_id: str | None = None
     lap_number: int | None = None
+    capture_sequence: int | None = None
     completed_at_us: int | None = None
     duration_ms: int | None = None
     flag_kinds: tuple[str, ...] = ()

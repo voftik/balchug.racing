@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from timing.db import connect, migrate
-from timing.normalization import TIME_SERVICE_EPOCH_UNIX_US
+from timing.normalization import TIME_SERVICE_EPOCH_UNIX_US, parse_ts_time
 from timing.read_api import (
     ArchiveProjectionMissingError,
     MetricScopeRequest,
@@ -272,6 +272,57 @@ class TimingReadModelTests(unittest.TestCase):
             )
             cell_ids.append(self.connection.execute("SELECT last_insert_rowid()").fetchone()[0])
         return cell_ids
+
+    def _add_last_cell_ledger(self, cell_id, *, classification, linked_lap_id=None):
+        """Classify one seeded immutable LAST cell as the writer would."""
+
+        row = self.connection.execute(
+            """
+            SELECT observation.source_heat_id,observation.participant_id,observation.layout_version_id,
+                   observation.source_message_id,observation.source_key,
+                   observation.source_change_ordinal,observation.observed_at_us,
+                   observation.value_text,message.handle,message.ordinal AS message_ordinal,
+                   frame.id AS frame_id
+            FROM participant_result_cell_observations AS observation
+            JOIN feed_messages AS message ON message.id = observation.source_message_id
+            JOIN feed_frames AS frame ON frame.id = message.frame_id
+            WHERE observation.id = ?
+            """,
+            (cell_id,),
+        ).fetchone()
+        assert row is not None
+        duration_us = parse_ts_time(row["value_text"])
+        duration_ms = duration_us // 1_000 if duration_us is not None else None
+        self.connection.execute(
+            """
+            INSERT INTO result_last_cell_ledger(
+              source_cell_observation_id,source_heat_id,participant_id,layout_version_id,
+              source_frame_id,source_message_id,source_message_ordinal,source_key,
+              source_change_ordinal,source_handle,observed_at_us,duration_ms,
+              classification,classification_reason,predecessor_source_cell_observation_id,
+              schema_baseline_id,linked_lap_id,sectors_json,
+              sectors_source_cell_observation_ids_json,created_at_us
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,?,NULL,NULL,?)
+            """,
+            (
+                cell_id,
+                row["source_heat_id"],
+                row["participant_id"],
+                row["layout_version_id"],
+                row["frame_id"],
+                row["source_message_id"],
+                row["message_ordinal"],
+                row["source_key"],
+                row["source_change_ordinal"],
+                row["handle"],
+                row["observed_at_us"],
+                duration_ms,
+                classification,
+                f"test:{classification.lower()}",
+                linked_lap_id,
+                row["observed_at_us"],
+            ),
+        )
 
     def _add_interval_source_fact(self, *, raw_value, interval_ms, observed_at_us):
         """Seed one exact current GAP cell independently of cached state."""
@@ -1030,6 +1081,94 @@ class TimingReadModelTests(unittest.TestCase):
         self.assertIsNone(raw[2]["sectors"])
         self.assertIn("individual source cell", comparison["semantics"]["lap_series_sectors"])
         self.assertIn("not an invented finish crossing", comparison["semantics"]["lap_series_ours_raw"])
+
+    def test_archive_manifest_capture_lap_events_uses_confirmed_last_ledger(self):
+        """A refresh is excluded while sparse confirmed r_c LAST is retained."""
+
+        self.connection.execute("UPDATE analysis_sessions SET lifecycle = 'stopped' WHERE id = 'session-1'")
+        _baseline_cell, confirmed_cell, refresh_cell, unlinked_delta_cell = self._add_result_last_cells(
+            (
+                ("r_i", "108000000", 10_500_000),
+                ("r_c", "107200000", 12_000_000),
+                # A later r_c can repaint a whole result table too. This
+                # exact repeat of lap 12 is classified REFRESH_REPEAT, not a
+                # new captured lap, despite its r_c transport handle.
+                ("r_c", "107200000", 12_250_000),
+                # A changed sparse r_c LAST can be ledger-confirmed without
+                # an exact completed-lap link. It advances the local capture
+                # counter, but its provider lap number remains unknown.
+                ("r_c", "106900000", 12_750_000),
+            )
+        )
+        refresh_message_id = self.connection.execute(
+            "SELECT source_message_id FROM participant_result_cell_observations WHERE id = ?",
+            (refresh_cell,),
+        ).fetchone()[0]
+        confirmed_message_id = self.connection.execute(
+            "SELECT source_message_id FROM participant_result_cell_observations WHERE id = ?",
+            (confirmed_cell,),
+        ).fetchone()[0]
+        self.connection.execute(
+            """
+            UPDATE laps
+            SET duration_ms = 107200, duration_source_cell_observation_id = ?, duration_source_message_id = ?,
+                duration_source_key = 'raw:1', duration_source_kind = 'RESULT_GRID_LAST'
+            WHERE id = 'lap-11'
+            """,
+            (refresh_cell, refresh_message_id),
+        )
+        self.connection.execute(
+            """
+            UPDATE laps
+            SET duration_source_cell_observation_id = ?, duration_source_message_id = ?,
+                duration_source_key = 'raw:2', duration_source_kind = 'RESULT_GRID_LAST'
+            WHERE id = 'lap-12'
+            """,
+            (confirmed_cell, confirmed_message_id),
+        )
+        self._add_last_cell_ledger(_baseline_cell, classification="UNCONFIRMED")
+        self._add_last_cell_ledger(
+            confirmed_cell,
+            classification="CONFIRMED_LAP",
+            linked_lap_id="lap-12",
+        )
+        self._add_last_cell_ledger(
+            refresh_cell,
+            classification="REFRESH_REPEAT",
+            linked_lap_id="lap-11",
+        )
+        self._add_last_cell_ledger(unlinked_delta_cell, classification="CONFIRMED_LAP")
+        payload = {
+            "schema_version": "timing-archive.v1",
+            "observed_at_us": 10_000_000,
+            "computed": {"session": {"ours_participant_id": "ours"}},
+        }
+        self._add_playback_snapshot(10_000_000, payload)
+        payload["observed_at_us"] = 13_000_000
+        self._add_playback_snapshot(13_000_000, payload)
+        self.connection.commit()
+
+        manifest = self.model.archive_manifest("session-1")
+
+        self.assertEqual(len(manifest["capture_lap_events"]), 2)
+        event = manifest["capture_lap_events"][0]
+        self.assertEqual(event["capture_at_us"], 12_000_000)
+        self.assertEqual(event["completed_at_us"], 12_000_000)
+        self.assertEqual(event["lap_number"], 12)
+        self.assertEqual(event["duration_ms"], 107_200)
+        self.assertEqual(event["timeline_kind"], "confirmed_lap")
+        self.assertEqual(event["source"]["cell_observation_id"], confirmed_cell)
+        self.assertEqual(event["source"]["handle"], "r_c")
+        self.assertEqual(event["source"]["classification"], "CONFIRMED_LAP")
+        self.assertNotEqual(event["source"]["cell_observation_id"], refresh_cell)
+        sparse = manifest["capture_lap_events"][1]
+        self.assertEqual(sparse["capture_at_us"], 12_750_000)
+        self.assertEqual(sparse["duration_ms"], 106_900)
+        self.assertIsNone(sparse["lap_number"])
+        self.assertIsNone(sparse["completed_at_us"])
+        self.assertEqual(sparse["source"]["cell_observation_id"], unlinked_delta_cell)
+        self.assertEqual(sparse["source"]["classification"], "CONFIRMED_LAP")
+        self.assertIn("REFRESH_REPEAT table refreshes", manifest["semantics"]["capture_lap_events"])
 
     def test_archive_fallback_lap_sectors_require_result_grid_last_provenance(self):
         [source_cell] = self._add_result_last_cells((("r_c", "107200000", 12_000_000),))

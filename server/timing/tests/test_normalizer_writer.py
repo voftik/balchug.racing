@@ -39,11 +39,11 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         self.connection.close()
         self.temporary.cleanup()
 
-    def apply(self, messages, *, received_at_us):
+    def apply(self, messages, *, received_at_us, upstream=None):
         self.sequence += 1
         raw = json.dumps({"M": messages}, ensure_ascii=False, separators=(",", ":"))
         frame = self.store.persist_raw_frame(
-            self.upstream,
+            upstream or self.upstream,
             sequence=self.sequence,
             raw_text=raw,
             received_at_us=received_at_us,
@@ -1082,7 +1082,7 @@ class TimingNormalizerWriterTests(unittest.TestCase):
 
         laps = self.connection.execute(
             """
-            SELECT lap_number,completed_at_us,duration_ms,sectors_json,
+            SELECT id,lap_number,completed_at_us,duration_ms,sectors_json,
                    completion_passing_observation_id,duration_source_cell_observation_id,
                    duration_source_message_id,source_message_id,duration_source_kind,
                    sectors_source_cell_observation_ids_json
@@ -1111,8 +1111,225 @@ class TimingNormalizerWriterTests(unittest.TestCase):
             (first["duration_source_cell_observation_id"],),
         ).fetchone()
         self.assertEqual(source_cell["value_text"], "107491000")
+        ledger = self.connection.execute(
+            """
+            SELECT classification,classification_reason,linked_lap_id,sectors_json,
+                   sectors_source_cell_observation_ids_json
+            FROM result_last_cell_ledger
+            WHERE source_cell_observation_id = ?
+            """,
+            (first["duration_source_cell_observation_id"],),
+        ).fetchone()
+        self.assertEqual(
+            tuple(ledger[:3]),
+            ("CONFIRMED_LAP", "SOURCE_LAP_BOUNDARY", first["id"]),
+        )
+        self.assertEqual(json.loads(ledger["sectors_json"]), json.loads(first["sectors_json"]))
+        self.assertEqual(
+            json.loads(ledger["sectors_source_cell_observation_ids_json"]),
+            json.loads(first["sectors_source_cell_observation_ids_json"]),
+        )
         self.assertIsNone(second["duration_ms"])
         self.assertIsNone(second["duration_source_cell_observation_id"])
+
+    def test_last_ledger_distinguishes_late_sparse_cells_refreshes_and_invalid_values(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 58_000_000
+        headers = [
+            {"n": "NR"},
+            {"n": "TEAM"},
+            {"n": "CLS"},
+            {"n": "STATE"},
+            {"n": "LAST"},
+        ]
+        self.apply(
+            [
+                [
+                    "r_i",
+                    {
+                        "l": {"h": headers},
+                        "r": [
+                            [0, 0, "21"],
+                            [0, 1, "BALCHUG Racing"],
+                            [0, 2, "CN PRO"],
+                            [0, 3, "E58000000"],
+                            [0, 4, "108000000"],
+                            [2, 0, "77"],
+                            [2, 1, "MAZDA HIGH POWER 77"],
+                            [2, 2, "GT L"],
+                            [2, 3, "SIn Pit"],
+                            [2, 4, "140000000"],
+                        ],
+                    },
+                ]
+            ],
+            received_at_us=received,
+        )
+        baseline = self.connection.execute(
+            "SELECT id FROM result_schema_baselines ORDER BY id"
+        ).fetchone()
+        self.assertIsNotNone(baseline)
+
+        # #9 appears after the connection-wide schema snapshot. It has no
+        # personal r_i LAST baseline, but its direct r_c cell is valid timing
+        # evidence and must not be discarded.
+        self.apply(
+            [
+                [
+                    "r_c",
+                    [
+                        [1, 0, "9"],
+                        [1, 1, "Про Моторспорт"],
+                        [1, 2, "CN PRO"],
+                        [1, 3, "E58001000"],
+                        [1, 4, "110000000"],
+                    ],
+                ]
+            ],
+            received_at_us=received + 1_000,
+        )
+        self.apply([["r_c", [[0, 4, "107500000"]]]], received_at_us=received + 2_000)
+        self.apply([["r_c", [[0, 4, "107500000"]]]], received_at_us=received + 3_000)
+        self.apply(
+            [["r_c", [[0, 4, str(OPEN_ENDED_TS_TIME)]]]],
+            received_at_us=received + 4_000,
+        )
+        self.apply([["r_c", [[0, 4, "107400000"]]]], received_at_us=received + 5_000)
+
+        # Three rows are retained in the sparse grid, but this r_c contains a
+        # complete two-row block (ten cells). Refresh density is measured from
+        # its transmitted rows, so the unchanged #21 LAST is a repaint and the
+        # changed #9 value is deliberately not promoted into a timing event.
+        self.apply(
+            [
+                [
+                    "r_c",
+                    [
+                        [0, 0, "21"],
+                        [0, 1, "BALCHUG Racing"],
+                        [0, 2, "CN PRO"],
+                        [0, 3, "E58006000"],
+                        [0, 4, "107400000"],
+                        [1, 0, "9"],
+                        [1, 1, "Про Моторспорт"],
+                        [1, 2, "CN PRO"],
+                        [1, 3, "E58006000"],
+                        [1, 4, "109000000"],
+                    ],
+                ]
+            ],
+            received_at_us=received + 6_000,
+        )
+        rows = self.connection.execute(
+            """
+            SELECT participant.start_number,ledger.duration_ms,ledger.classification,
+                   ledger.classification_reason,ledger.schema_baseline_id,
+                   ledger.predecessor_source_cell_observation_id
+            FROM result_last_cell_ledger AS ledger
+            LEFT JOIN participants AS participant ON participant.id = ledger.participant_id
+            WHERE ledger.source_handle = 'r_c'
+            ORDER BY ledger.source_frame_id,ledger.source_message_ordinal,
+                     ledger.source_change_ordinal,ledger.source_cell_observation_id
+            """
+        ).fetchall()
+        self.assertEqual(
+            [
+                (row["start_number"], row["duration_ms"], row["classification"], row["classification_reason"])
+                for row in rows
+            ],
+            [
+                ("9", 110_000, "CONFIRMED_LAP", "DIRECT_FIRST_OBSERVATION"),
+                ("21", 107_500, "CONFIRMED_LAP", "DIRECT_VALUE_CHANGED"),
+                ("21", 107_500, "UNCONFIRMED", "AMBIGUOUS_EQUAL_DURATION"),
+                ("21", None, "INVALID", "INVALID_DURATION"),
+                ("21", 107_400, "CONFIRMED_LAP", "DIRECT_VALUE_CHANGED"),
+                ("21", 107_400, "REFRESH_REPEAT", "FULL_GRID_REFRESH_REPEAT"),
+                ("9", 109_000, "UNCONFIRMED", "FULL_GRID_NON_REPEAT"),
+            ],
+        )
+        self.assertTrue(all(row["schema_baseline_id"] == baseline["id"] for row in rows))
+        self.assertTrue(all(row["predecessor_source_cell_observation_id"] is not None for row in rows[1:]))
+
+    def test_last_ledger_requires_a_new_r_i_after_reconnect(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 59_000_000
+        payload = {
+            "l": {"h": [{"n": "NR"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "STATE"}, {"n": "LAST"}]},
+            "r": [
+                [0, 0, "21"],
+                [0, 1, "BALCHUG Racing"],
+                [0, 2, "CN PRO"],
+                [0, 3, "E59000000"],
+                [0, 4, "108000000"],
+            ],
+        }
+        self.apply([["r_i", payload]], received_at_us=received)
+        reconnect = self.store.open_connection(Bootstrap("https://example.test/igora", "tid-reconnect", None))
+        self.apply(
+            [["r_c", [[0, 4, "107800000"]]]],
+            received_at_us=received + 1_000,
+            upstream=reconnect,
+        )
+        self.apply([["r_i", payload]], received_at_us=received + 2_000, upstream=reconnect)
+        self.apply(
+            [["r_c", [[0, 4, "107700000"]]]],
+            received_at_us=received + 3_000,
+            upstream=reconnect,
+        )
+        rows = self.connection.execute(
+            """
+            SELECT duration_ms,classification,classification_reason,schema_baseline_id
+            FROM result_last_cell_ledger
+            WHERE source_handle = 'r_c'
+            ORDER BY source_frame_id,source_message_ordinal,source_change_ordinal
+            """
+        ).fetchall()
+        self.assertEqual(
+            [(row["duration_ms"], row["classification"], row["classification_reason"]) for row in rows],
+            [
+                (107_800, "UNCONFIRMED", "SCHEMA_BASELINE_MISSING"),
+                (107_700, "CONFIRMED_LAP", "DIRECT_VALUE_CHANGED"),
+            ],
+        )
+        self.assertIsNone(rows[0]["schema_baseline_id"])
+        self.assertIsNotNone(rows[1]["schema_baseline_id"])
+
+    def test_initial_r_i_before_h_i_persists_connection_schema_baseline(self):
+        """The production compressed bootstrap orders r_i before h_i/s_i."""
+
+        received = TIME_SERVICE_EPOCH_UNIX_US + 59_500_000
+        self.apply(
+            [
+                [
+                    "r_i",
+                    {
+                        "l": {"h": [{"n": "NR"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "STATE"}, {"n": "LAST"}]},
+                        "r": [
+                            [0, 0, "21"],
+                            [0, 1, "BALCHUG Racing"],
+                            [0, 2, "CN PRO"],
+                            [0, 3, "E59500000"],
+                            [0, 4, "108000000"],
+                        ],
+                    },
+                ],
+                ["h_i", {"n": "Practice - Open-Pit", "s": 59_500_000, "f": 6}],
+                ["s_i", 59_500_000],
+            ],
+            received_at_us=received,
+        )
+        baseline = self.connection.execute(
+            "SELECT source_message_ordinal,layout_generation FROM result_schema_baselines"
+        ).fetchone()
+        self.assertEqual(tuple(baseline), (0, 1))
+        self.apply([["r_c", [[0, 4, "107600000"]]]], received_at_us=received + 1_000)
+        fact = self.connection.execute(
+            """
+            SELECT classification,classification_reason,schema_baseline_id
+            FROM result_last_cell_ledger
+            WHERE source_handle = 'r_c'
+            """
+        ).fetchone()
+        self.assertEqual(tuple(fact[:2]), ("CONFIRMED_LAP", "DIRECT_VALUE_CHANGED"))
+        self.assertIsNotNone(fact["schema_baseline_id"])
 
     def test_no_laps_tracker_boundary_requires_last_in_the_same_frame(self):
         received = TIME_SERVICE_EPOCH_UNIX_US + 56_000_000

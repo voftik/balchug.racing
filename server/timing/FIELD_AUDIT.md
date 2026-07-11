@@ -39,7 +39,7 @@ provider heat whose display title is not itself called “Race”.
 | `GAP` | immutable `participant_interval_source_facts(GAP)` + current pointer | Exact source cell with message, time, subject/target position, state and lap context; only this fact may feed a gap metric |
 | `DIFF` | immutable `participant_interval_source_facts(DIFF)` + current pointer | Exact source cell to the absolute row ahead; never subtracted across unrelated table updates |
 | `BEST` | `best_lap_ms` | Invalid source sentinel remains raw-only |
-| `LAST` | current `last_lap_ms` plus immutable `LAST` event stream | The only source of a lap duration; every changed `r_c` value is retained in source order |
+| `LAST` | current `last_lap_ms` plus immutable `LAST` cell ledger | The only source of a lap duration; every canonical source cell is retained with an explicit admission status before it can enter timing analytics |
 | `STINT` | `current_driver_stint_raw` | Source-specific driver-stint representation, preserved independently from tyre logic |
 | `L-PIT` | `pit_time_raw`, source pit facts and computed `pit_stops` | Pit-lane source field; it is not stationary service time |
 | `PIT` | provider pit count plus reconciled `pit_stops` | Counter corroborates automatic pit cycles; it cannot manufacture a completed stop |
@@ -55,19 +55,31 @@ until their per-column semantics are decoded; they are not universally integers.
 ### LAST and LAPS
 
 `LAST` is the source of a lap duration. It is not recomputed from tracker
-timestamps. The archive and live metric input retain each valid changed `r_c`
-`LAST` cell in source order, including two consecutive equal lap times. `LAPS`,
-when present in the same current source schema, remains the official lap count;
-the archive does not replace it with a capture ordinal. The horizontal
-coordinate of a `LAST` fact is the time that the table observation arrived; it
-is not presented as an invented finish-crossing timestamp.
+timestamps. Every canonical `LAST` cell is written to the immutable
+`result_last_cell_ledger` with one of four statuses:
 
-`r_i` can be a reconnect snapshot carrying a stale visible `LAST`, so it is
-shown as an audit baseline rather than counted as a new table-lap event unless
-the exact cell is already linked to a proven lap. Tracker `t_p` and an explicit
-`LAPS` value may attach a lap number to the same source cell, but they never
-replace or suppress the recorded `LAST` duration when that association is
-missing.
+- `CONFIRMED_LAP`: the only status admitted to pace, archive capture counters,
+  tactical alerts and capture-local tyre age;
+- `REFRESH_REPEAT`: an unchanged value in a dense aggregate row block, not a
+  new lap;
+- `UNCONFIRMED`: incomplete or ambiguous evidence, retained for audit only;
+- `INVALID`: a sentinel or invalid duration, retained raw only.
+
+A sparse changed (or first observed) `r_c LAST` after the accepted `r_i`
+baseline for the same connection is a confirmed timing event. Equal sparse
+values remain unconfirmed: equal consecutive real laps are possible. A dense
+aggregate block has at least two transmitted rows and at least 95% of the
+current layout columns for those rows. Only an equal `LAST` in that block is a
+`REFRESH_REPEAT`; a changed or new value still fails closed as unconfirmed.
+
+`LAPS`, when present in the current source schema, remains the official lap
+count. When it is absent, the archive's capture counter and tyre age count only
+confirmed ledger events since the relevant capture/stint boundary; that local
+count is never presented as an official total. The horizontal coordinate of a
+`LAST` fact is the time that the table observation arrived, not an invented
+finish-crossing timestamp. `r_i` is an audit baseline, while tracker `t_p` or
+an explicit `LAPS` cell may attach a provider lap number to the same confirmed
+`LAST` source cell without replacing its duration.
 
 ## STATE interpretation contract
 

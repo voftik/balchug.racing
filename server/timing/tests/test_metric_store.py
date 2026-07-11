@@ -5,6 +5,7 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 from timing.db import connect, migrate
+from timing.normalization import OPEN_ENDED_TS_TIME, parse_ts_time
 from timing.metric_store import (
     MetricMaterializationResult,
     MetricSampleCandidate,
@@ -284,6 +285,61 @@ class MetricStoreTests(unittest.TestCase):
         )
         return frame_id, int(cursor.lastrowid)
 
+    def _insert_last_ledger_fact(self, cell_id, *, classification, linked_lap_id=None, reason=None):
+        """Seed an already-normalized LAST ledger fact for metric-store tests."""
+
+        row = self.connection.execute(
+            """
+            SELECT observation.source_heat_id,observation.participant_id,observation.layout_version_id,
+                   observation.source_message_id,observation.source_key,
+                   observation.source_change_ordinal,observation.observed_at_us,
+                   observation.value_text,message.handle,message.ordinal AS message_ordinal,
+                   frame.id AS frame_id
+            FROM participant_result_cell_observations AS observation
+            JOIN feed_messages AS message ON message.id = observation.source_message_id
+            JOIN feed_frames AS frame ON frame.id = message.frame_id
+            WHERE observation.id = ?
+            """,
+            (cell_id,),
+        ).fetchone()
+        self.assertIsNotNone(row)
+        duration_us = parse_ts_time(row["value_text"])
+        duration_ms = (
+            duration_us // 1_000
+            if duration_us is not None and 1_000_000 <= duration_us < OPEN_ENDED_TS_TIME
+            else None
+        )
+        self.connection.execute(
+            """
+            INSERT INTO result_last_cell_ledger(
+              source_cell_observation_id,source_heat_id,participant_id,layout_version_id,
+              source_frame_id,source_message_id,source_message_ordinal,source_key,
+              source_change_ordinal,source_handle,observed_at_us,duration_ms,
+              classification,classification_reason,predecessor_source_cell_observation_id,
+              schema_baseline_id,linked_lap_id,sectors_json,
+              sectors_source_cell_observation_ids_json,created_at_us
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL,?,NULL,NULL,?)
+            """,
+            (
+                cell_id,
+                row["source_heat_id"],
+                row["participant_id"],
+                row["layout_version_id"],
+                row["frame_id"],
+                row["source_message_id"],
+                row["message_ordinal"],
+                row["source_key"],
+                row["source_change_ordinal"],
+                row["handle"],
+                row["observed_at_us"],
+                duration_ms,
+                classification,
+                reason or f"test:{classification.lower()}",
+                linked_lap_id,
+                row["observed_at_us"],
+            ),
+        )
+
     def _seed_no_laps_last_history(self):
         """Seed r_i/r_c cells without using the normalizer under test elsewhere."""
 
@@ -409,6 +465,12 @@ class MetricStoreTests(unittest.TestCase):
             """,
             (self.source_heat_id, tracker_id),
         )
+        self._insert_last_ledger_fact(raw_ids[0], classification="CONFIRMED_LAP")
+        self._insert_last_ledger_fact(
+            raw_ids[1], classification="CONFIRMED_LAP", linked_lap_id="duplicate-r-c"
+        )
+        self._insert_last_ledger_fact(raw_ids[2], classification="INVALID")
+        self._insert_last_ledger_fact(raw_ids[3], classification="UNCONFIRMED")
         return raw_ids
 
     def _seed_explicit_lap_after_no_laps(self):
@@ -462,6 +524,9 @@ class MetricStoreTests(unittest.TestCase):
             ) VALUES ('explicit-after-raw',?,'ours',100,8000000,106900,NULL,'GREEN',0,0,0,1,?,'raw:107',8000000,NULL,?,'RESULT_GRID_LAST')
             """,
             (self.source_heat_id, message_id, duration_cell_id),
+        )
+        self._insert_last_ledger_fact(
+            duration_cell_id, classification="CONFIRMED_LAP", linked_lap_id="explicit-after-raw"
         )
 
     def test_loads_immutable_normalized_facts_and_automatic_class_scope(self):
@@ -618,22 +683,22 @@ class MetricStoreTests(unittest.TestCase):
         self.assertEqual(state.diff_interval_fact.target_participant_id, "leader")
         self.assertEqual(state.diff_interval_fact.relation_kind, "OVERALL_AHEAD")
 
-    def test_loads_each_raw_r_c_last_without_inventing_a_provider_lap_number(self):
+    def test_loads_only_confirmed_last_ledger_facts_without_inventing_a_provider_lap_number(self):
         raw_ids = self._seed_no_laps_last_history()
         self.connection.commit()
 
         ours = load_heat_metric_input(self.connection, self.source_heat_id).our_participant
         raw_laps = [lap for lap in ours.laps if lap.timing_event_id is not None]
 
-        # r_i is only a reconnect/baseline snapshot.  The sentinel is not a
-        # lap time.  Every valid r_c LAST remains an independent raw sample,
-        # including an equal consecutive duration.
-        self.assertEqual([lap.timing_event_id for lap in raw_laps], [raw_ids[0], raw_ids[1], raw_ids[3]])
-        self.assertEqual([lap.lap_number for lap in raw_laps], [None, None, None])
-        self.assertEqual([lap.capture_sequence for lap in raw_laps], [1, 2, 3])
-        self.assertEqual([lap.duration_ms for lap in raw_laps], [107_500, 107_400, 107_400])
-        self.assertEqual([lap.is_clean for lap in raw_laps], [False, True, False])
-        self.assertEqual(ours.latest_timing_event_id, raw_ids[3])
+        # The invalid sentinel and an equal sparse r_c value remain raw audit
+        # facts but cannot advance timing metrics. The source-linked row keeps
+        # its exact local tracker number without promoting it to provider LAPS.
+        self.assertEqual([lap.timing_event_id for lap in raw_laps], [raw_ids[0], raw_ids[1]])
+        self.assertEqual([lap.lap_number for lap in raw_laps], [None, 97])
+        self.assertEqual([lap.capture_sequence for lap in raw_laps], [1, 2])
+        self.assertEqual([lap.duration_ms for lap in raw_laps], [107_500, 107_400])
+        self.assertEqual([lap.is_clean for lap in raw_laps], [False, True])
+        self.assertEqual(ours.latest_timing_event_id, raw_ids[1])
         # Tracker rows stay in the durable chronology for tyre age, but they
         # cannot dilute timing counts once raw no-LAPS LAST facts exist.
         ineligible = [lap for lap in ours.laps if not lap.timing_eligible]
@@ -652,8 +717,8 @@ class MetricStoreTests(unittest.TestCase):
         self.assertEqual(explicit.duration_ms, 106_900)
         self.assertTrue(any(lap.timing_event_id is not None for lap in ours.laps))
 
-    def test_ambiguous_last_layout_is_not_a_raw_timing_source(self):
-        self._seed_no_laps_last_history()
+    def test_metric_store_uses_immutable_ledger_after_a_later_layout_mutation(self):
+        raw_ids = self._seed_no_laps_last_history()
         layout_id = self.connection.execute(
             "SELECT id FROM result_layout_versions WHERE layout_fingerprint = 'raw-no-laps'"
         ).fetchone()[0]
@@ -669,7 +734,38 @@ class MetricStoreTests(unittest.TestCase):
         self.connection.commit()
 
         ours = load_heat_metric_input(self.connection, self.source_heat_id).our_participant
-        self.assertEqual([lap for lap in ours.laps if lap.timing_event_id is not None], [])
+        self.assertEqual(
+            [lap.timing_event_id for lap in ours.laps if lap.timing_event_id is not None],
+            [raw_ids[0], raw_ids[1]],
+        )
+
+    def test_no_laps_stint_age_counts_confirmed_last_cells_once(self):
+        raw_ids = self._seed_no_laps_last_history()
+        # This fixture's final r_c is otherwise an ambiguous equal value. Make
+        # it an already-classified direct source event to isolate the metric
+        # store contract: it must count the ledger fact, not the tracker row.
+        self.connection.execute(
+            """
+            UPDATE result_last_cell_ledger
+            SET classification = 'CONFIRMED_LAP', classification_reason = 'test:direct_changed'
+            WHERE source_cell_observation_id = ?
+            """,
+            (raw_ids[3],),
+        )
+        self.connection.execute(
+            """
+            UPDATE participant_state_current
+            SET laps = NULL
+            WHERE source_heat_id = ? AND participant_id = 'ours'
+            """,
+            (self.source_heat_id,),
+        )
+        self.connection.commit()
+
+        ours = load_heat_metric_input(self.connection, self.source_heat_id).our_participant
+        active = ours.active_tire_stint
+        self.assertEqual(active.lap_count_basis, "CAPTURE_LAST")
+        self.assertEqual(active.completed_laps, 1)
 
     def test_overlapping_non_green_flag_rejects_raw_last_clean_classification(self):
         self.assertFalse(
@@ -717,12 +813,13 @@ class MetricStoreTests(unittest.TestCase):
                 (self.source_heat_id, layout_id, message_id),
             ).fetchone()[0]
         )
+        self._insert_last_ledger_fact(cell_id, classification="UNCONFIRMED")
         self.connection.commit()
 
         ours = load_heat_metric_input(self.connection, self.source_heat_id).our_participant
         self.assertNotIn(cell_id, [lap.timing_event_id for lap in ours.laps if lap.timing_event_id is not None])
 
-    def test_no_laps_r_c_requires_a_last_snapshot_for_the_same_participant(self):
+    def test_connection_baseline_allows_a_late_participant_without_personal_last_snapshot(self):
         self._seed_no_laps_last_history()
         layout_id = self.connection.execute(
             "SELECT id FROM result_layout_versions WHERE layout_fingerprint = 'raw-no-laps'"
@@ -760,20 +857,24 @@ class MetricStoreTests(unittest.TestCase):
             handle="r_c",
             connection_id="other-connection",
         )
-        self.connection.execute(
+        cell_id = int(
+            self.connection.execute(
             """
             INSERT INTO participant_result_cell_observations(
               source_heat_id,participant_id,layout_version_id,provider_row_index,column_index,
               raw_value_json,value_text,source_message_id,source_key,source_change_ordinal,
               observed_at_us,created_at_us
             ) VALUES (?,'ours',?,0,0,'["106900000"]','106900000',?,'raw:other-connection',0,7000000,7000000)
+            RETURNING id
             """,
             (self.source_heat_id, layout_id, message_id),
+            ).fetchone()[0]
         )
+        self._insert_last_ledger_fact(cell_id, classification="CONFIRMED_LAP")
         self.connection.commit()
 
         ours = load_heat_metric_input(self.connection, self.source_heat_id).our_participant
-        self.assertNotIn(106_900, [lap.duration_ms for lap in ours.laps if lap.timing_event_id is not None])
+        self.assertIn(cell_id, [lap.timing_event_id for lap in ours.laps if lap.timing_event_id is not None])
 
     def test_rejects_missing_heat(self):
         with self.assertRaisesRegex(MetricStoreError, "does not exist"):

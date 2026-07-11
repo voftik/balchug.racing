@@ -312,11 +312,15 @@
     var entries = [];
     var observedCells = Object.create(null);
     (Array.isArray(laps) ? laps : []).forEach(function (lap, index) {
-      var atUs = numericValue(lap && lap.board_observed_at_us);
+      var atUs = numericValue(lap && lap.capture_at_us);
+      if (atUs === null) atUs = numericValue(lap && lap.board_observed_at_us);
       if (atUs === null) atUs = numericValue(lap && lap.completed_at_us);
       var duration = numericValue(lap && lap.duration_ms);
       var timelineKind = lap && lap.timeline_kind || "confirmed_lap";
-      if (atUs === null || duration === null || duration < 0 || timelineKind === "snapshot_baseline") return;
+      // Only a persisted LAST event classified as confirmed is a captured lap.
+      // A REFRESH_REPEAT table repaint, regardless of its transport handle,
+      // and an unconfirmed observation cannot advance the counter or axis.
+      if (atUs === null || duration === null || duration < 0 || timelineKind !== "confirmed_lap") return;
       var source = asObject(lap && lap.source);
       var observationId = numericValue(source.cell_observation_id);
       // A source cell is one persisted table observation. Do not let a
@@ -340,6 +344,12 @@
   }
 
   function captureRecordedLaps() {
+    var manifest = asObject(state.manifest);
+    // New manifests carry this synchronously so the first player frame and
+    // lower lap axis do not depend on the later comparison request. An empty
+    // array is authoritative: do not replace it with a less strict legacy
+    // raw table series.
+    if (Array.isArray(manifest.capture_lap_events)) return manifest.capture_lap_events;
     var data = comparisonVisualData() || state.comparisonCache.all;
     var lapSeries = asObject(data && data.lap_series);
     return Array.isArray(lapSeries.ours_raw) ? lapSeries.ours_raw : null;
@@ -1200,7 +1210,9 @@
     var lapsValue = visibleLaps;
     if (lapCountScope === "capture_tracker") {
       var capturedLapCount = captureRecordedLapCount(captureRecordedLaps(), state.atUs);
-      lapsValue = capturedLapCount === null ? "—" : formatLapCount(capturedLapCount) + " с начала записи";
+      // Old manifests have no synchronous event list; zero is clearer than a
+      // transient dash while their strictly filtered comparison fallback loads.
+      lapsValue = formatLapCount(capturedLapCount === null ? 0 : capturedLapCount);
     }
     var classLeaderRelation = archiveRelationPresentation(effectiveAtUs, snapshot, "class_leader");
     var aheadRelation = archiveRelationPresentation(effectiveAtUs, snapshot, "class_ahead");
@@ -1219,7 +1231,7 @@
     var values = [
       { id: "pos", label: "POS", tooltip: "Абсолютная позиция BALCHUG Racing в момент выбранного среза", value: session.position_overall !== null && session.position_overall !== undefined ? "P" + session.position_overall : oursState.position_overall !== null && oursState.position_overall !== undefined ? "P" + oursState.position_overall : "—" },
       { id: "class_leader_gap", label: "До лидера класса", tooltip: classLeaderRelation.tooltip, value: classLeaderRelation.value },
-      { id: "laps", label: lapCountScope === "capture_tracker" ? "Круги в записи" : "Круги", tooltip: lapCountScope === "capture_tracker" ? "Количество новых значений LAST, зафиксированных после начала записи" : "Количество кругов по данным табло", value: lapsValue },
+      { id: "laps", label: lapCountScope === "capture_tracker" ? "Круги в записи" : "Круги", tooltip: lapCountScope === "capture_tracker" ? "Количество подтверждённых событий LAST с начала записи. Полные снимки таблицы и неподтверждённые ячейки не увеличивают счётчик." : "Количество кругов по данным табло", value: lapsValue },
       { id: "state", label: "Состояние", tooltip: "Последнее подтверждённое состояние экипажа по полю STATE", value: firstDefined(session.current_state, oursState.state_kind, oursState.state) },
       { id: "last", label: "Последний по табло", tooltip: "Последнее значение LAST, переданное табло; это не расчёт из timestamp", value: formatLap(firstDefined(session.last_lap_ms, oursState.last_lap_ms)) },
       { id: "last_to_best", label: "К лучшему кругу", tooltip: "Разница последнего времени LAST и лучшего времени BEST по табло", value: formatGap(

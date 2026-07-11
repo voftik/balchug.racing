@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Any, Iterator
 
 from .config import now_us
-from .normalization import OPEN_ENDED_TS_TIME, parse_result_state, parse_ts_time
+from .normalization import parse_result_state
 from .stream_events import StreamEventCandidate, StreamEventError, append_stream_events
 
 
@@ -193,6 +193,10 @@ class LapInput:
     # that the ordinal is a provider lap number.
     timing_event_id: int | None = None
     capture_sequence: int | None = None
+    # The exact result-table observation time. A linked tracker completion may
+    # have a different chronology boundary, but capture-local tyre ageing uses
+    # this ledger time so one LAST cell advances a stint exactly once.
+    capture_at_us: int | None = None
     # Tracker passings still drive tyre/stint chronology when a result grid
     # omits LAPS. They are not timing evidence unless a same-frame LAST fact
     # proves their duration. Keep that distinction per row so a later layout
@@ -229,6 +233,10 @@ class TireStintInput:
     completed_laps: int
     source_message_id: int | None
     source_key: str
+    # ``CAPTURE_LAST`` counts confirmed source LAST facts inside this stint
+    # when the current table has no official LAPS column. It is intentionally
+    # local to the capture and is never promoted to an official total.
+    lap_count_basis: str = "SOURCE_GRID"
 
 
 @dataclass(frozen=True)
@@ -439,17 +447,27 @@ def _int(value: Any) -> int | None:
 
 @dataclass(frozen=True)
 class _ResultLastFact:
-    """One durable r_c LAST cell from a layout without the LAPS column."""
+    """One ledger-confirmed result-grid LAST timing event."""
 
     timing_event_id: int
     participant_id: str
-    value_text: str | None
+    duration_ms: int
     source_message_id: int
     source_key: str
     source_change_ordinal: int
     observed_at_us: int
     frame_id: int
     message_ordinal: int
+    sectors_json: str | None
+    linked_lap_id: str | None
+    linked_lap_number: int | None
+    linked_completed_at_us: int | None
+    linked_duration_ms: int | None
+    linked_flag: str | None
+    linked_is_in_lap: bool | None
+    linked_is_out_lap: bool | None
+    linked_crosses_pit: bool | None
+    linked_is_clean: bool | None
 
 
 @dataclass(frozen=True)
@@ -460,15 +478,6 @@ class _ResultStateFact:
     message_ordinal: int
     source_change_ordinal: int
     cell_id: int
-
-
-def _result_last_duration_ms(value: Any) -> int | None:
-    """Parse only a real Time Service LAST duration, never a sentinel."""
-
-    source_us = parse_ts_time(value)
-    if source_us is None or not 1_000_000 <= source_us < OPEN_ENDED_TS_TIME:
-        return None
-    return source_us // 1_000
 
 
 def _interval_overlaps(
@@ -485,81 +494,66 @@ def _interval_overlaps(
 def _load_result_last_facts(
     connection: sqlite3.Connection, *, source_heat_id: int
 ) -> tuple[_ResultLastFact, ...]:
-    """Read source LAST deltas without converting reconnect snapshots to laps.
+    """Read only the normalizer's confirmed LAST-cell ledger facts.
 
-    The raw-cell table is already immutable and idempotent.  ``r_i`` is a
-    snapshot/reconnect baseline, so only an explicit ``r_c`` cell is evidence
-    of a new no-LAPS timing event.  A valid preceding r_i for the same layout
-    is required to keep schema-pending deltas out of tactical calculations.
+    The ledger is deliberately the sole admission gate. It accepts late
+    entrants after a connection-level schema baseline, preserves every raw
+    cell for audit, and excludes full-grid refresh repeats before metrics see
+    them. This reader must not recreate that classification from a materialized
+    result row or a personal reconnect snapshot.
     """
 
     rows = connection.execute(
         """
-        WITH initial_last_snapshots AS MATERIALIZED (
-          SELECT snapshot_cell.participant_id,snapshot_cell.layout_version_id,
-                 snapshot_frame.ingest_connection_id,snapshot_frame.id AS frame_id,
-                 snapshot_message.ordinal AS message_ordinal
-          FROM result_column_definitions AS snapshot_definition
-          CROSS JOIN participant_result_cell_observations AS snapshot_cell
-          JOIN feed_messages AS snapshot_message ON snapshot_message.id = snapshot_cell.source_message_id
-          JOIN feed_frames AS snapshot_frame ON snapshot_frame.id = snapshot_message.frame_id
-          WHERE snapshot_definition.canonical_key = 'last_lap'
-            AND snapshot_cell.source_heat_id = ?
-            AND snapshot_cell.participant_id IS NOT NULL
-            AND snapshot_cell.layout_version_id = snapshot_definition.layout_version_id
-            AND snapshot_cell.column_index = snapshot_definition.column_index
-            AND snapshot_message.handle = 'r_i'
-        )
-        SELECT DISTINCT observation.id AS timing_event_id,observation.participant_id,observation.value_text,
-               observation.source_message_id,observation.source_key,observation.source_change_ordinal,
-               observation.observed_at_us,frame.id AS frame_id,message.ordinal AS message_ordinal
-        FROM result_column_definitions AS definition
-        CROSS JOIN participant_result_cell_observations AS observation
-        JOIN feed_messages AS message ON message.id = observation.source_message_id
-        JOIN feed_frames AS frame ON frame.id = message.frame_id
-        JOIN initial_last_snapshots AS snapshot
-          ON snapshot.participant_id = observation.participant_id
-         AND snapshot.layout_version_id = observation.layout_version_id
-         AND snapshot.ingest_connection_id = frame.ingest_connection_id
-         AND (
-           snapshot.frame_id < frame.id
-           OR (snapshot.frame_id = frame.id AND snapshot.message_ordinal < message.ordinal)
-         )
-        WHERE definition.canonical_key = 'last_lap'
-          AND observation.source_heat_id = ?
-          AND observation.participant_id IS NOT NULL
-          AND observation.layout_version_id = definition.layout_version_id
-          AND observation.column_index = definition.column_index
-          AND message.handle = 'r_c'
-          AND NOT EXISTS (
-            SELECT 1
-            FROM result_column_definitions AS laps_definition
-            WHERE laps_definition.layout_version_id = observation.layout_version_id
-              AND laps_definition.canonical_key = 'laps'
-          )
-          AND NOT EXISTS (
-            SELECT 1
-            FROM result_column_definitions AS duplicate_last
-            WHERE duplicate_last.layout_version_id = observation.layout_version_id
-              AND duplicate_last.canonical_key = 'last_lap'
-              AND duplicate_last.column_index <> observation.column_index
-          )
-        ORDER BY observation.participant_id,frame.id,message.ordinal,
-                 observation.source_change_ordinal,observation.id
+        SELECT ledger.source_cell_observation_id AS timing_event_id,
+               ledger.participant_id,ledger.duration_ms,
+               ledger.source_message_id,ledger.source_key,
+               ledger.source_change_ordinal,ledger.observed_at_us,
+               ledger.source_frame_id AS frame_id,
+               ledger.source_message_ordinal AS message_ordinal,
+               ledger.sectors_json,ledger.linked_lap_id,
+               lap.lap_number AS linked_lap_number,
+               lap.completed_at_us AS linked_completed_at_us,
+               lap.duration_ms AS linked_duration_ms,
+               lap.flag AS linked_flag,
+               lap.is_in_lap AS linked_is_in_lap,
+               lap.is_out_lap AS linked_is_out_lap,
+               lap.crosses_pit AS linked_crosses_pit,
+               lap.is_clean AS linked_is_clean
+        FROM result_last_cell_ledger AS ledger
+        LEFT JOIN laps AS lap ON lap.id = ledger.linked_lap_id
+        WHERE ledger.source_heat_id = ?
+          AND ledger.participant_id IS NOT NULL
+          AND ledger.source_handle = 'r_c'
+          AND ledger.classification = 'CONFIRMED_LAP'
+          AND ledger.duration_ms IS NOT NULL AND ledger.duration_ms > 0
+        ORDER BY ledger.participant_id,ledger.source_frame_id,
+                 ledger.source_message_ordinal,ledger.source_change_ordinal,
+                 ledger.source_cell_observation_id
         """,
-        (source_heat_id, source_heat_id),
+        (source_heat_id,),
     ).fetchall()
     return tuple(
         _ResultLastFact(
             timing_event_id=int(row["timing_event_id"]),
             participant_id=row["participant_id"],
-            value_text=row["value_text"],
+            duration_ms=int(row["duration_ms"]),
             source_message_id=int(row["source_message_id"]),
             source_key=row["source_key"],
             source_change_ordinal=int(row["source_change_ordinal"]),
             observed_at_us=int(row["observed_at_us"]),
             frame_id=int(row["frame_id"]),
             message_ordinal=int(row["message_ordinal"]),
+            sectors_json=row["sectors_json"],
+            linked_lap_id=row["linked_lap_id"],
+            linked_lap_number=_int(row["linked_lap_number"]),
+            linked_completed_at_us=_int(row["linked_completed_at_us"]),
+            linked_duration_ms=_int(row["linked_duration_ms"]),
+            linked_flag=row["linked_flag"],
+            linked_is_in_lap=(bool(row["linked_is_in_lap"]) if row["linked_is_in_lap"] is not None else None),
+            linked_is_out_lap=(bool(row["linked_is_out_lap"]) if row["linked_is_out_lap"] is not None else None),
+            linked_crosses_pit=(bool(row["linked_crosses_pit"]) if row["linked_crosses_pit"] is not None else None),
+            linked_is_clean=(bool(row["linked_is_clean"]) if row["linked_is_clean"] is not None else None),
         )
         for row in rows
     )
@@ -674,7 +668,7 @@ def _load_raw_result_last_laps(
     source_heat_id: int,
     pits_by_participant: Mapping[str, Sequence[PitStopInput]],
 ) -> tuple[dict[str, list[LapInput]], dict[str, int], set[int]]:
-    """Build no-LAPS timing inputs directly from immutable r_c LAST cells."""
+    """Build timing inputs from the authoritative confirmed LAST ledger."""
 
     facts = _load_result_last_facts(connection, source_heat_id=source_heat_id)
     state_by_participant = _load_result_state_facts(connection, source_heat_id=source_heat_id)
@@ -706,9 +700,7 @@ def _load_raw_result_last_laps(
     current_state_kind: dict[str, str | None] = {}
 
     for event in facts:
-        duration_ms = _result_last_duration_ms(event.value_text)
-        if duration_ms is None:
-            continue
+        duration_ms = event.duration_ms
         participant_id = event.participant_id
         previous = previous_at_us.get(participant_id)
         state_facts = state_by_participant.get(participant_id, ())
@@ -722,35 +714,51 @@ def _load_raw_result_last_laps(
             index += 1
         state_index[participant_id] = index
         state_kind = current_state_kind.get(participant_id)
-        is_in_lap = state_kind == "IN_PIT"
-        is_out_lap = state_kind == "OUT_LAP"
-        flag = _flag_at(periods, observed_at_us=event.observed_at_us)
-        crosses_pit = is_in_lap
-        has_gap = False
-        if previous is not None:
-            crosses_pit = crosses_pit or any(
-                stop.completed
-                and _interval_overlaps(previous, event.observed_at_us, stop.entered_at_us, stop.exited_at_us)
-                for stop in pits_by_participant.get(participant_id, ())
-            )
-            has_gap = any(
-                _interval_overlaps(previous, event.observed_at_us, gap_started_at_us, gap_ended_at_us)
-                for gap_started_at_us, gap_ended_at_us in gaps
-            )
-        is_clean = bool(
-            previous is not None
-            and state_kind == "ON_TRACK"
-            and not crosses_pit
-            and not has_gap
-            and _green_covers_interval(periods, started_at_us=previous, ended_at_us=event.observed_at_us)
-        )
         capture_sequence[participant_id] += 1
+        linked_duration_matches = (
+            event.linked_lap_id is not None
+            and event.linked_duration_ms == duration_ms
+            and event.linked_completed_at_us is not None
+        )
+        if linked_duration_matches:
+            lap_number = event.linked_lap_number
+            completed_at_us = event.linked_completed_at_us
+            flag = event.linked_flag
+            is_in_lap = bool(event.linked_is_in_lap)
+            is_out_lap = bool(event.linked_is_out_lap)
+            crosses_pit = bool(event.linked_crosses_pit)
+            is_clean = bool(event.linked_is_clean)
+        else:
+            lap_number = None
+            completed_at_us = event.observed_at_us
+            is_in_lap = state_kind == "IN_PIT"
+            is_out_lap = state_kind == "OUT_LAP"
+            flag = _flag_at(periods, observed_at_us=event.observed_at_us)
+            crosses_pit = is_in_lap
+            has_gap = False
+            if previous is not None:
+                crosses_pit = crosses_pit or any(
+                    stop.completed
+                    and _interval_overlaps(previous, event.observed_at_us, stop.entered_at_us, stop.exited_at_us)
+                    for stop in pits_by_participant.get(participant_id, ())
+                )
+                has_gap = any(
+                    _interval_overlaps(previous, event.observed_at_us, gap_started_at_us, gap_ended_at_us)
+                    for gap_started_at_us, gap_ended_at_us in gaps
+                )
+            is_clean = bool(
+                previous is not None
+                and state_kind == "ON_TRACK"
+                and not crosses_pit
+                and not has_gap
+                and _green_covers_interval(periods, started_at_us=previous, ended_at_us=event.observed_at_us)
+            )
         grouped[participant_id].append(
             LapInput(
-                lap_number=None,
-                completed_at_us=event.observed_at_us,
+                lap_number=lap_number,
+                completed_at_us=completed_at_us,
                 duration_ms=duration_ms,
-                sectors_json=None,
+                sectors_json=event.sectors_json,
                 flag=flag,
                 is_in_lap=is_in_lap,
                 is_out_lap=is_out_lap,
@@ -760,6 +768,7 @@ def _load_raw_result_last_laps(
                 source_key=event.source_key,
                 timing_event_id=event.timing_event_id,
                 capture_sequence=capture_sequence[participant_id],
+                capture_at_us=event.observed_at_us,
                 timing_eligible=True,
                 source_frame_id=event.frame_id,
                 source_message_ordinal=event.message_ordinal,
@@ -1150,6 +1159,10 @@ def load_heat_metric_input(connection: sqlite3.Connection, source_heat_id: int) 
         for participant_id, raw_laps in raw_laps_by_participant.items():
             laps_by_participant[participant_id].extend(raw_laps)
 
+        source_grid_laps = {
+            row["participant_id"]: _int(row["state_laps"]) is not None
+            for row in participant_rows
+        }
         stints_by_participant: dict[str, list[TireStintInput]] = defaultdict(list)
         for row in connection.execute(
             """
@@ -1161,16 +1174,35 @@ def load_heat_metric_input(connection: sqlite3.Connection, source_heat_id: int) 
             """,
             (source_heat_id,),
         ):
+            participant_id = row["participant_id"]
+            started_at_us = int(row["started_at_us"])
+            ended_at_us = _int(row["ended_at_us"])
+            capture_events = raw_laps_by_participant.get(participant_id, ())
+            capture_lap_count = sum(
+                1
+                for lap in capture_events
+                if lap.capture_at_us is not None
+                and lap.capture_at_us >= started_at_us
+                and (ended_at_us is None or lap.capture_at_us < ended_at_us)
+            )
+            capture_basis = not source_grid_laps.get(participant_id, False) and bool(capture_events)
             stints_by_participant[row["participant_id"]].append(
                 TireStintInput(
                     stint_number=int(row["stint_number"]),
-                    started_at_us=int(row["started_at_us"]),
-                    ended_at_us=_int(row["ended_at_us"]),
+                    started_at_us=started_at_us,
+                    ended_at_us=ended_at_us,
                     started_lap=_int(row["started_lap"]),
                     ended_lap=_int(row["ended_lap"]),
-                    completed_laps=int(row["completed_laps"]),
+                    completed_laps=capture_lap_count if capture_basis else int(row["completed_laps"]),
                     source_message_id=_int(row["source_message_id"]),
                     source_key=row["source_key"],
+                    lap_count_basis=(
+                        "CAPTURE_LAST"
+                        if capture_basis
+                        else "SOURCE_GRID"
+                        if source_grid_laps.get(participant_id, False)
+                        else "TRACKER"
+                    ),
                 )
             )
 

@@ -278,6 +278,22 @@ class RawIngestStore:
             raise IngestStoreError(f"Raw frame not found: {frame.source_key}")
         if row["decode_state"] == "failed":
             return ()
+        if row["decode_state"] == "decoded":
+            # The immutable decoded messages are the replay contract. A raw
+            # SignalR frame can depend on a compression dictionary that no
+            # longer exists in a later process, so re-decoding it here could
+            # silently return fewer messages than the ones committed during
+            # live ingest (notably the initial r_i layout snapshot).
+            existing = self.connection.execute(
+                "SELECT ordinal,handle,args_json,compressed FROM feed_messages WHERE frame_id = ? ORDER BY ordinal",
+                (frame.id,),
+            ).fetchall()
+            return tuple(
+                SignalRMessage(
+                    item["handle"], tuple(json.loads(item["args_json"])), bool(item["compressed"])
+                )
+                for item in existing
+            )
         raw_payload = bytes(row["raw_payload"])
         try:
             raw_text = raw_payload.decode("utf-8")

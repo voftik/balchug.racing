@@ -93,6 +93,19 @@ class IntervalSourceFact:
 
 
 @dataclass(frozen=True)
+class ResultSchemaBaseline:
+    """One accepted ``r_i`` schema snapshot for a feed connection."""
+
+    id: int
+    connection_id: str
+    layout_version_id: int
+    layout_generation: int
+    source_frame_id: int
+    source_message_id: int
+    source_message_ordinal: int
+
+
+@dataclass(frozen=True)
 class PendingPitEvent:
     """A source STATE/PIT event applied after every handle in one frame."""
 
@@ -309,6 +322,11 @@ class TimingNormalizer:
         self._provider_heat_start_ts: int | None = None
         self._finish_sector_ids: set[int] = set()
         self._pending_pit_events: list[PendingPitEvent] = []
+        # A result layout is global, but an ``r_c`` is only trustworthy after
+        # this specific ingest connection has supplied its own ``r_i``.
+        self._schema_baselines: dict[str, list[ResultSchemaBaseline]] = {}
+        self._pending_last_schema_baseline_ids: dict[int, int | None] = {}
+        self._pending_last_full_grid_refresh: dict[int, bool] = {}
         self._primed = False
         self._metric_runner = TimingMetricRunner()
 
@@ -332,6 +350,8 @@ class TimingNormalizer:
         if not contexts:
             return
         self._pending_pit_events = []
+        self._pending_last_schema_baseline_ids = {}
+        self._pending_last_full_grid_refresh = {}
         try:
             with _write_transaction(connection):
                 self._ensure_heat(connection, contexts[0].received_at_us)
@@ -347,8 +367,11 @@ class TimingNormalizer:
                 # SignalR frame. Apply source pit boundaries only after tracker
                 # chronology is complete, so tyre/stint ledgers are invariant.
                 self._reconcile_frame_pit_events(connection)
+                self._finalize_last_cell_ledger(connection, frame.id)
         finally:
             self._pending_pit_events = []
+            self._pending_last_schema_baseline_ids = {}
+            self._pending_last_full_grid_refresh = {}
         # Derived tactical state is deliberately downstream of the committed
         # normalized facts. A retry reuses the same frame time/source key and
         # is idempotent in metric_current and metric_samples.
@@ -499,6 +522,7 @@ class TimingNormalizer:
                     self.grid = ResultGrid()
                     self.statistics = {}
                     self._layout_id = None
+                    self._schema_baselines.clear()
                     self._finish_sector_ids.clear()
                     old_flag = None
                 if next_start is not None:
@@ -514,6 +538,9 @@ class TimingNormalizer:
         if handle == "r_l":
             self.grid.set_layout(payload)
             self._layout_id = None
+            # A provider layout announcement invalidates every connection's
+            # preceding snapshot until each connection sends a fresh ``r_i``.
+            self._schema_baselines.clear()
             if write:
                 self._ensure_layout(connection, context)
             return
@@ -521,7 +548,14 @@ class TimingNormalizer:
             self.grid.apply_snapshot(payload)
             self._layout_id = None
             if write:
-                self._write_result_changes(connection, context, _payload_mapping(payload).get("r") if _payload_mapping(payload) else None)
+                layout_id = self._write_result_changes(
+                    connection,
+                    context,
+                    _payload_mapping(payload).get("r") if _payload_mapping(payload) else None,
+                )
+                self._record_schema_baseline(connection, context, layout_id)
+            else:
+                self._restore_schema_baseline(connection, context)
             return
         if handle == "r_c":
             self.grid.apply_changes(payload)
@@ -589,6 +623,7 @@ class TimingNormalizer:
             (self.analysis_session_id, generation, context.received_at_us),
         )
         self._heat_id = int(cursor.lastrowid)
+        self._schema_baselines.clear()
 
     def _observe_clock(self, connection: sqlite3.Connection, context: FrameMessage, *, write: bool) -> None:
         clock = self._clock(context.connection_id)
@@ -721,10 +756,432 @@ class TimingNormalizer:
             )
         return self._layout_id
 
-    def _write_result_changes(self, connection: sqlite3.Connection, context: FrameMessage, changes: Any) -> None:
+    @staticmethod
+    def _baseline_sort_key(baseline: ResultSchemaBaseline) -> tuple[int, int, int]:
+        return (baseline.source_frame_id, baseline.source_message_ordinal, baseline.id)
+
+    def _remember_schema_baseline(self, baseline: ResultSchemaBaseline) -> None:
+        records = self._schema_baselines.setdefault(baseline.connection_id, [])
+        for existing in records:
+            if existing.id == baseline.id:
+                return
+        records.append(baseline)
+        records.sort(key=self._baseline_sort_key)
+
+    def _record_schema_baseline(
+        self,
+        connection: sqlite3.Connection,
+        context: FrameMessage,
+        layout_id: int | None,
+    ) -> None:
+        """Persist an accepted r_i without requiring a participant LAST cell."""
+
+        if layout_id is None or not self.grid.schema_ready:
+            return
+        frame = connection.execute(
+            "SELECT frame_id FROM feed_messages WHERE id = ?", (context.id,)
+        ).fetchone()
+        if frame is None:
+            raise NormalizerError("Schema baseline source message is missing")
+        generation = self.grid.layout_generation
+        _insert_ignore(
+            connection,
+            "result_schema_baselines",
+            {
+                "source_heat_id": self.heat_id,
+                "ingest_connection_id": context.connection_id,
+                "layout_version_id": layout_id,
+                "layout_generation": generation,
+                "source_frame_id": int(frame["frame_id"]),
+                "source_message_id": context.id,
+                "source_message_ordinal": context.ordinal,
+                "source_key": context.source_key,
+                "observed_at_us": context.received_at_us,
+                "created_at_us": now_us(),
+            },
+        )
+        stored = connection.execute(
+            """
+            SELECT id,ingest_connection_id,layout_version_id,layout_generation,
+                   source_frame_id,source_message_id,source_message_ordinal
+            FROM result_schema_baselines WHERE source_message_id = ?
+            """,
+            (context.id,),
+        ).fetchone()
+        if stored is None:
+            raise NormalizerError("Schema baseline insert did not produce a row")
+        if (
+            stored["ingest_connection_id"] != context.connection_id
+            or int(stored["layout_version_id"]) != layout_id
+            or int(stored["layout_generation"]) != generation
+        ):
+            raise NormalizerError("Schema baseline conflicts with replayed source message")
+        self._remember_schema_baseline(
+            ResultSchemaBaseline(
+                id=int(stored["id"]),
+                connection_id=stored["ingest_connection_id"],
+                layout_version_id=int(stored["layout_version_id"]),
+                layout_generation=int(stored["layout_generation"]),
+                source_frame_id=int(stored["source_frame_id"]),
+                source_message_id=int(stored["source_message_id"]),
+                source_message_ordinal=int(stored["source_message_ordinal"]),
+            )
+        )
+
+    def _restore_schema_baseline(self, connection: sqlite3.Connection, context: FrameMessage) -> None:
+        """Restore runtime connection readiness while priming a restarted writer."""
+
+        row = connection.execute(
+            """
+            SELECT id,ingest_connection_id,layout_version_id,layout_generation,
+                   source_frame_id,source_message_id,source_message_ordinal
+            FROM result_schema_baselines WHERE source_message_id = ?
+            """,
+            (context.id,),
+        ).fetchone()
+        if row is None or not self.grid.schema_ready:
+            return
+        if int(row["layout_generation"]) != self.grid.layout_generation:
+            return
+        self._remember_schema_baseline(
+            ResultSchemaBaseline(
+                id=int(row["id"]),
+                connection_id=row["ingest_connection_id"],
+                layout_version_id=int(row["layout_version_id"]),
+                layout_generation=int(row["layout_generation"]),
+                source_frame_id=int(row["source_frame_id"]),
+                source_message_id=int(row["source_message_id"]),
+                source_message_ordinal=int(row["source_message_ordinal"]),
+            )
+        )
+
+    def _schema_baseline_at(
+        self,
+        connection: sqlite3.Connection,
+        context: FrameMessage,
+        layout_id: int,
+    ) -> ResultSchemaBaseline | None:
+        """Return the latest same-connection r_i strictly before ``context``."""
+
+        if not self.grid.schema_ready:
+            return None
+        frame = connection.execute(
+            "SELECT frame_id FROM feed_messages WHERE id = ?", (context.id,)
+        ).fetchone()
+        if frame is None:
+            raise NormalizerError("Result source message is missing")
+        source_frame_id = int(frame["frame_id"])
+        candidates = self._schema_baselines.get(context.connection_id, ())
+        for baseline in reversed(candidates):
+            if (
+                baseline.layout_version_id != layout_id
+                or baseline.layout_generation != self.grid.layout_generation
+            ):
+                continue
+            if baseline.source_frame_id < source_frame_id or (
+                baseline.source_frame_id == source_frame_id
+                and baseline.source_message_ordinal < context.ordinal
+            ):
+                return baseline
+        return None
+
+    def _capture_last_schema_context(
+        self,
+        connection: sqlite3.Connection,
+        context: FrameMessage,
+        layout_id: int,
+    ) -> None:
+        """Freeze per-cell readiness before later frame handles can change it."""
+
+        baseline = self._schema_baseline_at(connection, context, layout_id) if context.handle == "r_c" else None
+        message_cell_count = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM participant_result_cell_observations
+                WHERE source_heat_id = ? AND source_message_id = ? AND layout_version_id = ?
+                """,
+                (self.heat_id, context.id, layout_id),
+            ).fetchone()[0]
+        )
+        message_row_count = int(
+            connection.execute(
+                """
+                SELECT COUNT(DISTINCT provider_row_index)
+                FROM participant_result_cell_observations
+                WHERE source_heat_id = ? AND source_message_id = ? AND layout_version_id = ?
+                """,
+                (self.heat_id, context.id, layout_id),
+            ).fetchone()[0]
+        )
+        # A Time Service aggregate can refresh a complete visible row block
+        # while omitting rows that have not changed in that transmission. Its
+        # density must therefore be measured against the message's own rows,
+        # not every row retained in our sparse grid cache.
+        expected_grid_cells = message_row_count * len(self.grid.columns)
+        full_grid_refresh = bool(
+            context.handle == "r_c"
+            and message_row_count >= 2
+            and expected_grid_cells > 0
+            and message_cell_count * 100 >= expected_grid_cells * 95
+        )
+        rows = connection.execute(
+            """
+            SELECT observation.id
+            FROM participant_result_cell_observations AS observation
+            JOIN result_column_definitions AS definition
+              ON definition.layout_version_id = observation.layout_version_id
+             AND definition.column_index = observation.column_index
+            WHERE observation.source_heat_id = ?
+              AND observation.source_message_id = ?
+              AND definition.canonical_key = 'last_lap'
+            """,
+            (self.heat_id, context.id),
+        ).fetchall()
+        for row in rows:
+            self._pending_last_schema_baseline_ids.setdefault(
+                int(row["id"]), baseline.id if baseline is not None else None
+            )
+            self._pending_last_full_grid_refresh.setdefault(int(row["id"]), full_grid_refresh)
+
+    def _previous_canonical_last_cell(
+        self, connection: sqlite3.Connection, candidate: Mapping[str, Any]
+    ) -> sqlite3.Row | None:
+        """Find the preceding unambiguous visible LAST for one participant."""
+
+        participant_id = candidate.get("participant_id")
+        if not isinstance(participant_id, str):
+            return None
+        return connection.execute(
+            """
+            SELECT observation.id,observation.value_text
+            FROM participant_result_cell_observations AS observation
+            JOIN result_column_definitions AS definition
+              ON definition.layout_version_id = observation.layout_version_id
+             AND definition.column_index = observation.column_index
+            JOIN feed_messages AS message ON message.id = observation.source_message_id
+            WHERE observation.source_heat_id = ?
+              AND observation.participant_id = ?
+              AND definition.canonical_key = 'last_lap'
+              AND NOT EXISTS (
+                SELECT 1
+                FROM result_column_definitions AS duplicate_last
+                WHERE duplicate_last.layout_version_id = observation.layout_version_id
+                  AND duplicate_last.canonical_key = 'last_lap'
+                  AND duplicate_last.column_index <> observation.column_index
+              )
+              AND (
+                message.frame_id < ?
+                OR (message.frame_id = ? AND message.ordinal < ?)
+                OR (
+                  message.frame_id = ? AND message.ordinal = ?
+                  AND observation.source_change_ordinal < ?
+                )
+                OR (
+                  message.frame_id = ? AND message.ordinal = ?
+                  AND observation.source_change_ordinal = ? AND observation.id < ?
+                )
+              )
+            ORDER BY message.frame_id DESC,message.ordinal DESC,
+                     observation.source_change_ordinal DESC,observation.id DESC
+            LIMIT 1
+            """,
+            (
+                self.heat_id,
+                participant_id,
+                int(candidate["source_frame_id"]),
+                int(candidate["source_frame_id"]),
+                int(candidate["source_message_ordinal"]),
+                int(candidate["source_frame_id"]),
+                int(candidate["source_message_ordinal"]),
+                int(candidate["source_change_ordinal"]),
+                int(candidate["source_frame_id"]),
+                int(candidate["source_message_ordinal"]),
+                int(candidate["source_change_ordinal"]),
+                int(candidate["source_cell_observation_id"]),
+            ),
+        ).fetchone()
+
+    def _linked_lap_for_last_cell(
+        self, connection: sqlite3.Connection, source_cell_observation_id: int
+    ) -> sqlite3.Row | None:
+        """Return one exact source-linked lap; ambiguity stays unlinked."""
+
+        rows = connection.execute(
+            """
+            SELECT id,duration_ms,duration_source_kind,sectors_json,
+                   sectors_source_cell_observation_ids_json
+            FROM laps
+            WHERE source_heat_id = ?
+              AND duration_source_cell_observation_id = ?
+            ORDER BY id
+            LIMIT 2
+            """,
+            (self.heat_id, source_cell_observation_id),
+        ).fetchall()
+        return rows[0] if len(rows) == 1 else None
+
+    @staticmethod
+    def _participant_identity_is_resolved(candidate: Mapping[str, Any]) -> bool:
+        return bool(
+            candidate.get("participant_id")
+            and candidate.get("start_number_key")
+            and candidate.get("team_name_key")
+            and candidate.get("class_name_key")
+        )
+
+    @staticmethod
+    def _ledger_values_match(existing: sqlite3.Row, values: Mapping[str, Any]) -> bool:
+        return all(existing[column] == value for column, value in values.items() if column != "created_at_us")
+
+    def _write_last_cell_ledger(
+        self, connection: sqlite3.Connection, values: Mapping[str, Any]
+    ) -> None:
+        inserted = _insert_ignore(connection, "result_last_cell_ledger", values)
+        if inserted:
+            return
+        existing = connection.execute(
+            "SELECT * FROM result_last_cell_ledger WHERE source_cell_observation_id = ?",
+            (values["source_cell_observation_id"],),
+        ).fetchone()
+        if existing is None or not self._ledger_values_match(existing, values):
+            raise NormalizerError("LAST ledger conflicts with replayed source cell")
+
+    def _finalize_last_cell_ledger(self, connection: sqlite3.Connection, frame_id: int) -> None:
+        """Classify every canonical LAST cell after its frame is fully known."""
+
+        rows = connection.execute(
+            """
+            SELECT observation.id AS source_cell_observation_id,
+                   observation.source_heat_id,observation.participant_id,
+                   observation.layout_version_id,observation.value_text,
+                   observation.source_message_id,observation.source_key,
+                   observation.source_change_ordinal,observation.observed_at_us,
+                   message.handle AS source_handle,message.ordinal AS source_message_ordinal,
+                   message.ordinal AS message_ordinal,frame.id AS source_frame_id,
+                   frame.id AS frame_id,
+                   participant.start_number_key,participant.team_name_key,
+                   participant.class_name_key,
+                   EXISTS (
+                     SELECT 1
+                     FROM result_column_definitions AS duplicate_last
+                     WHERE duplicate_last.layout_version_id = observation.layout_version_id
+                       AND duplicate_last.canonical_key = 'last_lap'
+                       AND duplicate_last.column_index <> observation.column_index
+                   ) AS has_duplicate_canonical_last
+            FROM participant_result_cell_observations AS observation
+            JOIN result_column_definitions AS definition
+              ON definition.layout_version_id = observation.layout_version_id
+             AND definition.column_index = observation.column_index
+            JOIN feed_messages AS message ON message.id = observation.source_message_id
+            JOIN feed_frames AS frame ON frame.id = message.frame_id
+            LEFT JOIN participants AS participant ON participant.id = observation.participant_id
+            WHERE observation.source_heat_id = ?
+              AND frame.id = ?
+              AND definition.canonical_key = 'last_lap'
+            ORDER BY message.ordinal,observation.source_change_ordinal,observation.id
+            """,
+            (self.heat_id, frame_id),
+        ).fetchall()
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            candidate = dict(row)
+            cell_id = int(candidate["source_cell_observation_id"])
+            candidate["duration_ms"] = _duration_us_to_ms(candidate["value_text"])
+            candidate["schema_baseline_id"] = self._pending_last_schema_baseline_ids.get(cell_id)
+            candidate["is_full_grid_refresh"] = self._pending_last_full_grid_refresh.get(cell_id, False)
+            candidate["predecessor"] = self._previous_canonical_last_cell(connection, candidate)
+            candidate["same_predecessor"] = bool(
+                candidate["predecessor"] is not None
+                and candidate["predecessor"]["value_text"] == candidate["value_text"]
+            )
+            candidate["linked_lap"] = self._linked_lap_for_last_cell(connection, cell_id)
+            candidates.append(candidate)
+        for candidate in candidates:
+            duration_ms = candidate["duration_ms"]
+            predecessor = candidate["predecessor"]
+            linked_lap = candidate["linked_lap"]
+            if duration_ms is None:
+                classification, reason = "INVALID", "INVALID_DURATION"
+            elif bool(candidate["has_duplicate_canonical_last"]):
+                classification, reason = "UNCONFIRMED", "DUPLICATE_CANONICAL_LAST"
+            elif not self._participant_identity_is_resolved(candidate):
+                classification, reason = "UNCONFIRMED", "PARTICIPANT_UNRESOLVED"
+            elif candidate["source_handle"] == "r_i":
+                classification, reason = (
+                    ("REFRESH_REPEAT", "SNAPSHOT_REPEAT")
+                    if candidate["same_predecessor"]
+                    else ("UNCONFIRMED", "SNAPSHOT_BASELINE")
+                )
+            elif candidate["schema_baseline_id"] is None:
+                classification, reason = "UNCONFIRMED", "SCHEMA_BASELINE_MISSING"
+            elif linked_lap is not None and linked_lap["duration_source_kind"] == "RESULT_GRID_LAST":
+                classification, reason = "CONFIRMED_LAP", "SOURCE_LAP_BOUNDARY"
+            elif candidate["is_full_grid_refresh"]:
+                classification, reason = (
+                    ("REFRESH_REPEAT", "FULL_GRID_REFRESH_REPEAT")
+                    if candidate["same_predecessor"]
+                    else ("UNCONFIRMED", "FULL_GRID_NON_REPEAT")
+                )
+            elif predecessor is None:
+                classification, reason = "CONFIRMED_LAP", "DIRECT_FIRST_OBSERVATION"
+            elif not candidate["same_predecessor"]:
+                classification, reason = "CONFIRMED_LAP", "DIRECT_VALUE_CHANGED"
+            else:
+                classification, reason = "UNCONFIRMED", "AMBIGUOUS_EQUAL_DURATION"
+
+            sectors_json = None
+            sector_source_ids_json = None
+            linked_lap_id = None
+            if classification == "CONFIRMED_LAP":
+                if linked_lap is not None and linked_lap["duration_source_kind"] == "RESULT_GRID_LAST":
+                    linked_lap_id = linked_lap["id"]
+                    sectors_json = linked_lap["sectors_json"]
+                    sector_source_ids_json = linked_lap["sectors_source_cell_observation_ids_json"]
+                elif isinstance(candidate["participant_id"], str):
+                    source_sectors = self._result_sectors_for_lap(
+                        connection,
+                        participant_id=candidate["participant_id"],
+                        last_cell=candidate,
+                    )
+                    if source_sectors:
+                        sectors_json = _json({key: value[0] for key, value in source_sectors.items()})
+                        sector_source_ids_json = _json({key: value[1] for key, value in source_sectors.items()})
+
+            self._write_last_cell_ledger(
+                connection,
+                {
+                    "source_cell_observation_id": int(candidate["source_cell_observation_id"]),
+                    "source_heat_id": int(candidate["source_heat_id"]),
+                    "participant_id": candidate["participant_id"],
+                    "layout_version_id": int(candidate["layout_version_id"]),
+                    "source_frame_id": int(candidate["source_frame_id"]),
+                    "source_message_id": int(candidate["source_message_id"]),
+                    "source_message_ordinal": int(candidate["source_message_ordinal"]),
+                    "source_key": candidate["source_key"],
+                    "source_change_ordinal": int(candidate["source_change_ordinal"]),
+                    "source_handle": candidate["source_handle"],
+                    "observed_at_us": int(candidate["observed_at_us"]),
+                    "duration_ms": duration_ms,
+                    "classification": classification,
+                    "classification_reason": reason,
+                    "predecessor_source_cell_observation_id": (
+                        int(predecessor["id"]) if predecessor is not None else None
+                    ),
+                    "schema_baseline_id": candidate["schema_baseline_id"],
+                    "linked_lap_id": linked_lap_id,
+                    "sectors_json": sectors_json,
+                    "sectors_source_cell_observation_ids_json": sector_source_ids_json,
+                    "created_at_us": now_us(),
+                },
+            )
+
+    def _write_result_changes(
+        self, connection: sqlite3.Connection, context: FrameMessage, changes: Any
+    ) -> int | None:
         layout_id = self._ensure_layout(connection, context)
         if layout_id is None:
-            return
+            return None
         changed_rows: set[int] = set()
         for ordinal, change in enumerate(_changes(changes)):
             if len(change) < 3 or type(change[0]) is not int or type(change[1]) is not int:
@@ -760,6 +1217,11 @@ class TimingNormalizer:
             self._participant_for_row(connection, context, row_index)
         for row_index in sorted(changed_rows):
             self._write_row_state(connection, context, row_index, layout_id)
+        # Capture the source-connection baseline as it existed at this exact
+        # message rank. A later r_i/r_l in the same frame must not retroactively
+        # make an earlier r_c trustworthy.
+        self._capture_last_schema_context(connection, context, layout_id)
+        return layout_id
 
     def _row_event_cells(
         self,
