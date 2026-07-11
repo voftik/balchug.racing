@@ -255,7 +255,7 @@ body.admin .boris-btn::after { content: " · вкл"; }
 
 .decision-strip {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(8, minmax(0, 1fr));
   border-bottom: 1px solid var(--line);
   background: #f7f9fb;
 }
@@ -653,13 +653,15 @@ body.admin .boris-btn::after { content: " · вкл"; }
 .class-table th:first-child,
 .class-table td:first-child { width: 38px; text-align: center; }
 .class-table th:nth-child(3),
-.class-table td:nth-child(3) { display: none; }
+.class-table td:nth-child(3) { width: 50px; }
 .class-table th:nth-child(4),
 .class-table td:nth-child(4) { width: 72px; }
 .class-table th:nth-child(5),
-.class-table td:nth-child(5) { width: 48px; }
+.class-table td:nth-child(5) { display: none; }
 .class-table th:nth-child(6),
-.class-table td:nth-child(6) { width: 43px; }
+.class-table td:nth-child(6) { width: 48px; }
+.class-table th:nth-child(7),
+.class-table td:nth-child(7) { width: 43px; }
 .class-table th:last-child,
 .class-table td:last-child { width: 42px; text-align: center; }
 .class-table .ours-row { background: #fff1f4; }
@@ -1016,10 +1018,10 @@ body.admin .boris-btn::after { content: " · вкл"; }
 }
 
 @media (max-width: 1100px) {
-  .decision-strip,
+  .decision-strip { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .metric-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .decision-item:nth-child(3n) { border-right: 0; }
-  .decision-item:nth-child(-n+3) { border-bottom: 1px solid var(--line); }
+  .decision-item:nth-child(4n) { border-right: 0; }
+  .decision-item:nth-child(-n+4) { border-bottom: 1px solid var(--line); }
 }
 
 @media (max-width: 980px) {
@@ -1039,9 +1041,9 @@ body.admin .boris-btn::after { content: " · вкл"; }
   .panel-header { padding-top: 11px; }
   .decision-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .decision-item { border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
-  .decision-item:nth-child(3n) { border-right: 1px solid var(--line); }
+  .decision-item:nth-child(4n) { border-right: 0; }
   .decision-item:nth-child(2n) { border-right: 0; }
-  .decision-item:nth-child(-n+3) { border-bottom: 1px solid var(--line); }
+  .decision-item:nth-child(-n+4) { border-bottom: 1px solid var(--line); }
   .decision-item:nth-last-child(-n+2) { border-bottom: 0; }
   .decision-item { min-height: 56px; }
   .panel-tab { min-height: 48px; padding: 10px 12px; }

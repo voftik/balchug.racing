@@ -49,7 +49,7 @@ from .metrics import (
 )
 
 
-METRIC_ENGINE_VERSION = 4
+METRIC_ENGINE_VERSION = 5
 """Version of the deterministic value schema emitted by this module."""
 
 FRESHNESS_STALE_MS = 3_000
@@ -336,21 +336,32 @@ def _source_time_ms(value: int | None, kind: str | None) -> int | None:
 def _completed_laps(participant: ParticipantMetricInput) -> int | None:
     if participant.state is not None and _lap_count(participant.state.laps) is not None:
         return participant.state.laps
-    observed = [lap.lap_number for lap in participant.laps if _lap_count(lap.lap_number) is not None]
+    observed = [
+        lap.lap_number
+        for lap in participant.laps
+        if lap.lap_number_is_official and _lap_count(lap.lap_number) is not None
+    ]
     return max(observed) if observed else None
 
 
 def _source_lap_count(participant: ParticipantMetricInput) -> int | None:
-    """Return only an explicit current source LAPS value.
+    """Return an explicit LAPS value or a green-anchored canonical count.
 
-    Tracker passings are useful to reconstruct a local stint after capture
-    starts, but a partial capture cannot promote them to the provider's
-    official class-lap total.  Position gaps and lap deltas therefore use this
-    narrower helper rather than ``_completed_laps``.
+    Canonical laps have a non-null lap number only when RAW coverage is
+    corroborated from the official green flag. Partial captures retain null
+    lap numbers, so they cannot silently become an official class total.
     """
 
     state = participant.state
-    return _lap_count(state.laps) if state is not None else None
+    explicit = _lap_count(state.laps) if state is not None else None
+    if explicit is not None:
+        return explicit
+    observed = [
+        lap.lap_number
+        for lap in participant.laps
+        if lap.lap_number_is_official and _lap_count(lap.lap_number) is not None
+    ]
+    return max(observed) if observed else None
 
 
 def _timing_laps(participant: ParticipantMetricInput) -> tuple[LapInput, ...]:

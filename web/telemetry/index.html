@@ -10,7 +10,7 @@
 <link rel="preload" href="/assets/russoone-latin.woff2" as="font" type="font/woff2" crossorigin />
 <link rel="stylesheet" href="/assets/site.css" />
 <link rel="stylesheet" href="/assets/vendor/uplot/uPlot.min.css" />
-<link rel="stylesheet" href="/assets/timing-panel.css" />
+<link rel="stylesheet" href="/assets/timing-panel.css?v=20260711-canonical-gap-r2" />
 <style>
   .ctrl{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:0 0 10px;}
   .ctrl .lbl{font-family:var(--display);text-transform:uppercase;letter-spacing:.1em;font-size:11px;color:var(--muted);min-width:74px;}
@@ -98,6 +98,8 @@
 
           <div class="decision-strip" aria-label="Ключевые тактические показатели">
             <div class="decision-item"><span class="decision-label">Позиция</span><b class="decision-value" id="decisionPosition">—</b></div>
+            <div class="decision-item"><span class="decision-label">Пройдено кругов</span><b class="decision-value" id="decisionLaps">—</b></div>
+            <div class="decision-item"><span class="decision-label">До абсолютного лидера</span><b class="decision-value" id="decisionLeaderGap">—</b></div>
             <div class="decision-item"><span class="decision-label">До соперника впереди</span><b class="decision-value" id="decisionAhead">—</b></div>
             <div class="decision-item"><span class="decision-label">До соперника сзади</span><b class="decision-value" id="decisionBehind">—</b></div>
             <div class="decision-item"><span class="decision-label">Последний круг</span><b class="decision-value" id="decisionPace">—</b></div>
@@ -258,6 +260,6 @@
   })();
   </script>
   <script src="/assets/vendor/uplot/uPlot.iife.min.js"></script>
-  <script src="/assets/timing-panel.js"></script>
+  <script src="/assets/timing-panel.js?v=20260711-canonical-gap-r3"></script>
 </body>
 </html>

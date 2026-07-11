@@ -39,7 +39,7 @@ class ResultGridTests(unittest.TestCase):
         grid.remove_rows([[3], [-1], ["not-a-row"]])
         self.assertEqual(grid.rows, {})
 
-    def test_layout_swap_clears_rows_and_ignores_deltas_until_next_snapshot(self):
+    def test_layout_swap_remaps_rows_by_canonical_identity_and_accepts_sparse_delta(self):
         grid = ResultGrid()
         grid.apply_snapshot(
             {
@@ -52,22 +52,34 @@ class ResultGridTests(unittest.TestCase):
             {"start_number": "21", "position_overall": "3", "position_class": "1"},
         )
 
-        # A new layout moves PIC before POS. Sparse values observed before r_i
-        # cannot safely be assigned to the new headers.
-        grid.set_layout({"h": [{"n": "NR"}, {"n": "PIC"}, {"n": "POS"}]})
-        grid.apply_changes([[0, 1, "1"], [0, 2, "3"]])
+        # The live provider adds LAPS and moves PIC/POS, then immediately sends
+        # r_c without another r_i. Existing cells move by header identity.
+        grid.apply_layout_update(
+            {"h": [{"n": "NR"}, {"n": "PIC"}, {"n": "LAPS"}, {"n": "POS"}]}
+        )
+        grid.apply_changes([[0, 2, "28"], [0, 3, "4"]])
 
-        self.assertTrue(grid.schema_pending)
-        self.assertFalse(grid.schema_ready)
-        self.assertEqual(grid.rows, {})
-        self.assertEqual(grid.all_rows(), {})
-
-        grid.apply_snapshot({"r": [[0, 0, "21"], [0, 1, "1"], [0, 2, "3"]]})
+        self.assertFalse(grid.schema_pending)
         self.assertTrue(grid.schema_ready)
         self.assertEqual(
             grid.row_values(0),
-            {"start_number": "21", "position_class": "1", "position_overall": "3"},
+            {
+                "start_number": "21",
+                "position_class": "1",
+                "laps": "28",
+                "position_overall": "4",
+            },
         )
+
+    def test_layout_update_with_duplicate_canonical_headers_stays_fail_closed(self):
+        grid = ResultGrid()
+        grid.apply_snapshot({"l": {"h": [{"n": "NR"}]}, "r": [[0, 0, "21"]]})
+        grid.apply_layout_update({"h": [{"n": "NR"}, {"n": "startnumber"}]})
+        grid.apply_changes([[0, 0, "21"]])
+
+        self.assertFalse(grid.schema_ready)
+        self.assertEqual(grid.schema_conflicts, {"start_number": (0, 1)})
+        self.assertEqual(grid.rows, {})
 
     def test_duplicate_canonical_headers_are_fail_closed(self):
         grid = ResultGrid()

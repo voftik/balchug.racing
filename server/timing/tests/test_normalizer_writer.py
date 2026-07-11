@@ -5,11 +5,18 @@ import unittest
 from pathlib import Path
 
 from timing.db import connect, migrate
+from timing.gap_coordinates import parse_gap_display
 from timing.ingest_store import RawIngestStore
 from timing.lifecycle import create_session, start_session, stop_session
+from timing.metric_store import load_heat_metric_input
 from timing.normalization import OPEN_ENDED_TS_TIME, TIME_SERVICE_EPOCH_UNIX_US
-from timing.normalizer_writer import NormalizerError, TimingNormalizer
+from timing.normalizer_writer import (
+    RUNTIME_CHECKPOINT_REDUCER_VERSION,
+    NormalizerError,
+    TimingNormalizer,
+)
 from timing.protocol import Bootstrap
+from timing.read_api import TimingReadModel
 from timing.retention import apply_retention, plan_retention
 
 
@@ -121,7 +128,7 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(
             tuple(checkpoint),
-            (checkpoint_frame.id, "timing-normalizer", "timeservice-normalizer-checkpoint-v1"),
+            (checkpoint_frame.id, "timing-normalizer", RUNTIME_CHECKPOINT_REDUCER_VERSION),
         )
 
         self.normalizer = TimingNormalizer(self.session.id)
@@ -949,7 +956,16 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         self.apply(
             [
                 ["s_i", 22_200_000],
-                ["t_i", {"l": [[0, False, 0], [500, False, 1]], "d": []}],
+                [
+                    "t_i",
+                    {
+                        "l": [[100, True, -1], [500, False, 0], [750, False, 1], [0, False, 0]],
+                        "d": [
+                            [42, "21", 0, 1000, 0, 47000, False, 0],
+                            [43, "22", 0, 1000, 0, 47000, False, 0],
+                        ],
+                    },
+                ],
                 [
                     "r_i",
                     {
@@ -986,7 +1002,7 @@ class TimingNormalizerWriterTests(unittest.TestCase):
             ORDER BY p.start_number
             """
         ).fetchall()
-        self.assertEqual([tuple(pit) for pit in pits], [("21", 1, 1, None), ("22", 1, 1, None)])
+        self.assertEqual([tuple(pit) for pit in pits], [("21", 1, None, None), ("22", 1, None, None)])
         stints = self.connection.execute(
             """
             SELECT p.start_number,t.stint_number,t.started_lap,t.ended_lap,t.completed_laps
@@ -996,7 +1012,12 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual(
             [tuple(stint) for stint in stints],
-            [("21", 1, None, 1, 1), ("21", 2, 1, None, 0), ("22", 1, None, 1, 1), ("22", 2, 1, None, 0)],
+            [
+                ("21", 1, None, None, 0),
+                ("21", 2, None, None, 0),
+                ("22", 1, None, None, 0),
+                ("22", 2, None, None, 0),
+            ],
         )
         laps = self.connection.execute(
             """
@@ -1005,7 +1026,7 @@ class TimingNormalizerWriterTests(unittest.TestCase):
             ORDER BY p.start_number
             """
         ).fetchall()
-        self.assertEqual([tuple(lap) for lap in laps], [("21", 0, 1, 0), ("22", 0, 1, 0)])
+        self.assertEqual([tuple(lap) for lap in laps], [])
 
     def test_equal_l_pit_durations_in_distinct_r_c_exit_events_remain_source_facts(self):
         received = TIME_SERVICE_EPOCH_UNIX_US + 22_350_000
@@ -1488,7 +1509,13 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         self.apply(
             [
                 ["s_i", 50_000_000],
-                ["t_i", {"l": [[0, False, 0], [500, False, 1], [50, True, -1]], "d": []}],
+                [
+                    "t_i",
+                    {
+                        "l": [[50, True, -1], [500, False, 0], [750, False, 1], [0, False, 0]],
+                        "d": [[42, "21", 0, 1000, 0, 47000, False, 0]],
+                    },
+                ],
                 [
                     "r_i",
                     {
@@ -1503,18 +1530,18 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         self.apply([["r_c", [[0, 3, "SIn Pit"], [0, 4, "1"]]]], received_at_us=received + 20_000)
         self.apply([["r_c", [[0, 3, "SOutLap"]]]], received_at_us=received + 30_000)
         self.apply([["t_p", [[42, "21", 0, 500, 0, 47000, False, 50_120_000]]]], received_at_us=received + 120_000)
-        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM laps").fetchone()[0], 2)
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM laps").fetchone()[0], 1)
         stints = self.connection.execute(
             "SELECT stint_number,started_lap,ended_lap,completed_laps FROM tire_stints ORDER BY stint_number"
         ).fetchall()
-        self.assertEqual([tuple(stint) for stint in stints], [(1, None, 1, 1), (2, 1, None, 1)])
+        self.assertEqual([tuple(stint) for stint in stints], [(1, None, None, 0), (2, None, None, 1)])
 
     def test_no_laps_tracker_boundary_uses_same_frame_last_and_sector_cells(self):
         received = TIME_SERVICE_EPOCH_UNIX_US + 55_000_000
         self.apply(
             [
                 ["s_i", 55_000_000],
-                ["t_i", {"l": [[0, False, 0], [500, False, 1]], "d": []}],
+                ["t_i", {"l": [[100, True, -1], [500, False, 0], [750, False, 1], [0, False, 0]], "d": []}],
                 [
                     "r_i",
                     {
@@ -1542,6 +1569,8 @@ class TimingNormalizerWriterTests(unittest.TestCase):
                         ],
                     },
                 ],
+                ["a_i", {"g": "55000000", "f": "0"}],
+                ["t_p", [[42, "21", 0, 1000, 0, 47000, False, 55_000_000]]],
             ],
             received_at_us=received,
         )
@@ -1549,20 +1578,20 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         # sends LAST followed by S3 in the same r_c as the finish passing.
         self.apply(
             [["r_c", [[0, 5, "34500000"], [0, 6, "35500000"]]]],
-            received_at_us=received + 50_000,
+            received_at_us=received + 50_000_000,
         )
         self.apply(
             [
                 ["r_c", [[0, 4, "107491000"], [0, 7, "34552000"]]],
-                ["t_p", [[42, "21", 0, 500, 0, 47000, False, 55_110_000]]],
+                ["t_p", [[42, "21", 0, 500, 0, 47000, False, 162_491_000]]],
             ],
-            received_at_us=received + 110_000,
+            received_at_us=received + 107_491_000,
         )
         # A following tracker passing without a new LAST cell must not become
-        # a synthetic 110 ms "lap".
+        # a synthetic duration from tracker chronology.
         self.apply(
-            [["t_p", [[42, "21", 0, 500, 0, 47000, False, 55_220_000]]]],
-            received_at_us=received + 220_000,
+            [["t_p", [[42, "21", 0, 500, 0, 47000, False, 272_491_000]]]],
+            received_at_us=received + 217_491_000,
         )
 
         laps = self.connection.execute(
@@ -1607,7 +1636,7 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(
             tuple(ledger[:3]),
-            ("CONFIRMED_LAP", "SOURCE_LAP_BOUNDARY", first["id"]),
+            ("CONFIRMED_LAP", "CANONICAL_TRACKER_DURATION_MATCH", first["id"]),
         )
         self.assertEqual(json.loads(ledger["sectors_json"]), json.loads(first["sectors_json"]))
         self.assertEqual(
@@ -1816,12 +1845,18 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         self.assertEqual(tuple(fact[:2]), ("CONFIRMED_LAP", "DIRECT_VALUE_CHANGED"))
         self.assertIsNotNone(fact["schema_baseline_id"])
 
-    def test_no_laps_tracker_boundary_requires_last_in_the_same_frame(self):
+    def test_no_laps_tracker_boundary_accepts_a_delayed_exact_last(self):
         received = TIME_SERVICE_EPOCH_UNIX_US + 56_000_000
         self.apply(
             [
                 ["s_i", 56_000_000],
-                ["t_i", {"l": [[0, False, 0], [500, False, 1]], "d": []}],
+                [
+                    "t_i",
+                    {
+                        "l": [[100, True, -1], [500, False, 0], [750, False, 1], [0, False, 0]],
+                        "d": [[42, "21", 0, 1000, 0, 47000, False, 0]],
+                    },
+                ],
                 [
                     "r_i",
                     {
@@ -1832,22 +1867,407 @@ class TimingNormalizerWriterTests(unittest.TestCase):
             ],
             received_at_us=received,
         )
-        self.apply([["r_c", [[0, 4, "107491000"]]]], received_at_us=received + 10_000)
         self.apply(
-            [["t_p", [[42, "21", 0, 500, 0, 47000, False, 56_110_000]]]],
-            received_at_us=received + 110_000,
+            [["t_p", [[42, "21", 0, 500, 0, 47000, False, 56_000_000]]]],
+            received_at_us=received,
+        )
+        self.apply(
+            [["t_p", [[42, "21", 0, 500, 0, 47000, False, 163_491_000]]]],
+            received_at_us=received + 107_491_000,
+        )
+        self.apply(
+            [["r_c", [[0, 4, "107491000"]]]],
+            received_at_us=received + 108_291_000,
         )
         lap = self.connection.execute(
-            "SELECT duration_ms,duration_source_cell_observation_id FROM laps"
+            """
+            SELECT duration_reconciliation,tracker_duration_ms,source_duration_ms,
+                   source_last_cell_observation_id,coverage_complete,lap_number
+            FROM canonical_laps
+            """
         ).fetchone()
-        self.assertEqual(tuple(lap), (None, None))
+        self.assertEqual(tuple(lap), ("EXACT", 107491, 107491, lap["source_last_cell_observation_id"], 0, None))
+        self.assertIsNotNone(lap["source_last_cell_observation_id"])
+        ledger = self.connection.execute(
+            "SELECT classification_reason,linked_canonical_lap_id FROM result_last_cell_ledger WHERE source_handle='r_c'"
+        ).fetchone()
+        self.assertEqual(ledger["classification_reason"], "CANONICAL_TRACKER_DURATION_MATCH")
+        self.assertIsNotNone(ledger["linked_canonical_lap_id"])
+
+    def test_live_layout_adds_laps_and_continues_sparse_updates_without_new_snapshot(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 65_000_000
+        initial_headers = [
+            {"n": "NR"},
+            {"n": "TEAM"},
+            {"n": "CLS"},
+            {"n": "STATE"},
+            {"n": "GAP"},
+            {"n": "LAST"},
+        ]
+        self.apply(
+            [
+                [
+                    "r_i",
+                    {
+                        "l": {"h": initial_headers},
+                        "r": [
+                            [0, 0, "21"],
+                            [0, 1, "BALCHUG Racing"],
+                            [0, 2, "CN PRO"],
+                            [0, 3, "E65000000"],
+                            [0, 4, "-- 11 laps --"],
+                            [0, 5, "120000000"],
+                        ],
+                    },
+                ]
+            ],
+            received_at_us=received,
+        )
+
+        # Production sent this r_l during the race and immediately resumed r_c;
+        # it did not send a replacement r_i snapshot.
+        next_headers = [
+            {"n": "NR"},
+            {"n": "TEAM"},
+            {"n": "CLS"},
+            {"n": "STATE"},
+            {"n": "LAPS"},
+            {"n": "GAP"},
+            {"n": "LAST"},
+        ]
+        self.apply([["r_l", {"h": next_headers}]], received_at_us=received + 1_000_000)
+        self.apply(
+            [["r_c", [[0, 4, "12"], [0, 5, "-- 12 laps --"], [0, 6, "110000000"]]]],
+            received_at_us=received + 2_000_000,
+        )
+
+        state = self.connection.execute(
+            """
+            SELECT state.laps,state.gap_raw,state.last_lap_ms,participant.start_number,
+                   participant.team_name,participant.class_name
+            FROM participant_state_current AS state
+            JOIN participants AS participant ON participant.id = state.participant_id
+            WHERE participant.is_ours = 1
+            """
+        ).fetchone()
+        self.assertEqual(tuple(state), (12, "-- 12 laps --", 110000, "21", "BALCHUG Racing", "CN PRO"))
+        anchors = self.connection.execute(
+            """
+            SELECT baseline.id,message.handle,baseline.layout_generation
+            FROM result_schema_baselines AS baseline
+            JOIN feed_messages AS message ON message.id = baseline.source_message_id
+            ORDER BY baseline.id
+            """
+        ).fetchall()
+        self.assertEqual(
+            [(anchor["handle"], anchor["layout_generation"]) for anchor in anchors],
+            [("r_i", 1), ("r_l", 2)],
+        )
+        cells = self.connection.execute(
+            """
+            SELECT definition.canonical_key,observation.participant_id
+            FROM participant_result_cell_observations AS observation
+            JOIN result_column_definitions AS definition
+              ON definition.layout_version_id = observation.layout_version_id
+             AND definition.column_index = observation.column_index
+            JOIN feed_messages AS message ON message.id = observation.source_message_id
+            WHERE message.handle = 'r_c'
+            ORDER BY observation.source_change_ordinal
+            """
+        ).fetchall()
+        self.assertEqual([cell["canonical_key"] for cell in cells], ["laps", "gap", "last_lap"])
+        self.assertTrue(all(cell["participant_id"] is not None for cell in cells))
+        ledger = self.connection.execute(
+            """
+            SELECT classification,classification_reason,schema_baseline_id
+            FROM result_last_cell_ledger WHERE source_handle = 'r_c'
+            """
+        ).fetchone()
+        self.assertEqual(tuple(ledger[:2]), ("CONFIRMED_LAP", "DIRECT_VALUE_CHANGED"))
+        self.assertEqual(ledger["schema_baseline_id"], anchors[-1]["id"])
+
+    def test_canonical_tracker_chronology_preserves_equal_laps_sectors_and_pit_boundary(self):
+        green = 70_000_000
+        received = TIME_SERVICE_EPOCH_UNIX_US + green
+        headers = [
+            {"n": "NR"},
+            {"n": "TEAM"},
+            {"n": "CLS"},
+            {"n": "STATE"},
+            {"n": "PIT"},
+            {"n": "LAST"},
+            {"n": "SectorTimes", "p": "1"},
+            {"n": "SectorTimes", "p": "2"},
+            {"n": "SectorTimes", "p": "3"},
+        ]
+        self.apply(
+            [
+                ["s_i", green],
+                ["t_i", {"l": [[100, True, -1], [500, False, 0], [750, False, 1], [0, False, 0]], "d": []}],
+                [
+                    "r_i",
+                    {
+                        "l": {"h": headers},
+                        "r": [
+                            [0, 0, "21"],
+                            [0, 1, "BALCHUG Racing"],
+                            [0, 2, "CN PRO"],
+                            [0, 3, f"E{green}"],
+                            [0, 4, "0"],
+                            [0, 5, str(OPEN_ENDED_TS_TIME)],
+                            [0, 6, str(OPEN_ENDED_TS_TIME)],
+                            [0, 7, str(OPEN_ENDED_TS_TIME)],
+                            [0, 8, str(OPEN_ENDED_TS_TIME)],
+                        ],
+                    },
+                ],
+                ["a_i", {"g": str(green), "f": "0"}],
+                ["h_h", {"f": 6}],
+                ["t_p", [[42, "21", 0, 1000, 0, 47000, False, green]]],
+            ],
+            received_at_us=received,
+        )
+
+        def sector(column, raw, start_distance, stop_distance, sector_id, provider_time):
+            self.apply(
+                [
+                    ["r_c", [[0, column, raw]]],
+                    [
+                        "t_p",
+                        [[42, "21", start_distance, stop_distance, sector_id, 47000, False, provider_time]],
+                    ],
+                ],
+                received_at_us=received + provider_time - green,
+            )
+
+        sector(6, "40000000", 500, 750, 1, 110_000_000)
+        sector(7, "34000000", 750, 1000, 2, 144_000_000)
+        self.apply(
+            [["t_p", [[42, "21", 0, 500, 0, 47000, False, 180_000_000]]]],
+            received_at_us=received + 110_000_000,
+        )
+        self.apply(
+            [["r_c", [[0, 5, "110000000"], [0, 8, "36000000"]]]],
+            received_at_us=received + 110_800_000,
+        )
+
+        sector(6, "41000000", 500, 750, 1, 221_000_000)
+        sector(7, "34000000", 750, 1000, 2, 255_000_000)
+        self.apply(
+            [["t_p", [[42, "21", 0, 500, 0, 47000, False, 290_000_000]]]],
+            received_at_us=received + 220_000_000,
+        )
+        # Equal consecutive LAST values are still two distinct exact laps.
+        self.apply(
+            [["r_c", [[0, 5, "110000000"], [0, 8, "35000000"]]]],
+            received_at_us=received + 220_800_000,
+        )
+
+        sector(6, "40000000", 500, 750, 1, 330_000_000)
+        sector(7, "35000000", 750, 1000, 2, 365_000_000)
+        self.apply(
+            [
+                ["t_p", [[42, "21", 0, 100, -1, 47000, True, 410_000_000]]],
+                [
+                    "r_c",
+                    [[0, 3, "SIn Pit"], [0, 4, "1"], [0, 5, "120000000"], [0, 8, "45000000"]],
+                ],
+            ],
+            received_at_us=received + 340_000_000,
+        )
+        # Pit exit is a path passing, never a completed lap.
+        self.apply(
+            [["t_p", [[42, "21", 100, 500, 0, 47000, True, 415_000_000]]]],
+            received_at_us=received + 345_000_000,
+        )
+        # A reconnect replay of the same physical pit boundary is deduplicated.
+        self.apply(
+            [["t_p", [[42, "21", 0, 100, -1, 47000, True, 410_000_000]]]],
+            received_at_us=received + 346_000_000,
+        )
+
+        laps = self.connection.execute(
+            """
+            SELECT lap_number,started_at_provider_us,finished_at_provider_us,
+                   tracker_duration_ms,source_duration_ms,duration_reconciliation,is_pit_lap
+            FROM canonical_laps ORDER BY lap_number
+            """
+        ).fetchall()
+        self.assertEqual(
+            [tuple(lap) for lap in laps],
+            [
+                (1, 70_000_000, 180_000_000, 110000, 110000, "EXACT", 0),
+                (2, 180_000_000, 290_000_000, 110000, 110000, "EXACT", 0),
+                (3, 290_000_000, 410_000_000, 120000, 120000, "EXACT", 1),
+            ],
+        )
+        boundaries = self.connection.execute(
+            "SELECT boundary_kind FROM canonical_lap_boundaries ORDER BY boundary_ordinal"
+        ).fetchall()
+        self.assertEqual(
+            [boundary["boundary_kind"] for boundary in boundaries],
+            ["HEAT_START", "MAIN_FINISH", "MAIN_FINISH", "PIT_FINISH"],
+        )
+        sectors = self.connection.execute(
+            """
+            SELECT lap.lap_number,sector.sector_number,sector.tracker_duration_ms,
+                   sector.source_duration_ms,sector.duration_reconciliation,
+                   sector.source_cell_observation_id
+            FROM canonical_lap_sectors AS sector
+            JOIN canonical_laps AS lap ON lap.id = sector.canonical_lap_id
+            ORDER BY lap.lap_number,sector.sector_number
+            """
+        ).fetchall()
+        self.assertEqual(len(sectors), 9)
+        self.assertTrue(all(row["duration_reconciliation"] == "EXACT" for row in sectors))
+        self.assertTrue(all(row["tracker_duration_ms"] == row["source_duration_ms"] for row in sectors))
+        self.assertTrue(all(row["source_cell_observation_id"] is not None for row in sectors))
+        equal_last = self.connection.execute(
+            """
+            SELECT classification,classification_reason,linked_canonical_lap_id
+            FROM result_last_cell_ledger
+            WHERE duration_ms = 110000 AND source_handle = 'r_c'
+            ORDER BY source_frame_id
+            """
+        ).fetchall()
+        self.assertEqual(len(equal_last), 2)
+        self.assertTrue(all(row["classification"] == "CONFIRMED_LAP" for row in equal_last))
+        self.assertTrue(
+            all(row["classification_reason"] == "CANONICAL_TRACKER_DURATION_MATCH" for row in equal_last)
+        )
+        self.assertEqual(len({row["linked_canonical_lap_id"] for row in equal_last}), 2)
+        participant_id = self.connection.execute(
+            "SELECT id FROM participants WHERE source_heat_id = ? AND start_number_key = '21'",
+            (self.normalizer.heat_id,),
+        ).fetchone()[0]
+        payload = TimingReadModel(self.path).laps(
+            self.session.id,
+            participant_id=participant_id,
+            limit=10,
+        )
+        self.assertEqual(payload["lap_counts"][0]["completed_laps"], 3)
+        self.assertTrue(payload["lap_counts"][0]["coverage_complete"])
+        self.assertEqual(payload["lap_counts"][0]["exact_last_laps"], 3)
+        self.assertEqual(len(payload["items"]), 3)
+        first = payload["items"][0]
+        self.assertEqual(
+            (first["started_at_provider_us"], first["finished_at_provider_us"], first["duration_ms"]),
+            (70_000_000, 180_000_000, 110_000),
+        )
+        self.assertEqual(len(first["sector_facts"]), 3)
+        self.assertEqual(len(first["tracker_passings"]), 3)
+        self.assertEqual(first["source"]["last_raw_value"], ["110000000"])
+        self.assertEqual(first["finish_boundary"]["kind"], "MAIN_FINISH")
+        metric_input = load_heat_metric_input(self.connection, self.normalizer.heat_id)
+        self.assertEqual(
+            [lap.is_clean for lap in metric_input.our_participant.laps if lap.timing_eligible],
+            [True, True, False],
+        )
+        snapshot = TimingReadModel(self.path).snapshot(self.session.id).as_dict()
+        ours = next(item for item in snapshot["measured"]["participants"] if item["participant_id"] == participant_id)
+        self.assertEqual(
+            ours["lap_count"],
+            {
+                "completed_laps": 3,
+                "observed_complete_laps": 3,
+                "coverage_complete": True,
+                "exact_last_laps": 3,
+                "latest_finished_at_provider_us": 410_000_000,
+            },
+        )
+
+    def test_gap_lap_groups_are_snapshotted_across_classes_without_summing_rows(self):
+        self.assertEqual(parse_gap_display("2.567").time_ms, 2_567)
+        self.assertEqual(parse_gap_display("1:02.973").time_ms, 62_973)
+        self.assertEqual(parse_gap_display("6:20.111").time_ms, 380_111)
+        self.assertEqual(parse_gap_display("-- 28 laps --").completed_laps, 28)
+        self.assertEqual(parse_gap_display("not timing").kind, "UNKNOWN")
+
+        received = TIME_SERVICE_EPOCH_UNIX_US + 80_000_000
+        headers = [{"n": "POS"}, {"n": "NR"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "GAP"}]
+        rows = []
+        values = [
+            (1, "9", "Про Моторспорт", "CN PRO", "-- 28 laps --"),
+            (2, "29", "TEAMGARIS", "CN PRO", "2.567"),
+            (3, "13", "CapitalRT", "GT PRO", "8.216"),
+            (4, "93", "ИСКРА Моторспорт", "GT PRO", "-- 27 laps --"),
+            (5, "37", "ИСКРА Моторспорт", "GT PRO", "41.740"),
+            (6, "90", "Vracing", "GT PRO", "-- 14 laps --"),
+            (7, "21", "BALCHUG Racing", "CN PRO", "6:20.111"),
+        ]
+        for row_index, value in enumerate(values):
+            for column_index, cell in enumerate(value):
+                rows.append([row_index, column_index, str(cell)])
+        self.apply(
+            [["r_i", {"l": {"h": headers}, "r": rows}]],
+            received_at_us=received,
+        )
+
+        snapshot = self.connection.execute(
+            "SELECT id,leader_completed_laps,participant_count,resolved_coordinate_count,lap_group_count FROM gap_coordinate_snapshots"
+        ).fetchone()
+        self.assertEqual(tuple(snapshot[1:]), (28, 7, 7, 3))
+        coordinates = self.connection.execute(
+            """
+            SELECT participant.start_number,coordinate.lap_group_completed_laps,
+                   coordinate.time_from_lap_group_leader_ms,
+                   coordinate.gap_to_overall_leader_laps,
+                   coordinate.gap_to_overall_leader_residual_ms,coordinate.coordinate_status
+            FROM participant_gap_coordinates AS coordinate
+            JOIN participants AS participant ON participant.id = coordinate.participant_id
+            WHERE coordinate.snapshot_id = ? ORDER BY coordinate.source_position_overall
+            """,
+            (snapshot["id"],),
+        ).fetchall()
+        by_number = {row["start_number"]: row for row in coordinates}
+        self.assertEqual(tuple(by_number["9"][1:]), (28, 0, 0, 0, "EXACT"))
+        self.assertEqual(tuple(by_number["29"][1:]), (28, 2_567, 0, 2_567, "EXACT"))
+        # 8.216 is cumulative from the 28-lap group leader, not 2.567 + 8.216.
+        self.assertEqual(by_number["13"]["gap_to_overall_leader_residual_ms"], 8_216)
+        self.assertEqual(tuple(by_number["21"][1:]), (14, 380_111, 14, 380_111, "EXACT"))
+        state = self.connection.execute(
+            """
+            SELECT current.gap_ms,current.gap_kind
+            FROM participant_state_current AS current
+            JOIN participants AS participant ON participant.id = current.participant_id
+            WHERE participant.start_number = '21'
+            """
+        ).fetchone()
+        self.assertEqual(tuple(state), (380_111, "TIME"))
+
+        # The reducer stores at most one full-table projection per second.
+        self.apply([["r_c", [[6, 4, "6:19.500"]]]], received_at_us=received + 500_000)
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM gap_coordinate_snapshots").fetchone()[0], 1)
+        self.apply([["r_c", [[6, 4, "6:19.000"]]]], received_at_us=received + 1_000_000)
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM gap_coordinate_snapshots").fetchone()[0], 2)
+        latest = self.connection.execute(
+            """
+            SELECT coordinate.gap_to_overall_leader_laps,coordinate.gap_to_overall_leader_residual_ms
+            FROM participant_gap_coordinates AS coordinate
+            JOIN participants AS participant ON participant.id = coordinate.participant_id
+            JOIN gap_coordinate_snapshots AS snapshot ON snapshot.id = coordinate.snapshot_id
+            WHERE participant.start_number = '21'
+            ORDER BY snapshot.observed_second DESC LIMIT 1
+            """
+        ).fetchone()
+        self.assertEqual(tuple(latest), (14, 379_000))
+        public = TimingReadModel(self.path).snapshot(self.session.id).as_dict()
+        car = next(item for item in public["measured"]["participants"] if item["start_number"] == "21")
+        self.assertEqual(car["gap_coordinate"]["gap_to_overall_leader_laps"], 14)
+        self.assertEqual(car["gap_coordinate"]["gap_to_overall_leader_residual_ms"], 379_000)
 
     def test_same_frame_last_marks_pit_entry_lap_non_clean_when_tracker_arrives_first(self):
         received = TIME_SERVICE_EPOCH_UNIX_US + 57_000_000
         self.apply(
             [
                 ["s_i", 57_000_000],
-                ["t_i", {"l": [[0, False, 0], [500, False, 1]], "d": []}],
+                [
+                    "t_i",
+                    {
+                        "l": [[100, True, -1], [500, False, 0], [750, False, 1], [0, False, 0]],
+                        "d": [[42, "21", 0, 1000, 0, 47000, False, 0]],
+                    },
+                ],
                 [
                     "r_i",
                     {
@@ -1875,11 +2295,15 @@ class TimingNormalizerWriterTests(unittest.TestCase):
             received_at_us=received,
         )
         self.apply(
+            [["t_p", [[42, "21", 0, 500, 0, 47000, False, 57_000_000]]]],
+            received_at_us=received,
+        )
+        self.apply(
             [
-                ["t_p", [[42, "21", 0, 500, 0, 47000, True, 57_110_000]]],
+                ["t_p", [[42, "21", 0, 100, -1, 47000, True, 312_104_000]]],
                 ["r_c", [[0, 3, "SIn Pit"], [0, 4, "1"], [0, 5, "255104000"]]],
             ],
-            received_at_us=received + 110_000,
+            received_at_us=received + 255_104_000,
         )
         lap = self.connection.execute(
             "SELECT duration_ms,is_in_lap,is_out_lap,crosses_pit,is_clean FROM laps"
