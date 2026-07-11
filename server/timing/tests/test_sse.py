@@ -162,6 +162,14 @@ class TimingStreamBrokerTests(unittest.IsolatedAsyncioTestCase):
 
         self.emit("session-a", "two")
         self.emit("session-a", "three")
+        latest_event_id = self.connection.execute(
+            "SELECT MAX(id) FROM stream_events WHERE analysis_session_id = ?", ("session-a",)
+        ).fetchone()[0]
+        deadline = asyncio.get_running_loop().time() + 1
+        while self.broker._last_event_id < latest_event_id:
+            if asyncio.get_running_loop().time() >= deadline:
+                self.fail("broker did not process the queued source events")
+            await asyncio.sleep(0.01)
         reset = await asyncio.wait_for(queue_a.get(), timeout=1)
         self.assertIsInstance(reset, ResetRequired)
         self.assertEqual(reset.reason, "subscriber_backpressure")
