@@ -2042,7 +2042,7 @@
     var yAt = function (value) { return top + (value - domain.min) / (domain.max - domain.min) * (bottom - top); };
     context.fillStyle = "#6E7E98";
     context.font = "10px Arial";
-    context.fillText("Время", 2, top + 10);
+    context.fillText("Темп", 2, top + 10);
     context.fillText(formatLap(domain.min), width - right - 48, top + 10);
     context.fillText(formatLap(domain.max), width - right - 48, bottom);
     context.font = "8.5px Arial";
