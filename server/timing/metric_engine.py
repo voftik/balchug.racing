@@ -10,7 +10,7 @@ browser time influence the calculation.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 from math import ceil, floor
 from typing import Any
@@ -379,6 +379,8 @@ def _best_lap_ms(participant: ParticipantMetricInput) -> int | None:
     if participant.state is not None and _duration_ms(participant.state.best_lap_ms) is not None:
         return participant.state.best_lap_ms
     values = [lap.duration_ms for lap in _timing_laps(participant) if _duration_ms(lap.duration_ms) is not None]
+    if _duration_ms(participant.best_lap_ms_checkpoint) is not None:
+        values.append(participant.best_lap_ms_checkpoint)
     return min(values) if values else None
 
 
@@ -537,8 +539,36 @@ def _participant_with_laps(participant: ParticipantMetricInput, laps: tuple[LapI
         laps=laps,
         pit_stops=participant.pit_stops,
         tire_stints=participant.tire_stints,
+        latest_timing_event_id=participant.latest_timing_event_id,
+        observed_lap_count_prefix=participant.observed_lap_count_prefix,
+        clean_lap_count_prefix=participant.clean_lap_count_prefix,
+        best_lap_ms_checkpoint=participant.best_lap_ms_checkpoint,
+        last_sector_ms_checkpoint=participant.last_sector_ms_checkpoint,
+        personal_best_sector_ms_checkpoint=participant.personal_best_sector_ms_checkpoint,
+        active_stint_observed_lap_count_prefix=participant.active_stint_observed_lap_count_prefix,
+        active_stint_clean_lap_count_prefix=participant.active_stint_clean_lap_count_prefix,
+        active_stint_best_lap_ms_checkpoint=participant.active_stint_best_lap_ms_checkpoint,
+        stint_summary_checkpoint=participant.stint_summary_checkpoint,
     )
     return stint_participant
+
+
+def _pace_with_prefix(
+    pace: PaceMetrics,
+    *,
+    observed_prefix: int,
+    clean_prefix: int,
+) -> PaceMetrics:
+    """Restore whole-heat counters around a bounded rolling lap tail."""
+
+    observed = max(0, observed_prefix) + pace.observed_lap_count
+    clean = max(0, clean_prefix) + pace.clean_lap_count
+    return replace(
+        pace,
+        observed_lap_count=observed,
+        clean_lap_count=clean,
+        clean_lap_ratio=(clean / observed if observed else None),
+    )
 
 
 def _stint_pace_values(
@@ -553,7 +583,19 @@ def _stint_pace_values(
     )
     # Full slow-lap history is produced once for the participant's overall
     # stream. A stint's rolling pace needs only the current windows/counts.
-    return calculate_pace_metrics(samples, include_slow_lap_history=False), samples
+    pace = calculate_pace_metrics(samples, include_slow_lap_history=False)
+    active = participant.active_tire_stint
+    if (
+        active is not None
+        and stint.stint_number == active.stint_number
+        and stint.started_at_us == active.started_at_us
+    ):
+        pace = _pace_with_prefix(
+            pace,
+            observed_prefix=participant.active_stint_observed_lap_count_prefix,
+            clean_prefix=participant.active_stint_clean_lap_count_prefix,
+        )
+    return pace, samples
 
 
 def _theil_sen_slope(points: Sequence[tuple[int, int]]) -> float | None:
@@ -694,9 +736,20 @@ def _stint_summary(
     all_samples: Sequence[LapSample] | None = None,
 ) -> tuple[dict[str, Any], ...]:
     summaries: list[dict[str, Any]] = []
+    checkpoint = {
+        summary.get("stint_number"): summary
+        for summary in participant.stint_summary_checkpoint
+        if isinstance(summary, Mapping) and _is_int(summary.get("stint_number"), minimum=1)
+    }
     for stint in participant.tire_stints:
         if stint is active_stint and active_pace is not None and active_samples is not None:
             pace, samples = active_pace, active_samples
+        elif stint.stint_number in checkpoint:
+            cached = dict(checkpoint[stint.stint_number])
+            cached["completed_laps"] = stint.completed_laps
+            cached["elapsed_s"] = _elapsed_s(stint.ended_at_us or observed_at_us, stint.started_at_us)
+            summaries.append(cached)
+            continue
         else:
             pace, samples = _stint_pace_values(participant, stint, all_samples=all_samples)
         clean_durations = [sample.duration_ms for sample in samples if is_clean_lap(sample) and sample.duration_ms is not None]
@@ -740,14 +793,27 @@ def _active_stint_values(
 
     stint_pace, samples = _stint_pace_values(participant, stint, all_samples=all_samples)
     clean_durations = [sample.duration_ms for sample in samples if is_clean_lap(sample) and sample.duration_ms is not None]
+    if _duration_ms(participant.active_stint_best_lap_ms_checkpoint) is not None:
+        clean_durations.append(participant.active_stint_best_lap_ms_checkpoint)
     trend_points = _stint_age_duration_points_from_samples(samples, stint)
     trend = _theil_sen_slope(trend_points) if len({age for age, _ in trend_points}) >= 6 else None
     prior_stints = [candidate for candidate in participant.tire_stints if candidate.stint_number < stint.stint_number and candidate.ended_at_us is not None]
-    previous_pace = (
-        _stint_pace_values(participant, prior_stints[-1], all_samples=all_samples)[0].pace5_ms
-        if prior_stints
-        else None
-    )
+    previous_pace = None
+    if prior_stints:
+        previous_number = prior_stints[-1].stint_number
+        previous_summary = next(
+            (
+                summary
+                for summary in participant.stint_summary_checkpoint
+                if isinstance(summary, Mapping) and summary.get("stint_number") == previous_number
+            ),
+            None,
+        )
+        previous_pace = (
+            previous_summary.get("pace_5_ms")
+            if isinstance(previous_summary, Mapping)
+            else _stint_pace_values(participant, prior_stints[-1], all_samples=all_samples)[0].pace5_ms
+        )
     minimum_age = min((age for age, _ in trend_points), default=None)
     slow_events = _slow_lap_events(samples)
     abrupt = (
@@ -795,6 +861,7 @@ def _participant_values(
     observed_at_us: int,
     pace: PaceMetrics,
     lap_samples: Sequence[LapSample] | None = None,
+    sector_values: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     state = participant.state
     completed_pits = _completed_pits(participant)
@@ -843,7 +910,7 @@ def _participant_values(
         "clean_lap_ratio": pace.clean_lap_ratio,
         "slow_lap_numbers": pace.slow_lap_numbers,
         "slow_lap_anomaly": slow_events[-1] if slow_events else None,
-        **_participant_sector_values(participant),
+        **(dict(sector_values) if sector_values is not None else _participant_sector_values(participant)),
         **_active_stint_values(participant, observed_at_us, all_samples=samples),
         "pits_completed": len(completed_pits) if participant.tire_stints or state is not None else None,
         "pit_history": history,
@@ -893,10 +960,15 @@ def _participant_sector_values(participant: ParticipantMetricInput) -> dict[str,
     # LAST boundary and its exact result-cell observation.
     all_maps = [_sector_map(lap.sectors_json) for lap in participant.laps]
     confirmed = [values for values in all_maps if values]
-    last = confirmed[-1] if confirmed else {}
-    keys = sorted({key for values in all_maps for key in values})
+    checkpoint_last = dict(participant.last_sector_ms_checkpoint)
+    last = confirmed[-1] if confirmed else checkpoint_last
+    checkpoint = dict(participant.personal_best_sector_ms_checkpoint)
+    keys = sorted({*checkpoint, *(key for values in all_maps for key in values)})
     personal = {
-        key: min(values[key] for values in all_maps if key in values)
+        key: min(
+            [values[key] for values in all_maps if key in values]
+            + ([checkpoint[key]] if key in checkpoint else [])
+        )
         for key in keys
     }
     return {
@@ -905,8 +977,17 @@ def _participant_sector_values(participant: ParticipantMetricInput) -> dict[str,
     }
 
 
-def _sector_metrics(ours: ParticipantMetricInput, scope: ClassScopeInput | None) -> dict[str, Any]:
-    ours_values = _participant_sector_values(ours)
+def _sector_metrics(
+    ours: ParticipantMetricInput,
+    scope: ClassScopeInput | None,
+    *,
+    values_by_participant: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    ours_values = (
+        values_by_participant[ours.id]
+        if values_by_participant is not None and ours.id in values_by_participant
+        else _participant_sector_values(ours)
+    )
     ours_best = ours_values["personal_best_sector_ms"] or {}
     if scope is None:
         return {
@@ -919,7 +1000,11 @@ def _sector_metrics(ours: ParticipantMetricInput, scope: ClassScopeInput | None)
             "largest_sector_loss": None,
         }
     best_by_participant = {
-        participant.id: _participant_sector_values(participant)["personal_best_sector_ms"] or {}
+        participant.id: (
+            values_by_participant[participant.id]
+            if values_by_participant is not None and participant.id in values_by_participant
+            else _participant_sector_values(participant)
+        )["personal_best_sector_ms"] or {}
         for participant in scope.participants
     }
     active_keys = sorted({key for values in best_by_participant.values() for key in values})
@@ -2295,6 +2380,7 @@ def _ours_tactical_values(
     pace_by_participant: Mapping[str, PaceMetrics],
     class_orders: Mapping[str, _ClassOrder | None],
     lap_samples_by_participant: Mapping[str, Sequence[LapSample]],
+    sector_values_by_participant: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any]:
     empty = {
         "ours_identity": None,
@@ -2375,6 +2461,7 @@ def _ours_tactical_values(
         observed_at_us=observed_at_us,
         pace=ours_pace,
         lap_samples=lap_samples_by_participant.get(ours.id),
+        sector_values=sector_values_by_participant.get(ours.id),
     )
     scope = heat.current_class_scope
     order = class_orders.get(scope.key) if scope is not None else None
@@ -2416,7 +2503,11 @@ def _ours_tactical_values(
         },
     }
     class_best = _class_best_lap_ms(scope) if scope is not None else None
-    sector_values = _sector_metrics(ours, scope)
+    sector_values = _sector_metrics(
+        ours,
+        scope,
+        values_by_participant=sector_values_by_participant,
+    )
     participants_by_id = {
         participant.id: participant
         for participant in (scope.participants if scope is not None else ())
@@ -2771,10 +2862,18 @@ def evaluate_heat_metrics(
         for participant in heat.participants
     }
     pace_by_participant = {
-        participant.id: calculate_pace_metrics(
-            lap_samples_by_participant[participant.id],
-            slow_lap_window=SLOW_LAP_MAX_CLEAN_LAPS,
+        participant.id: _pace_with_prefix(
+            calculate_pace_metrics(
+                lap_samples_by_participant[participant.id],
+                slow_lap_window=SLOW_LAP_MAX_CLEAN_LAPS,
+            ),
+            observed_prefix=participant.observed_lap_count_prefix,
+            clean_prefix=participant.clean_lap_count_prefix,
         )
+        for participant in heat.participants
+    }
+    sector_values_by_participant = {
+        participant.id: _participant_sector_values(participant)
         for participant in heat.participants
     }
     class_orders = {scope.key: _class_order(scope) for scope in heat.class_scopes}
@@ -2785,6 +2884,7 @@ def evaluate_heat_metrics(
         pace_by_participant=pace_by_participant,
         class_orders=class_orders,
         lap_samples_by_participant=lap_samples_by_participant,
+        sector_values_by_participant=sector_values_by_participant,
     )
     battle_values = _battle_values(
         heat,
@@ -2836,6 +2936,7 @@ def evaluate_heat_metrics(
             observed_at_us=observed_at_us,
             pace=pace_by_participant[participant.id],
             lap_samples=lap_samples_by_participant[participant.id],
+            sector_values=sector_values_by_participant[participant.id],
         )
         candidates.append(
             MetricSampleCandidate(

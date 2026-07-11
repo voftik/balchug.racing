@@ -15,7 +15,7 @@ import sqlite3
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterator
 
 from .config import now_us
@@ -35,6 +35,9 @@ PLAYBACK_SNAPSHOT_INTERVAL_US = METRIC_SAMPLE_INTERVAL_US
 # table migration and would reject every existing snapshot before rebuild.
 PLAYBACK_PROJECTION_VERSION = 1
 PLAYBACK_PAYLOAD_CODEC = "gzip-json-v1"
+
+METRIC_INPUT_TAIL_LAPS = 72
+"""No-LAPS tail: 60-point stint trend + 10-lap pace baseline + safety margin."""
 
 _SCOPE_KINDS = frozenset({"participant", "class", "session"})
 
@@ -258,6 +261,18 @@ class ParticipantMetricInput:
     pit_stops: tuple[PitStopInput, ...]
     tire_stints: tuple[TireStintInput, ...]
     latest_timing_event_id: int | None = None
+    # A durable metric_current/metric_runner_state cursor lets the loader keep
+    # only a bounded raw tail after restart. Prefix totals preserve whole-heat
+    # counts without promoting capture-local LAST chronology to source LAPS.
+    observed_lap_count_prefix: int = 0
+    clean_lap_count_prefix: int = 0
+    best_lap_ms_checkpoint: int | None = None
+    last_sector_ms_checkpoint: tuple[tuple[str, int], ...] = ()
+    personal_best_sector_ms_checkpoint: tuple[tuple[str, int], ...] = ()
+    active_stint_observed_lap_count_prefix: int = 0
+    active_stint_clean_lap_count_prefix: int = 0
+    active_stint_best_lap_ms_checkpoint: int | None = None
+    stint_summary_checkpoint: tuple[Mapping[str, Any], ...] = ()
 
     @property
     def active_tire_stint(self) -> TireStintInput | None:
@@ -480,6 +495,62 @@ class _ResultStateFact:
     cell_id: int
 
 
+@dataclass(frozen=True)
+class _MetricInputCheckpoint:
+    """Previously committed metric values and their source-frame cursor."""
+
+    source_frame_id: int
+    boundary: Mapping[str, Any]
+    values_by_participant: Mapping[str, Mapping[str, Any]]
+
+
+def _load_metric_input_checkpoint(
+    connection: sqlite3.Connection,
+    *,
+    source_heat_id: int,
+    metric_version: int | None,
+) -> _MetricInputCheckpoint | None:
+    if metric_version is None:
+        return None
+    row = connection.execute(
+        """
+        SELECT source_frame_id,boundary_state_json
+        FROM metric_runner_state
+        WHERE source_heat_id = ? AND metric_version = ?
+        """,
+        (source_heat_id, metric_version),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        boundary = json.loads(row["boundary_state_json"])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(boundary, Mapping) or boundary.get("source_heat_id") != source_heat_id:
+        return None
+    values: dict[str, Mapping[str, Any]] = {}
+    for current in connection.execute(
+        """
+        SELECT scope_key,values_json
+        FROM metric_current
+        WHERE source_heat_id = ? AND scope_kind = 'participant' AND metric_version = ?
+        """,
+        (source_heat_id, metric_version),
+    ):
+        try:
+            payload = json.loads(current["values_json"])
+        except (TypeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, Mapping):
+            return None
+        values[current["scope_key"]] = payload
+    return _MetricInputCheckpoint(
+        source_frame_id=int(row["source_frame_id"]),
+        boundary=boundary,
+        values_by_participant=values,
+    )
+
+
 def _interval_overlaps(
     started_at_us: int,
     ended_at_us: int,
@@ -492,7 +563,7 @@ def _interval_overlaps(
 
 
 def _load_result_last_facts(
-    connection: sqlite3.Connection, *, source_heat_id: int
+    connection: sqlite3.Connection, *, source_heat_id: int, tail_limit: int | None = None
 ) -> tuple[_ResultLastFact, ...]:
     """Read only the normalizer's confirmed LAST-cell ledger facts.
 
@@ -503,8 +574,7 @@ def _load_result_last_facts(
     result row or a personal reconnect snapshot.
     """
 
-    rows = connection.execute(
-        """
+    select = """
         SELECT ledger.source_cell_observation_id AS timing_event_id,
                ledger.participant_id,ledger.duration_ms,
                ledger.source_message_id,ledger.source_key,
@@ -527,12 +597,48 @@ def _load_result_last_facts(
           AND ledger.source_handle = 'r_c'
           AND ledger.classification = 'CONFIRMED_LAP'
           AND ledger.duration_ms IS NOT NULL AND ledger.duration_ms > 0
-        ORDER BY ledger.participant_id,ledger.source_frame_id,
-                 ledger.source_message_ordinal,ledger.source_change_ordinal,
-                 ledger.source_cell_observation_id
-        """,
-        (source_heat_id,),
-    ).fetchall()
+    """
+    if tail_limit is None:
+        rows = connection.execute(
+            select
+            + """
+              ORDER BY ledger.participant_id,ledger.source_frame_id,
+                       ledger.source_message_ordinal,ledger.source_change_ordinal,
+                       ledger.source_cell_observation_id
+              """,
+            (source_heat_id,),
+        ).fetchall()
+    else:
+        rows = []
+        participant_ids = [
+            row["id"]
+            for row in connection.execute(
+                "SELECT id FROM participants WHERE source_heat_id = ? ORDER BY id",
+                (source_heat_id,),
+            )
+        ]
+        for participant_id in participant_ids:
+            rows.extend(
+                connection.execute(
+                    select
+                    + """
+                      AND ledger.participant_id = ?
+                      ORDER BY ledger.source_frame_id DESC,ledger.source_message_ordinal DESC,
+                               ledger.source_change_ordinal DESC,ledger.source_cell_observation_id DESC
+                      LIMIT ?
+                      """,
+                    (source_heat_id, participant_id, tail_limit),
+                ).fetchall()
+            )
+        rows.sort(
+            key=lambda row: (
+                row["participant_id"],
+                row["frame_id"],
+                row["message_ordinal"],
+                row["source_change_ordinal"],
+                row["timing_event_id"],
+            )
+        )
     return tuple(
         _ResultLastFact(
             timing_event_id=int(row["timing_event_id"]),
@@ -560,12 +666,11 @@ def _load_result_last_facts(
 
 
 def _load_result_state_facts(
-    connection: sqlite3.Connection, *, source_heat_id: int
+    connection: sqlite3.Connection, *, source_heat_id: int, tail_limit: int | None = None
 ) -> dict[str, tuple[_ResultStateFact, ...]]:
     """Load exact STATE cells; do not use synthetic UNKNOWN state observations."""
 
-    rows = connection.execute(
-        """
+    select = """
         SELECT observation.id,observation.participant_id,observation.value_text,
                observation.source_change_ordinal,frame.id AS frame_id,message.ordinal AS message_ordinal
         FROM result_column_definitions AS definition
@@ -584,11 +689,56 @@ def _load_result_state_facts(
               AND duplicate_state.canonical_key = 'state'
               AND duplicate_state.column_index <> observation.column_index
           )
-        ORDER BY observation.participant_id,frame.id,message.ordinal,
-                 observation.source_change_ordinal,observation.id
-        """,
-        (source_heat_id,),
-    ).fetchall()
+    """
+    if tail_limit is None:
+        rows = connection.execute(
+            select
+            + """
+              ORDER BY observation.participant_id,frame.id,message.ordinal,
+                       observation.source_change_ordinal,observation.id
+              """,
+            (source_heat_id,),
+        ).fetchall()
+    else:
+        rows = []
+        participant_ids = [
+            row["id"]
+            for row in connection.execute(
+                "SELECT id FROM participants WHERE source_heat_id = ? ORDER BY id",
+                (source_heat_id,),
+            )
+        ]
+        for participant_id in participant_ids:
+            rows.extend(
+                connection.execute(
+                    """
+                    SELECT state.state_cell_observation_id AS id,state.participant_id,
+                           state.state_raw AS value_text,state.state_kind,
+                           cell.source_change_ordinal,frame.id AS frame_id,
+                           message.ordinal AS message_ordinal
+                    FROM participant_state_observations AS state
+                    JOIN participant_result_cell_observations AS cell
+                      ON cell.id = state.state_cell_observation_id
+                    JOIN feed_messages AS message ON message.id = state.source_message_id
+                    JOIN feed_frames AS frame ON frame.id = message.frame_id
+                    WHERE state.source_heat_id = ? AND state.participant_id = ?
+                      AND state.state_cell_observation_id IS NOT NULL
+                    ORDER BY state.source_message_id DESC,
+                             cell.source_change_ordinal DESC,state.source_event_key DESC
+                      LIMIT ?
+                      """,
+                    (source_heat_id, participant_id, tail_limit + 1),
+                ).fetchall()
+            )
+        rows.sort(
+            key=lambda row: (
+                row["participant_id"],
+                row["frame_id"],
+                row["message_ordinal"],
+                row["source_change_ordinal"],
+                row["id"],
+            )
+        )
     grouped: dict[str, list[_ResultStateFact]] = defaultdict(list)
     for row in rows:
         participant_id = row["participant_id"]
@@ -597,7 +747,11 @@ def _load_result_state_facts(
         grouped[participant_id].append(
             _ResultStateFact(
                 participant_id=participant_id,
-                state_kind=parse_result_state(row["value_text"]).kind,
+                state_kind=(
+                    row["state_kind"]
+                    if "state_kind" in row.keys()
+                    else parse_result_state(row["value_text"]).kind
+                ),
                 frame_id=int(row["frame_id"]),
                 message_ordinal=int(row["message_ordinal"]),
                 source_change_ordinal=int(row["source_change_ordinal"]),
@@ -667,11 +821,20 @@ def _load_raw_result_last_laps(
     *,
     source_heat_id: int,
     pits_by_participant: Mapping[str, Sequence[PitStopInput]],
+    tail_limit: int | None = None,
 ) -> tuple[dict[str, list[LapInput]], dict[str, int], set[int]]:
     """Build timing inputs from the authoritative confirmed LAST ledger."""
 
-    facts = _load_result_last_facts(connection, source_heat_id=source_heat_id)
-    state_by_participant = _load_result_state_facts(connection, source_heat_id=source_heat_id)
+    facts = _load_result_last_facts(
+        connection,
+        source_heat_id=source_heat_id,
+        tail_limit=tail_limit,
+    )
+    state_by_participant = _load_result_state_facts(
+        connection,
+        source_heat_id=source_heat_id,
+        tail_limit=tail_limit,
+    )
     periods = _load_flag_periods(connection, source_heat_id=source_heat_id)
     gaps = tuple(
         (int(row["started_at_us"]), _int(row["ended_at_us"]))
@@ -861,7 +1024,96 @@ def _participant_sort_key(participant: ParticipantMetricInput) -> tuple[int, int
     )
 
 
-def load_heat_metric_input(connection: sqlite3.Connection, source_heat_id: int) -> HeatMetricInput:
+def _checkpoint_dependencies_unchanged(
+    checkpoint: _MetricInputCheckpoint | None,
+    *,
+    flag: TrackFlagInput | None,
+    open_gap: IngestGapInput | None,
+    participant_rows: Sequence[sqlite3.Row],
+    pits_by_participant: Mapping[str, Sequence[PitStopInput]],
+    stint_rows: Sequence[sqlite3.Row],
+) -> bool:
+    """Admit a bounded tail only when old clean-lap decisions stay valid."""
+
+    if checkpoint is None:
+        return False
+    boundary = checkpoint.boundary
+    prior_flag = boundary.get("flag")
+    current_flag = (
+        [
+            flag.flag,
+            flag.calibrated_started_at_us if flag.calibrated_started_at_us is not None else flag.started_at_us,
+            flag.provider_code,
+            flag.provider_label,
+        ]
+        if flag is not None
+        else None
+    )
+    if prior_flag != current_flag:
+        return False
+    prior_gap = boundary.get("source_gap")
+    current_gap = [open_gap.started_at_us, open_gap.reason] if open_gap is not None else None
+    if prior_gap != current_gap:
+        return False
+    prior_items = boundary.get("participants")
+    if not isinstance(prior_items, list):
+        return False
+    prior = {
+        item.get("participant_id"): item
+        for item in prior_items
+        if isinstance(item, Mapping) and isinstance(item.get("participant_id"), str)
+    }
+    current_ids = {row["participant_id"] for row in participant_rows}
+    # Explicit source LAPS retains the full path because numbered slow-lap
+    # history is public. The bounded cursor targets the provider's current
+    # no-LAPS schema, where raw LAST facts have no official lap number.
+    if any(row["state_laps"] is not None for row in participant_rows):
+        return False
+    if set(prior) != current_ids or not current_ids.issubset(checkpoint.values_by_participant):
+        return False
+    if any(
+        type(checkpoint.values_by_participant[participant_id].get(key)) is not int
+        for participant_id in current_ids
+        for key in ("observed_lap_count", "clean_lap_count")
+    ):
+        return False
+    active_stints = {
+        row["participant_id"]: [int(row["stint_number"]), int(row["started_at_us"])]
+        for row in stint_rows
+        if row["ended_at_us"] is None
+    }
+    for row in participant_rows:
+        participant_id = row["participant_id"]
+        previous = prior[participant_id]
+        if previous.get("state_kind") != row["state_kind"]:
+            return False
+        previous_pits = previous.get("pits")
+        current_pits = [
+            [stop.stop_number, stop.entered_at_us, stop.exited_at_us, stop.completed]
+            for stop in sorted(
+                pits_by_participant.get(participant_id, ()),
+                key=lambda stop: (stop.stop_number, stop.entered_at_us),
+            )
+        ]
+        if previous_pits != current_pits:
+            return False
+        previous_stint = previous.get("active_stint")
+        previous_stint_identity = (
+            previous_stint[:2]
+            if isinstance(previous_stint, list) and len(previous_stint) == 3
+            else None
+        )
+        if previous_stint_identity != active_stints.get(participant_id):
+            return False
+    return True
+
+
+def load_heat_metric_input(
+    connection: sqlite3.Connection,
+    source_heat_id: int,
+    *,
+    metric_checkpoint_version: int | None = None,
+) -> HeatMetricInput:
     """Read one source heat into facts only; no formula or dashboard choice leaks in."""
 
     if type(source_heat_id) is not int or source_heat_id <= 0:
@@ -880,6 +1132,11 @@ def load_heat_metric_input(connection: sqlite3.Connection, source_heat_id: int) 
         ).fetchone()
         if heat is None:
             raise MetricStoreError(f"Source heat does not exist: {source_heat_id}")
+        checkpoint = _load_metric_input_checkpoint(
+            connection,
+            source_heat_id=source_heat_id,
+            metric_version=metric_checkpoint_version,
+        )
 
         tick_row = connection.execute(
             """
@@ -1122,10 +1379,46 @@ def load_heat_metric_input(connection: sqlite3.Connection, source_heat_id: int) 
                 )
             )
 
+        stint_rows = connection.execute(
+            """
+            SELECT participant_id,stint_number,started_at_us,ended_at_us,started_lap,ended_lap,
+                   completed_laps,source_message_id,source_key
+            FROM tire_stints
+            WHERE source_heat_id = ?
+            ORDER BY participant_id,stint_number
+            """,
+            (source_heat_id,),
+        ).fetchall()
+        checkpoint_usable = _checkpoint_dependencies_unchanged(
+            checkpoint,
+            flag=flag,
+            open_gap=open_gap,
+            participant_rows=participant_rows,
+            pits_by_participant=pits_by_participant,
+            stint_rows=stint_rows,
+        )
+        if checkpoint_usable and checkpoint is not None:
+            new_event_counts = connection.execute(
+                """
+                SELECT COALESCE(MAX(event_count),0) AS maximum_count
+                FROM (
+                  SELECT COUNT(*) AS event_count
+                  FROM result_last_cell_ledger
+                  WHERE source_heat_id = ? AND source_frame_id > ?
+                    AND source_handle = 'r_c' AND classification = 'CONFIRMED_LAP'
+                    AND duration_ms IS NOT NULL AND duration_ms > 0
+                  GROUP BY participant_id
+                )
+                """,
+                (source_heat_id, checkpoint.source_frame_id),
+            ).fetchone()
+            checkpoint_usable = int(new_event_counts["maximum_count"]) < METRIC_INPUT_TAIL_LAPS
+
         raw_laps_by_participant, latest_timing_event_ids, raw_last_cell_ids = _load_raw_result_last_laps(
             connection,
             source_heat_id=source_heat_id,
             pits_by_participant=pits_by_participant,
+            tail_limit=METRIC_INPUT_TAIL_LAPS if checkpoint_usable else None,
         )
         laps_by_participant: dict[str, list[LapInput]] = defaultdict(list)
         for participant_id, duration_source_cell_id, tracker_boundary, explicit_grid_duration, lap in legacy_laps:
@@ -1161,21 +1454,138 @@ def load_heat_metric_input(connection: sqlite3.Connection, source_heat_id: int) 
         for participant_id, raw_laps in raw_laps_by_participant.items():
             laps_by_participant[participant_id].extend(raw_laps)
 
+        checkpoint_fields: dict[str, dict[str, Any]] = {}
+        checkpoint_participants = {
+            item.get("participant_id"): item
+            for item in (checkpoint.boundary.get("participants", []) if checkpoint is not None else [])
+            if isinstance(item, Mapping) and isinstance(item.get("participant_id"), str)
+        }
+        active_stint_rows = {
+            row["participant_id"]: row for row in stint_rows if row["ended_at_us"] is None
+        }
+        if checkpoint_usable and checkpoint is not None:
+            for participant_id in (row["participant_id"] for row in participant_rows):
+                values = checkpoint.values_by_participant[participant_id]
+                boundary_participant = checkpoint_participants[participant_id]
+                previous_observed = values.get("observed_lap_count")
+                previous_clean = values.get("clean_lap_count")
+                if type(previous_observed) is not int or type(previous_clean) is not int:
+                    checkpoint_usable = False
+                    break
+                checkpoint_tail = [
+                    lap
+                    for lap in laps_by_participant[participant_id]
+                    if lap.timing_eligible
+                    and lap.source_frame_id is not None
+                    and lap.source_frame_id <= checkpoint.source_frame_id
+                ]
+                observed_prefix = max(0, previous_observed - len(checkpoint_tail))
+                clean_prefix = max(0, previous_clean - sum(lap.is_clean for lap in checkpoint_tail))
+                raw_checkpoint_count = sum(
+                    lap.timing_event_id is not None and lap.source_frame_id is not None
+                    and lap.source_frame_id <= checkpoint.source_frame_id
+                    for lap in raw_laps_by_participant.get(participant_id, ())
+                )
+                capture_prefix = max(0, previous_observed - raw_checkpoint_count)
+                raw_laps_by_participant[participant_id] = [
+                    replace(
+                        lap,
+                        capture_sequence=capture_prefix + index,
+                        # Metrics committed at the cursor already contain the
+                        # last and personal-best sectors through that frame.
+                        # Only newly arrived source sector cells need parsing.
+                        sectors_json=(
+                            lap.sectors_json
+                            if lap.source_frame_id is None
+                            or lap.source_frame_id > checkpoint.source_frame_id
+                            else None
+                        ),
+                    )
+                    for index, lap in enumerate(raw_laps_by_participant.get(participant_id, ()), start=1)
+                ]
+                # Replace the already-added raw objects with their restored
+                # whole-capture sequence values.
+                raw_ids = {
+                    lap.timing_event_id for lap in raw_laps_by_participant[participant_id]
+                    if lap.timing_event_id is not None
+                }
+                updated_raw = {
+                    lap.timing_event_id: lap
+                    for lap in raw_laps_by_participant[participant_id]
+                    if lap.timing_event_id is not None
+                }
+                laps_by_participant[participant_id] = [
+                    updated_raw[lap.timing_event_id]
+                    if lap.timing_event_id in raw_ids
+                    else lap
+                    for lap in laps_by_participant[participant_id]
+                ]
+                sector_checkpoint = values.get("personal_best_sector_ms")
+                sectors = tuple(
+                    sorted(
+                        (key, value)
+                        for key, value in sector_checkpoint.items()
+                        if isinstance(key, str) and type(value) is int and value > 0
+                    )
+                ) if isinstance(sector_checkpoint, Mapping) else ()
+                last_sector_checkpoint = values.get("last_sector_ms")
+                last_sectors = tuple(
+                    sorted(
+                        (key, value)
+                        for key, value in last_sector_checkpoint.items()
+                        if isinstance(key, str) and type(value) is int and value > 0
+                    )
+                ) if isinstance(last_sector_checkpoint, Mapping) else ()
+                stint_summary = values.get("stint_summary")
+                active_row = active_stint_rows.get(participant_id)
+                prior_active = boundary_participant.get("active_stint")
+                same_active = (
+                    active_row is not None
+                    and isinstance(prior_active, list)
+                    and len(prior_active) == 3
+                    and prior_active[:2] == [int(active_row["stint_number"]), int(active_row["started_at_us"])]
+                )
+                active_tail = [
+                    lap
+                    for lap in checkpoint_tail
+                    if active_row is not None
+                    and lap.capture_at_us is not None
+                    and lap.capture_at_us >= int(active_row["started_at_us"])
+                ]
+                previous_stint_observed = values.get("tyre_age_laps") if same_active else 0
+                previous_stint_clean = values.get("stint_clean_lap_count") if same_active else 0
+                checkpoint_fields[participant_id] = {
+                    "observed_prefix": observed_prefix,
+                    "clean_prefix": clean_prefix,
+                    "best_lap_ms": values.get("best_lap_ms") if type(values.get("best_lap_ms")) is int else None,
+                    "last_sectors": last_sectors,
+                    "sectors": sectors,
+                    "active_observed_prefix": max(
+                        0,
+                        (previous_stint_observed if type(previous_stint_observed) is int else 0)
+                        - len(active_tail),
+                    ),
+                    "active_clean_prefix": max(
+                        0,
+                        (previous_stint_clean if type(previous_stint_clean) is int else 0)
+                        - sum(lap.is_clean for lap in active_tail),
+                    ),
+                    "active_best_lap_ms": (
+                        values.get("stint_best_lap_ms")
+                        if same_active and type(values.get("stint_best_lap_ms")) is int
+                        else None
+                    ),
+                    "stint_summary": tuple(stint_summary) if isinstance(stint_summary, list) else (),
+                }
+        if not checkpoint_usable:
+            checkpoint_fields.clear()
+
         source_grid_laps = {
             row["participant_id"]: _int(row["state_laps"]) is not None
             for row in participant_rows
         }
         stints_by_participant: dict[str, list[TireStintInput]] = defaultdict(list)
-        for row in connection.execute(
-            """
-            SELECT participant_id,stint_number,started_at_us,ended_at_us,started_lap,ended_lap,
-                   completed_laps,source_message_id,source_key
-            FROM tire_stints
-            WHERE source_heat_id = ?
-            ORDER BY participant_id,stint_number
-            """,
-            (source_heat_id,),
-        ):
+        for row in stint_rows:
             participant_id = row["participant_id"]
             started_at_us = int(row["started_at_us"])
             ended_at_us = _int(row["ended_at_us"])
@@ -1188,6 +1598,25 @@ def load_heat_metric_input(connection: sqlite3.Connection, source_heat_id: int) 
                 and (ended_at_us is None or lap.capture_at_us < ended_at_us)
             )
             capture_basis = not source_grid_laps.get(participant_id, False) and bool(capture_events)
+            checkpoint_values = checkpoint.values_by_participant.get(participant_id) if checkpoint_usable and checkpoint else None
+            boundary_participant = checkpoint_participants.get(participant_id)
+            same_active_checkpoint = (
+                ended_at_us is None
+                and isinstance(boundary_participant, Mapping)
+                and isinstance(boundary_participant.get("active_stint"), list)
+                and boundary_participant["active_stint"][:2] == [int(row["stint_number"]), started_at_us]
+            )
+            if capture_basis and same_active_checkpoint and checkpoint_values is not None and checkpoint is not None:
+                previous_age = checkpoint_values.get("tyre_age_laps")
+                new_capture_count = sum(
+                    1
+                    for lap in capture_events
+                    if lap.source_frame_id is not None
+                    and lap.source_frame_id > checkpoint.source_frame_id
+                    and lap.capture_at_us is not None
+                    and lap.capture_at_us >= started_at_us
+                )
+                capture_lap_count = (previous_age if type(previous_age) is int else 0) + new_capture_count
             stints_by_participant[row["participant_id"]].append(
                 TireStintInput(
                     stint_number=int(row["stint_number"]),
@@ -1226,6 +1655,7 @@ def load_heat_metric_input(connection: sqlite3.Connection, source_heat_id: int) 
         participants: list[ParticipantMetricInput] = []
         for row in participant_rows:
             participant_id = row["participant_id"]
+            checkpoint_value = checkpoint_fields.get(participant_id, {})
             participants.append(
                 ParticipantMetricInput(
                     id=participant_id,
@@ -1245,6 +1675,19 @@ def load_heat_metric_input(connection: sqlite3.Connection, source_heat_id: int) 
                     pit_stops=tuple(pits_by_participant[participant_id]),
                     tire_stints=tuple(stints_by_participant[participant_id]),
                     latest_timing_event_id=latest_timing_event_ids.get(participant_id),
+                    observed_lap_count_prefix=int(checkpoint_value.get("observed_prefix", 0)),
+                    clean_lap_count_prefix=int(checkpoint_value.get("clean_prefix", 0)),
+                    best_lap_ms_checkpoint=checkpoint_value.get("best_lap_ms"),
+                    last_sector_ms_checkpoint=checkpoint_value.get("last_sectors", ()),
+                    personal_best_sector_ms_checkpoint=checkpoint_value.get("sectors", ()),
+                    active_stint_observed_lap_count_prefix=int(
+                        checkpoint_value.get("active_observed_prefix", 0)
+                    ),
+                    active_stint_clean_lap_count_prefix=int(
+                        checkpoint_value.get("active_clean_prefix", 0)
+                    ),
+                    active_stint_best_lap_ms_checkpoint=checkpoint_value.get("active_best_lap_ms"),
+                    stint_summary_checkpoint=checkpoint_value.get("stint_summary", ()),
                 )
             )
         participants.sort(key=_participant_sort_key)

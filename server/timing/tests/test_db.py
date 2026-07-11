@@ -83,7 +83,7 @@ class TimingDatabaseTests(unittest.TestCase):
             path = Path(temporary) / "timing.db"
             self.assertEqual(
                 migrate(path),
-                ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016"],
+                ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017"],
             )
             self.assertEqual(migrate(path), [])
             connection = connect(path)
@@ -492,7 +492,7 @@ class TimingDatabaseTests(unittest.TestCase):
 
             self.assertEqual(
                 migrate(path),
-                ["0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016"],
+                ["0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017"],
             )
             connection = connect(path)
             try:
@@ -512,7 +512,7 @@ class TimingDatabaseTests(unittest.TestCase):
             legacy_migrations = root / "legacy-migrations"
             legacy_migrations.mkdir()
             for migration in sorted((Path(__file__).parent.parent / "migrations").glob("00[0-1][0-9]_*.sql")):
-                if migration.name.startswith(("0013_", "0014_", "0015_", "0016_")):
+                if migration.name.startswith(("0013_", "0014_", "0015_", "0016_", "0017_")):
                     continue
                 shutil.copyfile(migration, legacy_migrations / migration.name)
             self.assertEqual(
@@ -608,7 +608,7 @@ class TimingDatabaseTests(unittest.TestCase):
             finally:
                 connection.close()
 
-            self.assertEqual(migrate(path), ["0013", "0014", "0015", "0016"])
+            self.assertEqual(migrate(path), ["0013", "0014", "0015", "0016", "0017"])
             connection = connect(path)
             try:
                 current = connection.execute(
@@ -645,7 +645,7 @@ class TimingDatabaseTests(unittest.TestCase):
             legacy_migrations = root / "legacy-migrations"
             legacy_migrations.mkdir()
             for migration in sorted((Path(__file__).parent.parent / "migrations").glob("00[0-1][0-9]_*.sql")):
-                if migration.name.startswith(("0014_", "0015_", "0016_")):
+                if migration.name.startswith(("0014_", "0015_", "0016_", "0017_")):
                     continue
                 shutil.copyfile(migration, legacy_migrations / migration.name)
             self.assertEqual(
@@ -720,7 +720,7 @@ class TimingDatabaseTests(unittest.TestCase):
             finally:
                 connection.close()
 
-            self.assertEqual(migrate(path), ["0014", "0015", "0016"])
+            self.assertEqual(migrate(path), ["0014", "0015", "0016", "0017"])
             connection = connect(path)
             try:
                 observation = connection.execute(
@@ -888,7 +888,7 @@ class TimingDatabaseTests(unittest.TestCase):
             legacy_migrations = root / "legacy-migrations"
             legacy_migrations.mkdir()
             for migration in sorted((Path(__file__).parent.parent / "migrations").glob("00[0-1][0-9]_*.sql")):
-                if migration.name.startswith("0016_"):
+                if migration.name.startswith(("0016_", "0017_")):
                     continue
                 shutil.copyfile(migration, legacy_migrations / migration.name)
             self.assertEqual(migrate(path, directory=legacy_migrations)[-1], "0015")
@@ -910,7 +910,7 @@ class TimingDatabaseTests(unittest.TestCase):
             finally:
                 connection.close()
 
-            self.assertEqual(migrate(path), ["0016"])
+            self.assertEqual(migrate(path), ["0016", "0017"])
             connection = connect(path)
             try:
                 row = connection.execute(
