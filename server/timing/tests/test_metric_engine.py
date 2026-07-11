@@ -440,6 +440,23 @@ def with_participant(heat, updated):
 
 
 class MetricEngineTests(unittest.TestCase):
+    def test_ready_race_rejects_implausible_provider_start_and_keeps_full_duration(self):
+        heat = heat_input(flag="GREEN")
+        assert heat.current_flag is not None
+        ready = replace(
+            heat,
+            provider_started_at_us=946_674_000_077_713,
+            current_flag=replace(
+                heat.current_flag,
+                flag="READY",
+                provider_code="1",
+                provider_label="Ready",
+            ),
+        )
+        session = candidate_values(evaluate_heat_metrics(ready), "session", "session-1")
+        self.assertEqual(session["session_elapsed_s"], 0.0)
+        self.assertEqual(session["session_remaining_s"], 14_400.0)
+
     def test_finish_flag_makes_the_tactical_channel_offline(self):
         heat = heat_input(flag="GREEN")
         assert heat.current_flag is not None
