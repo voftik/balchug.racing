@@ -2,6 +2,7 @@
   "use strict";
 
   var API = "/api/timing";
+  var ADMIN_TOKEN_KEY = "balchug_admin";
   var ENGINEER_TOKEN_KEY = "balchug_engineer_token";
   var PANEL_STATE_KEY = "balchug_timing_panel";
   var TAB_TITLES = {
@@ -96,13 +97,11 @@
   }
 
   var dom = {
-    workspace: byId("timingWorkspace"), panel: byId("engineerPanel"), iframe: byId("lt"),
-    open: byId("panelOpen"), close: byId("panelClose"), pin: byId("panelPin"),
+    workspace: byId("timingWorkspace"), suite: byId("engineerSuite"), panel: byId("engineerPanel"), iframe: byId("lt"),
     sessionBadge: byId("sessionBadge"), sessionClock: byId("sessionClock"), stop: byId("sessionStop"),
     panelFlagStrip: byId("panelFlagStrip"), panelFlag: byId("panelFlag"), panelFlagElapsed: byId("panelFlagElapsed"),
     panelMode: byId("panelMode"), panelHeat: byId("panelHeat"), freshness: byId("freshnessBadge"),
     panelSessionTime: byId("panelSessionTime"), panelIdentity: byId("panelIdentity"),
-    railFlag: byId("railFlag"), railPic: byId("railPic"), railTyres: byId("railTyres"), railPits: byId("railPits"),
     position: byId("decisionPosition"), ahead: byId("decisionAhead"), behind: byId("decisionBehind"),
     pace: byId("decisionPace"), tyres: byId("decisionTyres"), pits: byId("decisionPits"),
     viewTitle: byId("panelViewTitle"), scroll: byId("panelScroll"),
@@ -116,7 +115,12 @@
     engineerDialog: byId("engineerDialog"), engineerForm: byId("engineerForm"), engineerToken: byId("engineerToken"),
     engineerError: byId("engineerError")
   };
-  if (!dom.workspace || !dom.panel) return;
+  if (!dom.workspace || !dom.suite || !dom.panel) return;
+  try {
+    if (!localStorage.getItem(ADMIN_TOKEN_KEY)) return;
+  } catch (error) { return; }
+  document.body.classList.add("admin");
+  dom.suite.hidden = false;
 
   var query = new URLSearchParams(location.search);
   var demoMode = query.get("demo");
@@ -125,8 +129,6 @@
     track: query.get("track") === "moscow" ? "moscow" : "igora",
     demo: demoMode === "1" || demoMode === "24h",
     longDemo: demoMode === "24h",
-    panelOpen: savedPanel.open === true,
-    pinned: savedPanel.pinned === true && window.innerWidth >= 1440,
     tab: TAB_TITLES[savedPanel.tab] ? savedPanel.tab : "overview",
     activeSession: null,
     snapshot: null,
@@ -399,38 +401,8 @@
     });
   }
 
-  function openPanel(options) {
-    state.panelOpen = true;
-    if (options && options.focus === false) {
-      applyPanelState();
-      return;
-    }
-    applyPanelState();
-    window.setTimeout(function () { dom.close.focus(); }, 0);
-  }
-
-  function closePanel() {
-    state.panelOpen = false;
-    state.pinned = false;
-    closeCompetitors();
-    applyPanelState();
-    dom.open.focus();
-  }
-
-  function applyPanelState() {
-    if (window.innerWidth < 1440) state.pinned = false;
-    dom.workspace.dataset.panelOpen = String(state.panelOpen);
-    dom.workspace.dataset.panelPinned = String(state.panelOpen && state.pinned);
-    dom.panel.setAttribute("aria-hidden", String(!state.panelOpen));
-    dom.open.setAttribute("aria-expanded", String(state.panelOpen));
-    dom.pin.setAttribute("aria-pressed", String(state.pinned));
-    dom.pin.textContent = state.pinned ? "Открепить" : "Закрепить";
-    dom.pin.setAttribute("data-tooltip", state.pinned ? "Вернуть панель в режим поверх табло" : "Закрепить панель рядом с табло");
-    var mobileOpen = window.innerWidth < 768 && state.panelOpen;
-    document.documentElement.classList.toggle("timing-panel-mobile-open", mobileOpen);
-    if (mobileOpen) dom.iframe.setAttribute("tabindex", "-1");
-    else dom.iframe.removeAttribute("tabindex");
-    writeJson(PANEL_STATE_KEY, { open: state.panelOpen, pinned: state.pinned, tab: state.tab });
+  function persistPanelState() {
+    writeJson(PANEL_STATE_KEY, { tab: state.tab });
   }
 
   function switchTab(tab, focus) {
@@ -448,7 +420,7 @@
     dom.viewTitle.textContent = TAB_TITLES[tab];
     dom.scroll.scrollTop = 0;
     renderView(true);
-    applyPanelState();
+    persistPanelState();
   }
 
   function render() {
@@ -483,7 +455,6 @@
     var metric = view.sessionMetric || {};
     var active = view.lifecycle === "active";
     dom.panelFlagStrip.dataset.flag = view.flag;
-    dom.railFlag.dataset.flag = view.flag;
     dom.panelFlag.textContent = view.flag === "UNKNOWN" ? "Нет данных о флаге" : view.flag;
     dom.panelFlagElapsed.textContent = isNumber(view.flagElapsedS) ? formatDuration(view.flagElapsedS) : "—";
     dom.panelMode.textContent = active ? modeLabel(view.mode) : "Режим не запущен";
@@ -496,15 +467,11 @@
     dom.panelIdentity.textContent = ours
       ? participantLabel(ours) + (ours.driverName ? " · " + ours.driverName : "")
       : view.identityState === "unresolved" ? "Экипаж определяется автоматически" : "BALCHUG Racing · #21";
-    dom.railPic.textContent = ours && isNumber(ours.positionClass) ? "P" + ours.positionClass : "—";
-    dom.railTyres.textContent = ours && isNumber(ours.tyreAge) ? ours.tyreAge + "L" : "—";
-    dom.railPits.textContent = ours && isNumber(ours.pitsCompleted)
-      ? ours.pitsCompleted + (isNumber(view.requiredPits) ? "/" + view.requiredPits : "") : "—";
     dom.position.textContent = ours && isNumber(ours.positionClass)
       ? "P" + ours.positionClass + (isNumber(ours.positionOverall) ? " · OA " + ours.positionOverall : "") : "—";
     dom.ahead.textContent = formatGap(metric.gap_to_ahead_ms);
     dom.behind.textContent = formatGap(metric.gap_to_behind_ms);
-    dom.pace.textContent = ours ? formatLap(ours.pace5Ms) : "—";
+    dom.pace.textContent = ours ? formatLap(ours.lastLapMs) : "—";
     dom.tyres.textContent = ours ? formatLaps(ours.tyreAge) : "—";
     dom.pits.textContent = ours && isNumber(ours.pitsCompleted)
       ? ours.pitsCompleted + (isNumber(view.requiredPits) ? " / " + view.requiredPits : "") : "—";
@@ -534,7 +501,7 @@
   }
 
   function inactiveMarkup() {
-    return '<div class="panel-empty"><h3>Анализ не запущен</h3><p>Выберите Практику, Квалификацию или Гонку над табло. Экипаж, класс, шины, круги и интервалы будут определены автоматически.</p></div>';
+    return '<div class="panel-empty"><h3>Анализ не запущен</h3><p>Экипаж, класс, возраст шин, круги и интервалы определяются автоматически после запуска сессии.</p></div>';
   }
 
   function renderOverview(element) {
@@ -802,7 +769,7 @@
     var triggerRect = dom.competitorTrigger.getBoundingClientRect();
     var panelRect = dom.panel.getBoundingClientRect();
     dom.competitorPopover.style.top = Math.max(8, triggerRect.bottom - panelRect.top + 6) + "px";
-    dom.competitorPopover.style.maxHeight = Math.max(180, panelRect.bottom - triggerRect.bottom - 14) + "px";
+    dom.competitorPopover.style.maxHeight = Math.min(480, Math.max(180, window.innerHeight - triggerRect.bottom - 16)) + "px";
     dom.competitorPopover.classList.add("open");
     dom.competitorTrigger.setAttribute("aria-expanded", "true");
     renderCompetitorList();
@@ -900,7 +867,6 @@
       state.activeSession = { id: state.view.sessionId, mode: mode, lifecycle: "active" };
       restoreDisplayState();
       render();
-      openPanel();
       return;
     }
     setBusy(true, "Создаём сессию " + modeLabel(mode));
@@ -922,7 +888,6 @@
       return loadSnapshot(started.session.id);
     }).then(function () {
       connectStream(state.activeSession.id);
-      openPanel();
     }).catch(function (error) {
       handleMutationError(error, function () { requestStart(mode, raceOptions); });
     }).finally(function () { setBusy(false); });
@@ -1124,9 +1089,6 @@
     window.addEventListener("resize", hide);
   }
 
-  dom.open.addEventListener("click", openPanel);
-  dom.close.addEventListener("click", closePanel);
-  dom.pin.addEventListener("click", function () { state.pinned = !state.pinned; applyPanelState(); });
   dom.competitorTrigger.addEventListener("click", function () {
     if (dom.competitorPopover.classList.contains("open")) closeCompetitors(); else openCompetitors();
   });
@@ -1219,17 +1181,8 @@
   document.addEventListener("keydown", function (event) {
     if (event.key === "Escape") {
       if (dom.competitorPopover.classList.contains("open")) { closeCompetitors(); dom.competitorTrigger.focus(); event.preventDefault(); }
-      else if (state.panelOpen && !state.pinned && !dom.raceDialog.open && !dom.engineerDialog.open) { closePanel(); event.preventDefault(); }
-    }
-    if (event.key === "Tab" && state.panelOpen && window.innerWidth < 768 && !dom.raceDialog.open && !dom.engineerDialog.open) {
-      var focusable = all('button:not([disabled]),input:not([disabled]),[tabindex]:not([tabindex="-1"])', dom.panel).filter(function (node) { return node.offsetParent !== null; });
-      if (!focusable.length) return;
-      var first = focusable[0], last = focusable[focusable.length - 1];
-      if (event.shiftKey && document.activeElement === first) { last.focus(); event.preventDefault(); }
-      else if (!event.shiftKey && document.activeElement === last) { first.focus(); event.preventDefault(); }
     }
   });
-  window.addEventListener("resize", function () { applyPanelState(); });
   window.addEventListener("balchug:trackchange", function (event) {
     var nextTrack = event.detail && event.detail.track;
     if (!nextTrack || nextTrack === state.track) return;
@@ -1239,7 +1192,6 @@
   window.addEventListener("beforeunload", closeStream);
 
   setupTooltips();
-  applyPanelState();
   switchTab(state.tab, false);
   loadActiveSession();
 }());

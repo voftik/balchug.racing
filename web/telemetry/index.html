@@ -54,38 +54,32 @@
         <span class="note">хронометраж активен во время заездов на трассе</span>
       </div>
 
-      <section class="session-console reveal" aria-label="Режим инженерного анализа">
-        <div class="session-launcher" id="sessionLauncher">
-          <span class="session-console-label">Режим анализа</span>
-          <button class="session-mode-button" type="button" data-session-mode="practice">Практика</button>
-          <button class="session-mode-button" type="button" data-session-mode="qualifying">Квалификация</button>
-          <button class="session-mode-button" type="button" data-session-mode="race">Гонка</button>
-        </div>
-        <div class="session-summary">
-          <span class="session-summary-label">Запись и расчёт</span>
-          <span class="session-badge" id="sessionBadge" data-status="idle">Не запущены</span>
-          <span class="session-clock" id="sessionClock">00:00:00</span>
-          <button class="session-stop-button" id="sessionStop" type="button" hidden>Завершить</button>
-        </div>
-      </section>
-
-      <div class="embed-wrap timing-workspace" id="timingWorkspace" data-panel-open="false" data-panel-pinned="false">
+      <div class="embed-wrap timing-workspace" id="timingWorkspace">
         <div class="timing-frame-stage">
           <div class="embed-loader" id="ld"><div class="gauge"></div><p>Загрузка телеметрии…</p></div>
           <iframe id="lt" src="https://livetiming.getraceresults.com/igora" title="Live timing"
                   allow="fullscreen" referrerpolicy="no-referrer-when-downgrade"
                   onload="document.getElementById('ld').classList.add('hidden')"></iframe>
         </div>
+      </div>
 
-        <aside class="timing-rail" id="timingRail" aria-label="Ключевые показатели инженерной панели">
-          <span class="rail-flag" id="railFlag" data-flag="UNKNOWN" data-tooltip="Текущий флаг трассы"></span>
-          <span class="rail-value"><b id="railPic">—</b><span>PIC</span></span>
-          <span class="rail-value"><b id="railTyres">—</b><span>шины</span></span>
-          <span class="rail-value"><b id="railPits">—</b><span>питы</span></span>
-          <button class="rail-open" id="panelOpen" type="button" aria-controls="engineerPanel" aria-expanded="false" data-tooltip="Открыть инженерную панель">›</button>
-        </aside>
+      <section class="engineer-suite" id="engineerSuite" aria-label="Инженерный анализ" hidden>
+        <section class="session-console" aria-label="Режим инженерного анализа">
+          <div class="session-launcher" id="sessionLauncher">
+            <span class="session-console-label">Режим анализа</span>
+            <button class="session-mode-button" type="button" data-session-mode="practice">Практика</button>
+            <button class="session-mode-button" type="button" data-session-mode="qualifying">Квалификация</button>
+            <button class="session-mode-button" type="button" data-session-mode="race">Гонка</button>
+          </div>
+          <div class="session-summary">
+            <span class="session-summary-label">Запись и расчёт</span>
+            <span class="session-badge" id="sessionBadge" data-status="idle">Не запущены</span>
+            <span class="session-clock" id="sessionClock">00:00:00</span>
+            <button class="session-stop-button" id="sessionStop" type="button" hidden>Завершить</button>
+          </div>
+        </section>
 
-        <section class="engineer-panel" id="engineerPanel" aria-label="Инженерная панель" aria-hidden="true">
+        <section class="engineer-panel" id="engineerPanel" aria-label="Тактический дашборд">
           <div class="panel-flag-strip" id="panelFlagStrip" data-flag="UNKNOWN">
             <span id="panelFlag">Нет данных о флаге</span>
             <span id="panelFlagElapsed">—</span>
@@ -100,17 +94,13 @@
                 <span id="panelIdentity">BALCHUG Racing · #21</span>
               </div>
             </div>
-            <div class="panel-header-actions">
-              <button class="panel-command panel-pin" id="panelPin" type="button" aria-pressed="false" data-tooltip="Закрепить панель рядом с табло">Закрепить</button>
-              <button class="panel-close" id="panelClose" type="button" data-tooltip="Закрыть инженерную панель" aria-label="Закрыть инженерную панель">×</button>
-            </div>
           </div>
 
           <div class="decision-strip" aria-label="Ключевые тактические показатели">
             <div class="decision-item"><span class="decision-label">Позиция</span><b class="decision-value" id="decisionPosition">—</b></div>
-            <div class="decision-item"><span class="decision-label">Впереди</span><b class="decision-value" id="decisionAhead">—</b></div>
-            <div class="decision-item"><span class="decision-label">Сзади</span><b class="decision-value" id="decisionBehind">—</b></div>
-            <div class="decision-item"><span class="decision-label">Pace5</span><b class="decision-value" id="decisionPace">—</b></div>
+            <div class="decision-item"><span class="decision-label">До соперника впереди</span><b class="decision-value" id="decisionAhead">—</b></div>
+            <div class="decision-item"><span class="decision-label">До соперника сзади</span><b class="decision-value" id="decisionBehind">—</b></div>
+            <div class="decision-item"><span class="decision-label">Последний круг</span><b class="decision-value" id="decisionPace">—</b></div>
             <div class="decision-item"><span class="decision-label">Возраст шин</span><b class="decision-value" id="decisionTyres">—</b></div>
             <div class="decision-item"><span class="decision-label">Питы</span><b class="decision-value" id="decisionPits">—</b></div>
           </div>
@@ -152,7 +142,7 @@
 
           <div class="panel-live-region" id="panelLiveRegion" aria-live="polite"></div>
         </section>
-      </div>
+      </section>
     </div>
   </main>
 
