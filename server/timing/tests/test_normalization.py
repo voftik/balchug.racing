@@ -41,6 +41,21 @@ class TimeServiceTimeTests(unittest.TestCase):
         self.assertEqual(calibrator.to_utc_us(provider), received_at_to_unix_us(received))
         self.assertIsNone(ConnectionClockCalibrator().to_utc_us(provider))
 
+    def test_clock_checkpoint_preserves_the_ordered_median_window(self):
+        provider = 2_000_000
+        calibrator = ConnectionClockCalibrator(max_samples=3)
+        calibrator.observe(provider, TIME_SERVICE_EPOCH_UNIX_US + provider + 50)
+        calibrator.observe(provider, TIME_SERVICE_EPOCH_UNIX_US + provider + 10)
+        calibrator.observe(provider, TIME_SERVICE_EPOCH_UNIX_US + provider + 30)
+
+        restored = ConnectionClockCalibrator.from_snapshot(calibrator.snapshot())
+
+        self.assertEqual(restored.snapshot(), calibrator.snapshot())
+        self.assertEqual(restored.offset_us, 30)
+        self.assertEqual(restored.to_utc_us(provider), TIME_SERVICE_EPOCH_UNIX_US + provider + 30)
+        with self.assertRaises(ValueError):
+            ConnectionClockCalibrator.from_snapshot({"max_samples": 2, "offsets_us": [1, 2, 3]})
+
 
 class ResultTableNormalizationTests(unittest.TestCase):
     @staticmethod

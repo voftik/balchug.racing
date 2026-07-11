@@ -21,10 +21,12 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .config import now_us
-from .db import connect
+from .db import CheckpointError, RUNTIME_CHECKPOINT_FORMAT, RUNTIME_CHECKPOINT_FORMAT_VERSION, connect
 from .metric_store import PLAYBACK_PAYLOAD_CODEC, PLAYBACK_PROJECTION_VERSION
 from .normalization import OPEN_ENDED_TS_TIME, parse_ts_time, time_service_to_unix_us
+from .normalizer_writer import RUNTIME_CHECKPOINT_REDUCER_VERSION, NormalizerError, validate_runtime_checkpoint
 from .playback import PLAYBACK_SCHEMA_VERSION
+from .result_grid import ResultGridStateError
 
 
 US_PER_SECOND = 1_000_000
@@ -54,6 +56,10 @@ ARCHIVE_COMPARISON_LAP_BUCKET_US = 60 * US_PER_SECOND
 # label its x-axis with the clock actually shown on the timing dashboard.
 ARCHIVE_SOURCE_CLOCK_MAX_INTERPOLATION_US = 90 * US_PER_SECOND
 MAX_ARCHIVE_SOURCE_CLOCK_ANCHORS = 4_000
+# Health is a public diagnostic surface. Validate only a small newest window
+# of compressed reducer checkpoints per request; restart/retention retain the
+# unbounded fail-closed scan needed for recovery decisions.
+MAX_HEALTH_CHECKPOINT_VALIDATIONS = 8
 PIT_LANE_DURATION_SOURCE_KIND = "RESULT_L_PIT"
 
 SCOPE_KINDS = frozenset(("participant", "class", "session"))
@@ -249,6 +255,16 @@ class TimingReadModel:
             limit=limit,
             observation_limit=observation_limit,
         )
+
+    def ingest_health(self, session_id: str) -> dict[str, Any]:
+        """Return the durable recorder/reducer health for one session.
+
+        This is deliberately an operational read surface: it publishes frame
+        counts and immutable anchors, never a provider payload or reducer
+        checkpoint payload.
+        """
+
+        return read_ingest_health(session_id, database=self.database)
 
     def archived_sessions(self, *, limit: int = 50) -> dict[str, Any]:
         return read_archived_sessions(database=self.database, limit=limit)
@@ -536,6 +552,407 @@ def _open_gap(connection: sqlite3.Connection, heat_id: int) -> dict[str, Any] | 
         if row is not None
         else None
     )
+
+
+def _health_frame_payload(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    """Publish frame provenance without exposing its provider payload."""
+
+    if row is None:
+        return None
+    return {
+        "frame_id": int(row["id"]),
+        "ingest_connection_id": row["ingest_connection_id"],
+        "frame_sequence": int(row["frame_sequence"]),
+        "received_at_us": int(row["received_at_us"]),
+        "decode_state": row["decode_state"],
+        "processed_at_us": row["processed_at_us"],
+    }
+
+
+def _health_frame_counts(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+    after_frame_id: int | None = None,
+) -> dict[str, int]:
+    """Count retained recorder frames for a whole session or one replay tail."""
+
+    suffix = " AND id > ?" if after_frame_id is not None else ""
+    parameters: tuple[Any, ...] = (
+        (session_id, after_frame_id) if after_frame_id is not None else (session_id,)
+    )
+    row = connection.execute(
+        f"""
+        SELECT COUNT(*) AS retained_frame_count,
+               COALESCE(SUM(CASE WHEN decode_state = 'decoded' THEN 1 ELSE 0 END), 0) AS decoded_frame_count,
+               COALESCE(SUM(CASE WHEN processed_at_us IS NOT NULL THEN 1 ELSE 0 END), 0) AS processed_frame_count,
+               COALESCE(
+                 SUM(CASE WHEN processed_at_us IS NULL AND decode_state != 'failed' THEN 1 ELSE 0 END),
+                 0
+               ) AS pending_frame_count,
+               COALESCE(SUM(CASE WHEN decode_state = 'failed' THEN 1 ELSE 0 END), 0) AS failed_frame_count
+        FROM feed_frames
+        WHERE analysis_session_id = ?{suffix}
+        """,
+        parameters,
+    ).fetchone()
+    assert row is not None
+    return {
+        "retained_frame_count": int(row["retained_frame_count"]),
+        "decoded_frame_count": int(row["decoded_frame_count"]),
+        "processed_frame_count": int(row["processed_frame_count"]),
+        "pending_frame_count": int(row["pending_frame_count"]),
+        "failed_frame_count": int(row["failed_frame_count"]),
+    }
+
+
+def _health_frame_row(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+    after_frame_id: int | None = None,
+    processed_only: bool = False,
+    ascending: bool = False,
+) -> sqlite3.Row | None:
+    """Select one immutable recorder frame using the reducer's id ordering."""
+
+    clauses = ["analysis_session_id = ?"]
+    parameters: list[Any] = [session_id]
+    if after_frame_id is not None:
+        clauses.append("id > ?")
+        parameters.append(after_frame_id)
+    if processed_only:
+        clauses.append("processed_at_us IS NOT NULL")
+    direction = "ASC" if ascending else "DESC"
+    return connection.execute(
+        f"""
+        SELECT id,ingest_connection_id,frame_sequence,received_at_us,decode_state,processed_at_us
+        FROM feed_frames
+        WHERE {' AND '.join(clauses)}
+        ORDER BY id {direction}
+        LIMIT 1
+        """,
+        tuple(parameters),
+    ).fetchone()
+
+
+def _runtime_checkpoint_health(
+    connection: sqlite3.Connection,
+    *,
+    session_id: str,
+) -> dict[str, Any]:
+    """Return runtime checkpoint provenance and the newest semantic restore point.
+
+    A structurally eligible checkpoint still may be corrupt or from an older
+    reducer. The latest field therefore comes only from a write-free semantic
+    reducer restore validation, matching the worker/retention contract.
+    """
+
+    total_count = int(
+        connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM state_checkpoints AS checkpoint
+            JOIN source_heats AS heat ON heat.id = checkpoint.source_heat_id
+            WHERE heat.analysis_session_id = ?
+              AND checkpoint.checkpoint_format = ?
+              AND checkpoint.checkpoint_format_version = ?
+            """,
+            (session_id, RUNTIME_CHECKPOINT_FORMAT, RUNTIME_CHECKPOINT_FORMAT_VERSION),
+        ).fetchone()[0]
+    )
+    eligible_count = int(
+        connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM state_checkpoints AS checkpoint
+            JOIN source_heats AS heat ON heat.id = checkpoint.source_heat_id
+            JOIN feed_frames AS frame ON frame.id = checkpoint.source_frame_id
+            LEFT JOIN timing_raw_retention_floors AS floor
+              ON floor.analysis_session_id = heat.analysis_session_id
+            WHERE heat.analysis_session_id = ?
+              AND checkpoint.checkpoint_format = ?
+              AND checkpoint.checkpoint_format_version = ?
+              AND frame.analysis_session_id = heat.analysis_session_id
+              AND frame.processed_at_us IS NOT NULL
+              AND (
+                floor.deleted_through_frame_id IS NULL
+                OR checkpoint.source_frame_id > floor.deleted_through_frame_id
+              )
+            """,
+            (session_id, RUNTIME_CHECKPOINT_FORMAT, RUNTIME_CHECKPOINT_FORMAT_VERSION),
+        ).fetchone()[0]
+    )
+    rows = connection.execute(
+        """
+        SELECT checkpoint.id,checkpoint.source_heat_id,heat.generation AS source_heat_generation,
+               checkpoint.source_frame_id,checkpoint.source_key,checkpoint.observed_at_us,
+               checkpoint.state_hash,checkpoint.checkpoint_format,checkpoint.checkpoint_format_version,
+               checkpoint.reducer_version,checkpoint.codec,checkpoint.payload,checkpoint.created_at_us,
+               heat.analysis_session_id,
+               frame.ingest_connection_id AS anchor_connection_id,
+               frame.frame_sequence AS anchor_frame_sequence,
+               frame.analysis_session_id AS anchor_analysis_session_id,
+               frame.received_at_us AS anchor_received_at_us,
+               frame.processed_at_us AS anchor_processed_at_us
+        FROM state_checkpoints AS checkpoint
+        JOIN source_heats AS heat ON heat.id = checkpoint.source_heat_id
+        JOIN feed_frames AS frame ON frame.id = checkpoint.source_frame_id
+        LEFT JOIN timing_raw_retention_floors AS floor
+          ON floor.analysis_session_id = heat.analysis_session_id
+        WHERE heat.analysis_session_id = ?
+          AND checkpoint.checkpoint_format = ?
+          AND checkpoint.checkpoint_format_version = ?
+          AND frame.analysis_session_id = heat.analysis_session_id
+          AND frame.processed_at_us IS NOT NULL
+          AND (
+            floor.deleted_through_frame_id IS NULL
+            OR checkpoint.source_frame_id > floor.deleted_through_frame_id
+          )
+        ORDER BY checkpoint.source_frame_id DESC,checkpoint.id DESC
+        LIMIT ?
+        """,
+        (
+            session_id,
+            RUNTIME_CHECKPOINT_FORMAT,
+            RUNTIME_CHECKPOINT_FORMAT_VERSION,
+            MAX_HEALTH_CHECKPOINT_VALIDATIONS,
+        ),
+    )
+    row: sqlite3.Row | None = None
+    rejected_newer_count = 0
+    for row in rows:
+        if row["reducer_version"] != RUNTIME_CHECKPOINT_REDUCER_VERSION:
+            rejected_newer_count += 1
+            continue
+        try:
+            validate_runtime_checkpoint(connection, row)
+        except (CheckpointError, NormalizerError, ResultGridStateError, ValueError, TypeError, KeyError, IndexError):
+            rejected_newer_count += 1
+            continue
+        break
+    else:
+        row = None
+    validation_truncated = row is None and eligible_count > rejected_newer_count
+    latest = (
+        {
+            "checkpoint_id": int(row["id"]),
+            "source_heat_id": int(row["source_heat_id"]),
+            "source_heat_generation": int(row["source_heat_generation"]),
+            "source_frame_id": int(row["source_frame_id"]),
+            "source_key": row["source_key"],
+            "observed_at_us": int(row["observed_at_us"]),
+            "anchor_received_at_us": int(row["anchor_received_at_us"]),
+            "anchor_processed_at_us": int(row["anchor_processed_at_us"]),
+            "state_hash": row["state_hash"],
+            "checkpoint_format": row["checkpoint_format"],
+            "checkpoint_format_version": int(row["checkpoint_format_version"]),
+            "reducer_version": row["reducer_version"],
+            "created_at_us": int(row["created_at_us"]),
+        }
+        if row is not None
+        else None
+    )
+    return {
+        "runtime_checkpoint_count": total_count,
+        "eligible_runtime_checkpoint_count": eligible_count,
+        "latest_validation": {
+            "status": (
+                "RESTORABLE"
+                if row is not None
+                else "SCAN_LIMIT_REACHED"
+                if validation_truncated
+                else "NO_RESTORABLE"
+            ),
+            "rejected_newer_or_incompatible_checkpoint_count": rejected_newer_count,
+            "scan_limit": MAX_HEALTH_CHECKPOINT_VALIDATIONS,
+            "truncated": validation_truncated,
+        },
+        "latest": latest,
+    }
+
+
+def _retention_floor_payload(connection: sqlite3.Connection, *, session_id: str) -> dict[str, Any] | None:
+    """Make an irreversible RAW retention boundary explicit to operators."""
+
+    row = connection.execute(
+        """
+        SELECT deleted_through_frame_id,deleted_through_received_at_us,checkpoint_id,created_at_us,updated_at_us
+        FROM timing_raw_retention_floors
+        WHERE analysis_session_id = ?
+        """,
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "deleted_through_frame_id": int(row["deleted_through_frame_id"]),
+        "deleted_through_received_at_us": int(row["deleted_through_received_at_us"]),
+        "checkpoint_id": row["checkpoint_id"],
+        "created_at_us": int(row["created_at_us"]),
+        "updated_at_us": int(row["updated_at_us"]),
+    }
+
+
+def _session_open_gap(connection: sqlite3.Connection, *, session_id: str) -> dict[str, Any] | None:
+    """Return the newest still-open ingest outage across every heat in a session."""
+
+    row = connection.execute(
+        """
+        SELECT id,source_heat_id,ingest_connection_id,started_at_us,reason
+        FROM ingest_gaps
+        WHERE analysis_session_id = ? AND ended_at_us IS NULL
+        ORDER BY started_at_us DESC,id DESC
+        LIMIT 1
+        """,
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "gap_id": int(row["id"]),
+        "source_heat_id": row["source_heat_id"],
+        "connection_id": row["ingest_connection_id"],
+        "started_at_us": int(row["started_at_us"]),
+        "reason": row["reason"],
+    }
+
+
+def _latest_restore_event(connection: sqlite3.Connection, *, session_id: str) -> dict[str, Any] | None:
+    """Expose the last durable reducer bootstrap outcome, not worker memory."""
+
+    row = connection.execute(
+        """
+        SELECT id,source_heat_id,checkpoint_id,anchor_frame_id,outcome,reason,replayed_tail_frames,created_at_us
+        FROM normalizer_restore_events
+        WHERE analysis_session_id = ?
+        ORDER BY created_at_us DESC,id DESC
+        LIMIT 1
+        """,
+        (session_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "restore_event_id": int(row["id"]),
+        "source_heat_id": row["source_heat_id"],
+        "checkpoint_id": row["checkpoint_id"],
+        "anchor_frame_id": row["anchor_frame_id"],
+        "outcome": row["outcome"],
+        "reason": row["reason"],
+        "replayed_tail_frames": int(row["replayed_tail_frames"]),
+        "created_at_us": int(row["created_at_us"]),
+    }
+
+
+def _ingest_health_semantics() -> dict[str, str]:
+    """Keep operational counter meanings literal for API and runbook users."""
+
+    return {
+        "raw.retained_frame_count": "Retained immutable feed_frames for this analysis session.",
+        "processing.pending_frame_count": (
+            "Frames without a processed marker and without a terminal decode failure."
+        ),
+        "processing.failed_frame_count": (
+            "Frames whose decoder entered terminal failed state; they are not silently retried."
+        ),
+        "runtime_checkpoints.runtime_checkpoint_count": (
+            "All persisted timing-normalizer checkpoints for the session, including anchors no longer eligible for restore."
+        ),
+        "runtime_checkpoints.eligible_runtime_checkpoint_count": (
+            "Structurally eligible checkpoints whose anchor frame remains retained, processed, and belongs to this session."
+        ),
+        "runtime_checkpoints.latest_validation": (
+            "Bounded validation of newest checkpoint candidates; invalid/incompatible candidates are skipped until one passes or the scan limit is reached."
+        ),
+        "runtime_checkpoints.latest": (
+            "Newest semantically restorable timing-normalizer checkpoint anchored to a retained processed frame."
+        ),
+        "tail": "Frames after the newest restorable checkpoint in durable feed_frame id order; received_span_us is their recorder-time span.",
+        "last_restore": "Latest durable normalizer bootstrap audit event, not transient worker memory.",
+    }
+
+
+def read_ingest_health(
+    session_id: str,
+    *,
+    database: str | Path | None = None,
+) -> dict[str, Any]:
+    """Return a bounded, read-only ingestion and reducer health snapshot.
+
+    Frame identity is intentionally based on the monotonically assigned
+    ``feed_frames.id`` rather than receive timestamps: several physical
+    SignalR frames may carry the same recorder timestamp.
+    """
+
+    session_id = _require_session_id(session_id)
+    with _readonly_snapshot(database) as connection:
+        session = _session_row(connection, session_id)
+        heat = _latest_heat_row(connection, session_id)
+        all_frames = _health_frame_counts(connection, session_id=session_id)
+        latest_runtime = _runtime_checkpoint_health(connection, session_id=session_id)
+        checkpoint = latest_runtime["latest"]
+        anchor_frame_id = checkpoint["source_frame_id"] if checkpoint is not None else None
+        tail_counts = _health_frame_counts(
+            connection,
+            session_id=session_id,
+            after_frame_id=anchor_frame_id,
+        )
+        tail_first = _health_frame_row(
+            connection,
+            session_id=session_id,
+            after_frame_id=anchor_frame_id,
+            ascending=True,
+        )
+        tail_latest = _health_frame_row(
+            connection,
+            session_id=session_id,
+            after_frame_id=anchor_frame_id,
+        )
+        tail_received_span_us = (
+            int(tail_latest["received_at_us"]) - int(tail_first["received_at_us"])
+            if tail_first is not None and tail_latest is not None
+            else None
+        )
+        return {
+            "schema_version": LIVE_SCHEMA_VERSION,
+            "session_id": session_id,
+            "session": _session_payload(session),
+            "heat": _heat_payload(heat) if heat is not None else None,
+            "raw": {
+                "retained_frame_count": all_frames["retained_frame_count"],
+                "decoded_frame_count": all_frames["decoded_frame_count"],
+                "latest_frame": _health_frame_payload(
+                    _health_frame_row(connection, session_id=session_id)
+                ),
+                "retention_floor": _retention_floor_payload(connection, session_id=session_id),
+            },
+            "processing": {
+                "processed_frame_count": all_frames["processed_frame_count"],
+                "pending_frame_count": all_frames["pending_frame_count"],
+                "failed_frame_count": all_frames["failed_frame_count"],
+                "latest_processed_frame": _health_frame_payload(
+                    _health_frame_row(connection, session_id=session_id, processed_only=True)
+                ),
+            },
+            "runtime_checkpoints": latest_runtime,
+            "tail": {
+                "anchor_frame_id": anchor_frame_id,
+                "scope": (
+                    "after_latest_runtime_checkpoint"
+                    if anchor_frame_id is not None
+                    else "all_retained_raw_no_checkpoint"
+                ),
+                **tail_counts,
+                "received_span_us": tail_received_span_us,
+                "first_frame": _health_frame_payload(tail_first),
+                "latest_frame": _health_frame_payload(tail_latest),
+            },
+            "open_gap": _session_open_gap(connection, session_id=session_id),
+            "last_restore": _latest_restore_event(connection, session_id=session_id),
+            "semantics": _ingest_health_semantics(),
+            "provenance_contract": _provenance_contract(),
+        }
 
 
 def _current_flag(connection: sqlite3.Connection, heat_id: int) -> dict[str, Any] | None:

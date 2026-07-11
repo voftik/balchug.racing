@@ -148,6 +148,18 @@ class IngestSupervisorTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(reader.execute("SELECT flag FROM track_flag_current").fetchone()[0], "RED")
             participant = reader.execute("SELECT start_number,team_name,class_name FROM participants").fetchone()
             self.assertEqual(tuple(participant), ("21", "BALCHUG Racing", "CN PRO"))
+            checkpoint = reader.execute(
+                """
+                SELECT checkpoint_format,source_frame_id
+                FROM state_checkpoints
+                WHERE checkpoint_format = 'timing-normalizer'
+                """
+            ).fetchone()
+            self.assertIsNotNone(checkpoint)
+            self.assertEqual(
+                checkpoint["source_frame_id"],
+                reader.execute("SELECT id FROM feed_frames ORDER BY id LIMIT 1").fetchone()[0],
+            )
         finally:
             reader.close()
 

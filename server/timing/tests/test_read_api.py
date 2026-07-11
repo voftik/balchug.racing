@@ -6,8 +6,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from timing.db import connect, migrate
+from timing.db import RUNTIME_CHECKPOINT_FORMAT, RUNTIME_CHECKPOINT_FORMAT_VERSION, connect, migrate, save_checkpoint
 from timing.normalization import TIME_SERVICE_EPOCH_UNIX_US, parse_ts_time
+from timing.normalizer_writer import (
+    RUNTIME_CHECKPOINT_PAYLOAD_FORMAT,
+    RUNTIME_CHECKPOINT_PAYLOAD_VERSION,
+    RUNTIME_CHECKPOINT_REDUCER_VERSION,
+)
 from timing.read_api import (
     ArchiveProjectionMissingError,
     MetricScopeRequest,
@@ -519,6 +524,187 @@ class TimingReadModelTests(unittest.TestCase):
         self.assertEqual(pits["items"][0]["provenance"], "measured")
         with self.assertRaises(ScopeNotFoundError):
             self.model.laps("session-1", participant_id="not-a-crew")
+
+    def test_ingest_health_exposes_checkpoint_tail_and_recovery_evidence(self):
+        """Health must distinguish work waiting after a checkpoint from failed RAW."""
+
+        created_at_us = 20_000_000
+        self.connection.execute(
+            """
+            INSERT INTO ingest_runs(id,analysis_session_id,reducer_version,started_at_us)
+            VALUES ('health-run','session-1','test',?)
+            """,
+            (created_at_us,),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO ingest_connections(id,ingest_run_id,ordinal,connected_at_us)
+            VALUES ('health-connection','health-run',1,?)
+            """,
+            (created_at_us,),
+        )
+        frame_ids: list[int] = []
+        for sequence, decode_state, processed_at_us in (
+            (1, "decoded", 21_000_000),
+            (2, "decoded", 22_000_000),
+            (3, "pending", None),
+            (4, "failed", None),
+        ):
+            self.connection.execute(
+                """
+                INSERT INTO feed_frames(
+                  analysis_session_id,ingest_connection_id,frame_sequence,received_at_us,monotonic_ns,
+                  raw_payload,raw_sha256,decode_state,processed_at_us,created_at_us
+                ) VALUES ('session-1','health-connection',?,?,?,?,'health-hash',?,?,?)
+                """,
+                (
+                    sequence,
+                    sequence * 1_000_000,
+                    sequence,
+                    b"{}",
+                    decode_state,
+                    processed_at_us,
+                    created_at_us,
+                ),
+            )
+            frame_ids.append(int(self.connection.execute("SELECT last_insert_rowid()").fetchone()[0]))
+
+        save_checkpoint(
+            self.connection,
+            source_heat_id=self.heat_id,
+            source_frame_id=frame_ids[0],
+            source_key="health-connection:1",
+            observed_at_us=1_000_000,
+            state={
+                "format": RUNTIME_CHECKPOINT_PAYLOAD_FORMAT,
+                "format_version": RUNTIME_CHECKPOINT_PAYLOAD_VERSION,
+                "reducer_version": RUNTIME_CHECKPOINT_REDUCER_VERSION,
+                "analysis_session_id": "session-1",
+                "source_heat": {
+                    "id": self.heat_id,
+                    "generation": 1,
+                    "provider_heat_start_ts": None,
+                },
+                "anchor": {
+                    "source_frame_id": frame_ids[0],
+                    "source_key": "health-connection:1",
+                    "observed_at_us": 1_000_000,
+                },
+                "reducer": {
+                    "heat": {},
+                    "statistics": {},
+                    "grid": {
+                        "layout": None,
+                        "rows": {},
+                        "metadata_changes": [],
+                        "layout_generation": 0,
+                        "schema_pending": True,
+                        "schema_conflicts": {},
+                    },
+                    "layout_version": {"id": None, "fingerprint": None},
+                    "calibrators": {},
+                    "finish_sector_ids": [],
+                    "schema_baselines": {},
+                },
+            },
+            checkpoint_format=RUNTIME_CHECKPOINT_FORMAT,
+            checkpoint_format_version=RUNTIME_CHECKPOINT_FORMAT_VERSION,
+            reducer_version=RUNTIME_CHECKPOINT_REDUCER_VERSION,
+        )
+        checkpoint_id = int(self.connection.execute("SELECT last_insert_rowid()").fetchone()[0])
+        self.connection.execute(
+            """
+            INSERT INTO ingest_gaps(
+              analysis_session_id,source_heat_id,ingest_connection_id,started_at_us,reason,created_at_us
+            ) VALUES ('session-1',?,'health-connection',?,'connection_reset',?)
+            """,
+            (self.heat_id, 23_000_000, created_at_us),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO normalizer_restore_events(
+              analysis_session_id,source_heat_id,checkpoint_id,anchor_frame_id,outcome,reason,
+              replayed_tail_frames,created_at_us
+            ) VALUES ('session-1',?,?,?,'RESTORED','checkpoint_restored',1,?)
+            """,
+            (self.heat_id, checkpoint_id, frame_ids[0], 24_000_000),
+        )
+        self.connection.commit()
+
+        health = self.model.ingest_health("session-1")
+
+        self.assertEqual(health["schema_version"], "timing-live.v1")
+        self.assertEqual(health["raw"]["retained_frame_count"], 4)
+        self.assertEqual(health["raw"]["decoded_frame_count"], 2)
+        self.assertEqual(health["raw"]["latest_frame"]["frame_id"], frame_ids[3])
+        self.assertEqual(health["processing"], {
+            "processed_frame_count": 2,
+            "pending_frame_count": 1,
+            "failed_frame_count": 1,
+            "latest_processed_frame": {
+                "frame_id": frame_ids[1],
+                "ingest_connection_id": "health-connection",
+                "frame_sequence": 2,
+                "received_at_us": 2_000_000,
+                "decode_state": "decoded",
+                "processed_at_us": 22_000_000,
+            },
+        })
+        self.assertEqual(health["runtime_checkpoints"]["runtime_checkpoint_count"], 1)
+        self.assertEqual(health["runtime_checkpoints"]["eligible_runtime_checkpoint_count"], 1)
+        self.assertEqual(
+            health["runtime_checkpoints"]["latest_validation"],
+            {
+                "status": "RESTORABLE",
+                "rejected_newer_or_incompatible_checkpoint_count": 0,
+                "scan_limit": 8,
+                "truncated": False,
+            },
+        )
+        self.assertEqual(health["runtime_checkpoints"]["latest"]["checkpoint_id"], checkpoint_id)
+        self.assertEqual(health["runtime_checkpoints"]["latest"]["source_frame_id"], frame_ids[0])
+        self.assertEqual(health["tail"]["anchor_frame_id"], frame_ids[0])
+        self.assertEqual(health["tail"]["scope"], "after_latest_runtime_checkpoint")
+        self.assertEqual(health["tail"]["retained_frame_count"], 3)
+        self.assertEqual(health["tail"]["processed_frame_count"], 1)
+        self.assertEqual(health["tail"]["pending_frame_count"], 1)
+        self.assertEqual(health["tail"]["failed_frame_count"], 1)
+        self.assertEqual(health["tail"]["received_span_us"], 2_000_000)
+        self.assertEqual(health["tail"]["first_frame"]["frame_id"], frame_ids[1])
+        self.assertEqual(health["tail"]["latest_frame"]["frame_id"], frame_ids[3])
+        self.assertEqual(health["open_gap"], {
+            "gap_id": health["open_gap"]["gap_id"],
+            "source_heat_id": self.heat_id,
+            "connection_id": "health-connection",
+            "started_at_us": 23_000_000,
+            "reason": "connection_reset",
+        })
+        self.assertEqual(health["last_restore"], {
+            "restore_event_id": health["last_restore"]["restore_event_id"],
+            "source_heat_id": self.heat_id,
+            "checkpoint_id": checkpoint_id,
+            "anchor_frame_id": frame_ids[0],
+            "outcome": "RESTORED",
+            "reason": "checkpoint_restored",
+            "replayed_tail_frames": 1,
+            "created_at_us": 24_000_000,
+        })
+
+        self.connection.execute("UPDATE state_checkpoints SET state_hash = 'corrupt' WHERE id = ?", (checkpoint_id,))
+        self.connection.commit()
+        corrupt = self.model.ingest_health("session-1")
+        self.assertIsNone(corrupt["runtime_checkpoints"]["latest"])
+        self.assertEqual(
+            corrupt["runtime_checkpoints"]["latest_validation"],
+            {
+                "status": "NO_RESTORABLE",
+                "rejected_newer_or_incompatible_checkpoint_count": 1,
+                "scan_limit": 8,
+                "truncated": False,
+            },
+        )
+        self.assertIsNone(corrupt["tail"]["anchor_frame_id"])
+        self.assertEqual(corrupt["tail"]["scope"], "all_retained_raw_no_checkpoint")
 
     def test_race_control_read_keeps_current_board_and_immutable_observations_distinct(self):
         """Receipt time and exact SignalR evidence survive an ended session."""

@@ -5,8 +5,24 @@ import unittest
 from pathlib import Path
 
 from timing.config import now_us
-from timing.db import CheckpointError, MigrationError, backup_database, connect, encode_checkpoint, load_latest_checkpoint, migrate, save_checkpoint
-from timing.retention import apply_retention, plan_retention
+from timing.db import (
+    CheckpointError,
+    MigrationError,
+    RUNTIME_CHECKPOINT_FORMAT,
+    RUNTIME_CHECKPOINT_FORMAT_VERSION,
+    backup_database,
+    connect,
+    encode_checkpoint,
+    load_latest_checkpoint,
+    migrate,
+    save_checkpoint,
+)
+from timing.normalizer_writer import (
+    RUNTIME_CHECKPOINT_PAYLOAD_FORMAT,
+    RUNTIME_CHECKPOINT_PAYLOAD_VERSION,
+    RUNTIME_CHECKPOINT_REDUCER_VERSION,
+)
+from timing.retention import RetentionError, apply_retention, plan_retention
 
 
 class TimingDatabaseTests(unittest.TestCase):
@@ -67,7 +83,7 @@ class TimingDatabaseTests(unittest.TestCase):
             path = Path(temporary) / "timing.db"
             self.assertEqual(
                 migrate(path),
-                ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015"],
+                ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016"],
             )
             self.assertEqual(migrate(path), [])
             connection = connect(path)
@@ -93,6 +109,8 @@ class TimingDatabaseTests(unittest.TestCase):
                         "result_schema_contract_observations",
                         "race_control_message_observations",
                         "race_control_messages_current",
+                        "timing_raw_retention_floors",
+                        "normalizer_restore_events",
                     }.issubset(tables)
                 )
             finally:
@@ -474,7 +492,7 @@ class TimingDatabaseTests(unittest.TestCase):
 
             self.assertEqual(
                 migrate(path),
-                ["0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015"],
+                ["0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016"],
             )
             connection = connect(path)
             try:
@@ -494,7 +512,7 @@ class TimingDatabaseTests(unittest.TestCase):
             legacy_migrations = root / "legacy-migrations"
             legacy_migrations.mkdir()
             for migration in sorted((Path(__file__).parent.parent / "migrations").glob("00[0-1][0-9]_*.sql")):
-                if migration.name.startswith(("0013_", "0014_", "0015_")):
+                if migration.name.startswith(("0013_", "0014_", "0015_", "0016_")):
                     continue
                 shutil.copyfile(migration, legacy_migrations / migration.name)
             self.assertEqual(
@@ -590,7 +608,7 @@ class TimingDatabaseTests(unittest.TestCase):
             finally:
                 connection.close()
 
-            self.assertEqual(migrate(path), ["0013", "0014", "0015"])
+            self.assertEqual(migrate(path), ["0013", "0014", "0015", "0016"])
             connection = connect(path)
             try:
                 current = connection.execute(
@@ -627,7 +645,7 @@ class TimingDatabaseTests(unittest.TestCase):
             legacy_migrations = root / "legacy-migrations"
             legacy_migrations.mkdir()
             for migration in sorted((Path(__file__).parent.parent / "migrations").glob("00[0-1][0-9]_*.sql")):
-                if migration.name.startswith(("0014_", "0015_")):
+                if migration.name.startswith(("0014_", "0015_", "0016_")):
                     continue
                 shutil.copyfile(migration, legacy_migrations / migration.name)
             self.assertEqual(
@@ -702,7 +720,7 @@ class TimingDatabaseTests(unittest.TestCase):
             finally:
                 connection.close()
 
-            self.assertEqual(migrate(path), ["0014", "0015"])
+            self.assertEqual(migrate(path), ["0014", "0015", "0016"])
             connection = connect(path)
             try:
                 observation = connection.execute(
@@ -829,6 +847,89 @@ class TimingDatabaseTests(unittest.TestCase):
             finally:
                 connection.close()
 
+    def test_runtime_checkpoint_rejects_a_source_heat_from_another_session(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "timing.db"
+            migrate(path)
+            connection = connect(path)
+            try:
+                source_id = self.insert_source(connection)
+                own_heat = self.insert_session(connection, "checkpoint-own", source_id)
+                foreign_heat = self.insert_session(connection, "checkpoint-foreign", source_id)
+                frame_id, _message_id = self.insert_frame(
+                    connection,
+                    "checkpoint-own",
+                    received_at_us=2_000_000,
+                )
+                with self.assertRaises(CheckpointError):
+                    save_checkpoint(
+                        connection,
+                        source_heat_id=foreign_heat,
+                        source_frame_id=frame_id,
+                        source_key="connection-checkpoint-own:1",
+                        observed_at_us=2_000_000,
+                        checkpoint_format=RUNTIME_CHECKPOINT_FORMAT,
+                        checkpoint_format_version=RUNTIME_CHECKPOINT_FORMAT_VERSION,
+                        reducer_version=RUNTIME_CHECKPOINT_REDUCER_VERSION,
+                        state={"format": "synthetic"},
+                    )
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM state_checkpoints").fetchone()[0],
+                    0,
+                )
+                self.assertIsNotNone(own_heat)
+            finally:
+                connection.close()
+
+    def test_runtime_checkpoint_migration_preserves_legacy_checkpoint_rows(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "timing.db"
+            legacy_migrations = root / "legacy-migrations"
+            legacy_migrations.mkdir()
+            for migration in sorted((Path(__file__).parent.parent / "migrations").glob("00[0-1][0-9]_*.sql")):
+                if migration.name.startswith("0016_"):
+                    continue
+                shutil.copyfile(migration, legacy_migrations / migration.name)
+            self.assertEqual(migrate(path, directory=legacy_migrations)[-1], "0015")
+            connection = connect(path)
+            try:
+                source_id = self.insert_source(connection)
+                heat_id = self.insert_session(connection, "legacy-checkpoint", source_id)
+                codec, payload, state_hash = encode_checkpoint({"legacy": "preserved"})
+                connection.execute(
+                    """
+                    INSERT INTO state_checkpoints(
+                      source_heat_id,source_frame_id,source_key,observed_at_us,state_hash,codec,payload,created_at_us
+                    ) VALUES (?,?,?,?,?,?,?,?)
+                    """,
+                    (heat_id, None, "legacy:1", 7_000_000, state_hash, codec, payload, now_us()),
+                )
+                legacy_id = connection.execute("SELECT id FROM state_checkpoints").fetchone()[0]
+                connection.commit()
+            finally:
+                connection.close()
+
+            self.assertEqual(migrate(path), ["0016"])
+            connection = connect(path)
+            try:
+                row = connection.execute(
+                    """
+                    SELECT id,source_key,checkpoint_format,checkpoint_format_version,reducer_version
+                    FROM state_checkpoints
+                    """
+                ).fetchone()
+                self.assertEqual(
+                    tuple(row),
+                    (legacy_id, "legacy:1", "legacy", 0, "legacy"),
+                )
+                checkpoint = load_latest_checkpoint(connection, heat_id)
+                self.assertIsNotNone(checkpoint)
+                self.assertEqual(checkpoint[1], {"legacy": "preserved"})
+                self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+            finally:
+                connection.close()
+
     def test_wal_reader_does_not_block_a_writer(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "timing.db"
@@ -856,6 +957,9 @@ class TimingDatabaseTests(unittest.TestCase):
                 source_id = self.insert_source(connection)
                 active_heat = self.insert_session(connection, "active", source_id, lifecycle="active")
                 finished_heat = self.insert_session(connection, "finished", source_id, lifecycle="stopped")
+                # Runtime normalizer generations begin at one; this test's
+                # hand-built source heat must model a real restorable row.
+                connection.execute("UPDATE source_heats SET generation = 1 WHERE id = ?", (finished_heat,))
                 timestamp = now_us()
                 old = timestamp - 10 * 86_400_000_000
                 _, active_message = self.insert_frame(connection, "active", received_at_us=old)
@@ -883,13 +987,49 @@ class TimingDatabaseTests(unittest.TestCase):
                     """,
                     (finished_heat, finished_message, timestamp),
                 )
-                connection.execute(
-                    """
-                    INSERT INTO state_checkpoints(
-                      source_heat_id,source_frame_id,source_key,observed_at_us,state_hash,codec,payload,created_at_us
-                    ) VALUES (?,?,'connection-finished:1',?,'hash','identity','{}',?)
-                    """,
-                    (finished_heat, anchor_frame, timestamp, timestamp),
+                self.assertTrue(
+                    save_checkpoint(
+                        connection,
+                        source_heat_id=finished_heat,
+                        source_frame_id=anchor_frame,
+                        source_key="connection-finished:2",
+                        observed_at_us=old,
+                        checkpoint_format=RUNTIME_CHECKPOINT_FORMAT,
+                        checkpoint_format_version=RUNTIME_CHECKPOINT_FORMAT_VERSION,
+                        reducer_version=RUNTIME_CHECKPOINT_REDUCER_VERSION,
+                        state={
+                            "format": RUNTIME_CHECKPOINT_PAYLOAD_FORMAT,
+                            "format_version": RUNTIME_CHECKPOINT_PAYLOAD_VERSION,
+                            "reducer_version": RUNTIME_CHECKPOINT_REDUCER_VERSION,
+                            "analysis_session_id": "finished",
+                            "source_heat": {
+                                "id": finished_heat,
+                                "generation": 1,
+                                "provider_heat_start_ts": None,
+                            },
+                            "anchor": {
+                                "source_frame_id": anchor_frame,
+                                "source_key": "connection-finished:2",
+                                "observed_at_us": old,
+                            },
+                            "reducer": {
+                                "heat": {},
+                                "statistics": {},
+                                "grid": {
+                                    "layout": None,
+                                    "rows": {},
+                                    "metadata_changes": [],
+                                    "layout_generation": 0,
+                                    "schema_pending": True,
+                                    "schema_conflicts": {},
+                                },
+                                "layout_version": {"id": None, "fingerprint": None},
+                                "calibrators": {},
+                                "finish_sector_ids": [],
+                                "schema_baselines": {},
+                            },
+                        },
+                    )
                 )
                 connection.execute(
                     """
@@ -907,6 +1047,30 @@ class TimingDatabaseTests(unittest.TestCase):
                 plan = plan_retention(connection, now_at_us=timestamp)
                 self.assertEqual(plan.total, 2)
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM feed_frames").fetchone()[0], 3)
+                checkpoint_hash = connection.execute(
+                    "SELECT state_hash FROM state_checkpoints WHERE source_heat_id = ?",
+                    (finished_heat,),
+                ).fetchone()[0]
+                # A dry-run plan is not authority to delete evidence. If the
+                # chosen checkpoint becomes corrupt before apply, RAW deletion
+                # and its retention-floor write must roll back together.
+                connection.execute(
+                    "UPDATE state_checkpoints SET state_hash = 'corrupt' WHERE source_heat_id = ?",
+                    (finished_heat,),
+                )
+                connection.commit()
+                with self.assertRaises(RetentionError):
+                    apply_retention(connection, plan)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM feed_frames").fetchone()[0], 3)
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT 1 FROM timing_raw_retention_floors WHERE analysis_session_id = 'finished'"
+                    ).fetchone()
+                )
+                connection.execute(
+                    "UPDATE state_checkpoints SET state_hash = ? WHERE source_heat_id = ?",
+                    (checkpoint_hash, finished_heat),
+                )
                 connection.execute("UPDATE analysis_sessions SET lifecycle = 'stopped' WHERE id = 'active'")
                 connection.execute("UPDATE analysis_sessions SET lifecycle = 'active' WHERE id = 'finished'")
                 connection.commit()
@@ -929,6 +1093,17 @@ class TimingDatabaseTests(unittest.TestCase):
                     connection.execute("SELECT source_frame_id FROM state_checkpoints WHERE source_heat_id = ?", (finished_heat,)).fetchone()[0],
                     anchor_frame,
                 )
+                raw_floor = connection.execute(
+                    """
+                    SELECT deleted_through_frame_id,deleted_through_received_at_us,checkpoint_id
+                    FROM timing_raw_retention_floors
+                    WHERE analysis_session_id = 'finished'
+                    """
+                ).fetchone()
+                self.assertIsNotNone(raw_floor)
+                self.assertEqual(raw_floor["deleted_through_frame_id"], finished_frame)
+                self.assertEqual(raw_floor["deleted_through_received_at_us"], old)
+                self.assertIsNotNone(raw_floor["checkpoint_id"])
                 self.assertIsNone(
                     connection.execute(
                         "SELECT source_frame_id FROM playback_snapshots WHERE source_heat_id = ?", (finished_heat,)
@@ -938,6 +1113,90 @@ class TimingDatabaseTests(unittest.TestCase):
                 self.assertIsNotNone(active_message)
                 with self.assertRaises(ValueError):
                     plan_retention(connection, now_at_us=timestamp, raw_days=-1)
+            finally:
+                connection.close()
+
+    def test_retention_requires_a_valid_current_runtime_checkpoint(self):
+        """Legacy or malformed checkpoint rows must never authorize RAW pruning."""
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "timing.db"
+            migrate(path)
+            connection = connect(path)
+            try:
+                source_id = self.insert_source(connection)
+                heat_id = self.insert_session(connection, "retention-contract", source_id)
+                timestamp = now_us()
+                old = timestamp - 10 * 86_400_000_000
+                old_frame, old_message = self.insert_frame(
+                    connection,
+                    "retention-contract",
+                    received_at_us=old,
+                )
+                connection.execute(
+                    """
+                    INSERT INTO feed_frames(
+                      analysis_session_id,ingest_connection_id,frame_sequence,received_at_us,monotonic_ns,
+                      raw_payload,raw_sha256,decode_state,processed_at_us,created_at_us
+                    ) VALUES ('retention-contract','connection-retention-contract',2,?,?,
+                              '{}','anchor','decoded',?,?)
+                    """,
+                    (old + 1, (old + 1) * 1000, old + 1, timestamp),
+                )
+                anchor_frame = connection.execute(
+                    """
+                    SELECT id FROM feed_frames
+                    WHERE ingest_connection_id = 'connection-retention-contract' AND frame_sequence = 2
+                    """
+                ).fetchone()[0]
+                connection.execute(
+                    """
+                    INSERT INTO playback_snapshots(
+                      source_heat_id,observed_second,observed_at_us,source_frame_id,source_message_id,
+                      source_key,projection_version,metric_version,is_event_boundary,payload_codec,payload,
+                      payload_sha256,created_at_us,updated_at_us
+                    ) VALUES (?,?,?,?,?,'playback:retention-contract',1,1,0,'gzip-json-v1',X'7B7D',?,?,?)
+                    """,
+                    (heat_id, old // 1_000_000, old, old_frame, old_message, "0" * 64, timestamp, timestamp),
+                )
+                # The legacy row is decoded and intact, but no current
+                # normalizer can restore it as a runtime reducer boundary.
+                self.assertTrue(
+                    save_checkpoint(
+                        connection,
+                        source_heat_id=heat_id,
+                        source_frame_id=anchor_frame,
+                        source_key="connection-retention-contract:2",
+                        observed_at_us=old + 1,
+                        state={"legacy": True},
+                    )
+                )
+                connection.commit()
+                self.assertEqual(
+                    plan_retention(connection, now_at_us=timestamp).feed_frame_ids,
+                    (),
+                )
+
+                # Metadata alone is likewise insufficient: the versioned
+                # reducer envelope must match the immutable anchor.
+                self.assertTrue(
+                    save_checkpoint(
+                        connection,
+                        source_heat_id=heat_id,
+                        source_frame_id=anchor_frame,
+                        source_key="connection-retention-contract:2",
+                        observed_at_us=old + 1,
+                        checkpoint_format=RUNTIME_CHECKPOINT_FORMAT,
+                        checkpoint_format_version=RUNTIME_CHECKPOINT_FORMAT_VERSION,
+                        reducer_version=RUNTIME_CHECKPOINT_REDUCER_VERSION,
+                        state={"format": "wrong"},
+                    )
+                )
+                connection.commit()
+                self.assertEqual(
+                    plan_retention(connection, now_at_us=timestamp).feed_frame_ids,
+                    (),
+                )
             finally:
                 connection.close()
 

@@ -174,6 +174,32 @@ class ConnectionClockCalibrator:
         offset = self.offset_us
         return provider_us + offset if provider_us is not None and offset is not None else None
 
+    def snapshot(self) -> dict[str, Any]:
+        """Return the ordered offset window needed for deterministic restore."""
+
+        return {
+            "max_samples": self.max_samples,
+            "offsets_us": list(self._offsets_us),
+        }
+
+    @classmethod
+    def from_snapshot(cls, state: Any) -> "ConnectionClockCalibrator":
+        """Restore a validated offset window without observing a false clock sample."""
+
+        if not isinstance(state, Mapping):
+            raise ValueError("clock checkpoint must be an object")
+        max_samples = state.get("max_samples")
+        offsets = state.get("offsets_us")
+        if type(max_samples) is not int or max_samples < 1:
+            raise ValueError("clock checkpoint max_samples must be positive")
+        if not isinstance(offsets, list) or len(offsets) > max_samples:
+            raise ValueError("clock checkpoint offsets are invalid")
+        if any(type(offset) is not int for offset in offsets):
+            raise ValueError("clock checkpoint offsets must be integers")
+        calibrator = cls(max_samples=max_samples)
+        calibrator._offsets_us = list(offsets)
+        return calibrator
+
 
 @dataclass(frozen=True)
 class ResultColumn:

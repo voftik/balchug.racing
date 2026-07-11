@@ -15,6 +15,9 @@ from .config import now_us, timing_db_path
 
 
 MIGRATIONS_DIR = Path(__file__).with_name("migrations")
+LEGACY_CHECKPOINT_FORMAT = "legacy"
+RUNTIME_CHECKPOINT_FORMAT = "timing-normalizer"
+RUNTIME_CHECKPOINT_FORMAT_VERSION = 1
 
 
 class MigrationError(RuntimeError):
@@ -179,24 +182,93 @@ def save_checkpoint(
     source_key: str,
     observed_at_us: int,
     state: Any,
+    checkpoint_format: str = LEGACY_CHECKPOINT_FORMAT,
+    checkpoint_format_version: int = 0,
+    reducer_version: str = "legacy",
 ) -> bool:
-    """Insert one checkpoint once; a divergent replay at the same tick fails."""
+    """Insert one checkpoint once; a divergent replay at the same anchor fails.
+
+    Legacy callers remain keyed by source heat plus observed timestamp. Runtime
+    reducer checkpoints are instead keyed by their immutable source frame,
+    because two physical SignalR frames may share a recorder timestamp.
+    """
+
+    if not isinstance(checkpoint_format, str) or not checkpoint_format:
+        raise CheckpointError("checkpoint_format must be a non-empty string")
+    if type(checkpoint_format_version) is not int or checkpoint_format_version < 0:
+        raise CheckpointError("checkpoint_format_version must be a non-negative integer")
+    if not isinstance(reducer_version, str) or not reducer_version:
+        raise CheckpointError("reducer_version must be a non-empty string")
+    runtime = checkpoint_format == RUNTIME_CHECKPOINT_FORMAT
+    if runtime and (source_frame_id is None or type(source_frame_id) is not int or source_frame_id <= 0):
+        raise CheckpointError("runtime checkpoint requires a positive source_frame_id")
+    if runtime:
+        provenance = connection.execute(
+            """
+            SELECT heat.analysis_session_id AS heat_session_id,
+                   frame.analysis_session_id AS frame_session_id,
+                   frame.ingest_connection_id,frame.frame_sequence,frame.received_at_us
+            FROM source_heats AS heat
+            JOIN feed_frames AS frame ON frame.id = ?
+            WHERE heat.id = ?
+            """,
+            (source_frame_id, source_heat_id),
+        ).fetchone()
+        expected_source_key = (
+            f"{provenance['ingest_connection_id']}:{provenance['frame_sequence']}"
+            if provenance is not None
+            else None
+        )
+        if (
+            provenance is None
+            or provenance["heat_session_id"] != provenance["frame_session_id"]
+            or source_key != expected_source_key
+            or observed_at_us != int(provenance["received_at_us"])
+        ):
+            raise CheckpointError("runtime checkpoint source heat/frame provenance is invalid")
     codec, payload, state_hash = encode_checkpoint(state)
-    existing = connection.execute(
-        "SELECT state_hash FROM state_checkpoints WHERE source_heat_id = ? AND observed_at_us = ?",
-        (source_heat_id, observed_at_us),
-    ).fetchone()
+    if runtime:
+        existing = connection.execute(
+            """
+            SELECT state_hash FROM state_checkpoints
+            WHERE source_heat_id = ? AND checkpoint_format = ? AND checkpoint_format_version = ?
+              AND source_frame_id = ?
+            """,
+            (source_heat_id, checkpoint_format, checkpoint_format_version, source_frame_id),
+        ).fetchone()
+    else:
+        existing = connection.execute(
+            """
+            SELECT state_hash FROM state_checkpoints
+            WHERE source_heat_id = ? AND observed_at_us = ? AND checkpoint_format = ?
+              AND checkpoint_format_version = ?
+            """,
+            (source_heat_id, observed_at_us, checkpoint_format, checkpoint_format_version),
+        ).fetchone()
     if existing:
         if existing["state_hash"] != state_hash:
-            raise CheckpointError("Checkpoint conflicts with existing state at the same source tick")
+            raise CheckpointError("Checkpoint conflicts with existing state at the same source anchor")
         return False
     connection.execute(
         """
         INSERT INTO state_checkpoints(
-          source_heat_id,source_frame_id,source_key,observed_at_us,state_hash,codec,payload,created_at_us
-        ) VALUES (?,?,?,?,?,?,?,?)
+          source_heat_id,source_frame_id,source_key,observed_at_us,state_hash,codec,payload,
+          checkpoint_format,checkpoint_format_version,reducer_version,created_at_us
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """,
-        (source_heat_id, source_frame_id, source_key, observed_at_us, state_hash, codec, payload, now_us()),
+        (
+            source_heat_id,
+            source_frame_id,
+            source_key,
+            observed_at_us,
+            state_hash,
+            codec,
+            payload,
+            checkpoint_format,
+            checkpoint_format_version,
+            reducer_version,
+            now_us(),
+        ),
     )
     return True
 
@@ -208,3 +280,59 @@ def load_latest_checkpoint(connection: sqlite3.Connection, source_heat_id: int) 
         (source_heat_id,),
     ).fetchone()
     return (row, decode_checkpoint(row["codec"], row["payload"], expected_hash=row["state_hash"])) if row else None
+
+
+def runtime_checkpoint_rows(
+    connection: sqlite3.Connection,
+    *,
+    analysis_session_id: str,
+    reducer_version: str,
+) -> tuple[sqlite3.Row, ...]:
+    """Return newest compatible, already-processed runtime checkpoint anchors.
+
+    Decoding and reducer-specific payload validation deliberately remain with
+    the normalizer. A corrupt newest blob can therefore fall back to an older
+    compatible row without making generic database code understand reducer
+    state.
+    """
+
+    if not isinstance(analysis_session_id, str) or not analysis_session_id:
+        raise CheckpointError("analysis_session_id must be a non-empty string")
+    if not isinstance(reducer_version, str) or not reducer_version:
+        raise CheckpointError("reducer_version must be a non-empty string")
+    return tuple(
+        connection.execute(
+            """
+            SELECT checkpoint.*,heat.analysis_session_id,
+                   frame.ingest_connection_id AS anchor_connection_id,
+                   frame.frame_sequence AS anchor_frame_sequence,
+                   frame.analysis_session_id AS anchor_analysis_session_id,
+                   frame.received_at_us AS anchor_received_at_us,
+                   frame.processed_at_us AS anchor_processed_at_us,
+                   floor.deleted_through_frame_id AS raw_retention_floor_frame_id
+            FROM state_checkpoints AS checkpoint
+            JOIN source_heats AS heat ON heat.id = checkpoint.source_heat_id
+            JOIN feed_frames AS frame ON frame.id = checkpoint.source_frame_id
+            LEFT JOIN timing_raw_retention_floors AS floor
+              ON floor.analysis_session_id = heat.analysis_session_id
+            WHERE heat.analysis_session_id = ?
+              AND checkpoint.checkpoint_format = ?
+              AND checkpoint.checkpoint_format_version = ?
+              AND checkpoint.reducer_version = ?
+              AND checkpoint.source_frame_id IS NOT NULL
+              AND frame.analysis_session_id = heat.analysis_session_id
+              AND frame.processed_at_us IS NOT NULL
+              AND (
+                floor.deleted_through_frame_id IS NULL
+                OR checkpoint.source_frame_id > floor.deleted_through_frame_id
+              )
+            ORDER BY checkpoint.source_frame_id DESC,checkpoint.id DESC
+            """,
+            (
+                analysis_session_id,
+                RUNTIME_CHECKPOINT_FORMAT,
+                RUNTIME_CHECKPOINT_FORMAT_VERSION,
+                reducer_version,
+            ),
+        ).fetchall()
+    )

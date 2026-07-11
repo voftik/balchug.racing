@@ -1,6 +1,6 @@
 import unittest
 
-from timing.result_grid import ResultGrid
+from timing.result_grid import ResultGrid, ResultGridStateError
 
 
 class ResultGridTests(unittest.TestCase):
@@ -89,6 +89,28 @@ class ResultGridTests(unittest.TestCase):
         # Subsequent sparse deltas cannot revive an ambiguous schema.
         grid.apply_changes([[0, 2, "21"]])
         self.assertEqual(grid.rows, {})
+
+    def test_checkpoint_snapshot_restores_sparse_cells_without_reinterpreting_layout(self):
+        grid = ResultGrid()
+        grid.apply_snapshot(
+            {
+                "l": {"h": [{"n": "NR"}, {"n": "STATE"}, {"n": "future"}]},
+                "r": [[4, 0, "21"], [4, 1, "E1000000"], [4, 2, "source", "style"]],
+            }
+        )
+        grid.apply_changes([[-1, -1, "metadata"]])
+
+        restored = ResultGrid()
+        restored.restore_snapshot(grid.snapshot())
+
+        self.assertEqual(restored.snapshot(), grid.snapshot())
+        self.assertEqual(restored.row_values(4)["state"], "E1000000")
+        self.assertEqual(restored.rows[4][2].presentation, ("style",))
+
+        invalid = grid.snapshot()
+        invalid["schema_conflicts"] = {"state": [1, 2]}
+        with self.assertRaises(ResultGridStateError):
+            ResultGrid().restore_snapshot(invalid)
 
 
 if __name__ == "__main__":

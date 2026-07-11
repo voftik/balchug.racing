@@ -41,7 +41,7 @@ class MetricRunnerIntegrationTests(unittest.TestCase):
         self.connection.close()
         self.temporary.cleanup()
 
-    def apply(self, messages, *, received_at_us):
+    def apply(self, messages, *, received_at_us, checkpoint=False):
         self.sequence += 1
         frame = self.store.persist_raw_frame(
             self.upstream,
@@ -52,7 +52,10 @@ class MetricRunnerIntegrationTests(unittest.TestCase):
         )
         decoded = self.store.decode_frame(frame)
         self.normalizer(self.connection, frame, decoded)
-        self.store.mark_processed(frame)
+        self.store.mark_processed(
+            frame,
+            checkpoint=self.normalizer.checkpoint_for_processed_frame(self.connection, frame) if checkpoint else None,
+        )
         return frame
 
     @staticmethod
@@ -278,6 +281,41 @@ class MetricRunnerIntegrationTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual([row["is_event_boundary"] for row in playback], [0, 1])
         self.assertEqual(self.playback_payload(playback[-1])["measured"]["track_flag"]["flag"], "RED")
+
+    def test_checkpoint_restore_uses_metric_runner_state_after_a_tail_frame(self):
+        """A reducer checkpoint must not rewind the durable metric boundary."""
+
+        provider_start = 55_000_000
+        received = TIME_SERVICE_EPOCH_UNIX_US + provider_start
+        self.apply(
+            [["h_i", {"n": "Practice", "s": provider_start, "f": 6}], ["s_i", provider_start]],
+            received_at_us=received,
+            checkpoint=True,
+        )
+        self.apply([["s_t", provider_start + 1_000_000]], received_at_us=received + 1_000_000)
+
+        self.normalizer = TimingNormalizer(self.session.id)
+        red = self.apply([["h_h", {"f": 2}]], received_at_us=received + 2_000_000)
+
+        restore = self.connection.execute(
+            "SELECT outcome,replayed_tail_frames FROM normalizer_restore_events ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(tuple(restore), ("RESTORED", 1))
+        session = self.connection.execute(
+            "SELECT values_json FROM metric_current WHERE scope_kind='session' AND scope_key=?",
+            (self.session.id,),
+        ).fetchone()
+        alerts = json.loads(session["values_json"])["alerts"]
+        self.assertIn("red_flag_or_session_reset", {alert["key"] for alert in alerts})
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM stream_events WHERE source_frame_id = ? AND event_type = 'alert'",
+                (red.id,),
+            ).fetchone()[0],
+            1,
+        )
+        boundary = self.connection.execute("SELECT source_frame_id FROM metric_runner_state").fetchone()
+        self.assertEqual(boundary["source_frame_id"], red.id)
 
     def test_retry_after_metric_runner_failure_preserves_the_pending_red_transition(self):
         provider_start = 60_000_000

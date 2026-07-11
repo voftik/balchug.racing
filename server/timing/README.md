@@ -130,6 +130,7 @@ operations.
 
 ```text
 GET /api/timing/sessions/{id}/state
+GET /api/timing/sessions/{id}/ingest-health
 GET /api/timing/sessions/{id}/metrics
 GET /api/timing/sessions/{id}/metrics/history?scope_kind=participant&scope_key={participant_id}
 GET /api/timing/sessions/{id}/laps?participant_id={participant_id}&limit=200

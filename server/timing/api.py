@@ -412,6 +412,16 @@ def timing_state(session_id: str) -> JSONResponse:
         _raise_read_error(error)
 
 
+@app.get("/sessions/{session_id}/ingest-health", response_model=TimingReadResponse)
+def ingest_health(session_id: str) -> JSONResponse:
+    """Return the recorder/reducer recovery surface for one engineering session."""
+
+    try:
+        return _live_payload(_read_model().ingest_health(session_id))
+    except TimingReadError as error:
+        _raise_read_error(error)
+
+
 @app.get("/sessions/{session_id}/metrics/history", response_model=TimingReadResponse)
 def metric_history(
     session_id: str,

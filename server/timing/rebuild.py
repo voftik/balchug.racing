@@ -62,6 +62,20 @@ def _session_plan(connection: sqlite3.Connection, session_id: str) -> RebuildPla
         raise RebuildError(f"Analysis session not found: {session_id}")
     if session["lifecycle"] not in {"stopped", "aborted"}:
         raise RebuildError("Only a stopped or aborted analysis session may be rebuilt")
+    raw_retention_floor = connection.execute(
+        """
+        SELECT deleted_through_frame_id,deleted_through_received_at_us,checkpoint_id
+        FROM timing_raw_retention_floors
+        WHERE analysis_session_id = ?
+        """,
+        (session_id,),
+    ).fetchone()
+    if raw_retention_floor is not None:
+        raise RebuildError(
+            "Session has a raw retention floor "
+            f"through frame {int(raw_retention_floor['deleted_through_frame_id'])}; "
+            "a destructive full rebuild would replay only a partial recording"
+        )
     frame_counts = {
         row["decode_state"]: int(row["count"])
         for row in connection.execute(

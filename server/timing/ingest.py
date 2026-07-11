@@ -19,7 +19,7 @@ from typing import Any
 
 from .config import now_us
 from .db import connect
-from .ingest_store import IngestConnection, RawIngestStore, StoredFrame
+from .ingest_store import IngestConnection, ProcessedFrameCheckpoint, RawIngestStore, StoredFrame
 from .lifecycle import AnalysisSession, list_active_sessions
 from .protocol import DEFAULT_GROUPS, LiveTimingClient, SignalRMessage
 
@@ -44,6 +44,26 @@ def _live_client(source_url: str) -> LiveTimingClient:
 async def _maybe_await(value: object) -> None:
     if inspect.isawaitable(value):
         await value
+
+
+async def _checkpoint_for_processed_frame(
+    processor: FrameProcessor | None,
+    connection: sqlite3.Connection,
+    frame: StoredFrame,
+) -> ProcessedFrameCheckpoint | None:
+    """Ask an optional stateful processor for an atomic processed-frame anchor."""
+
+    if processor is None:
+        return None
+    candidate = getattr(processor, "checkpoint_for_processed_frame", None)
+    if candidate is None or not callable(candidate):
+        return None
+    value = candidate(connection, frame)
+    if inspect.isawaitable(value):
+        value = await value
+    if value is not None and not isinstance(value, ProcessedFrameCheckpoint):
+        raise TypeError("checkpoint_for_processed_frame must return ProcessedFrameCheckpoint or None")
+    return value
 
 
 async def _wait_until_inactive(store: RawIngestStore, *, poll_s: float) -> None:
@@ -133,7 +153,16 @@ class TimingIngestSupervisor:
                     pending_messages = store.decode_frame(pending_frame)
                     if pending_messages:
                         await _maybe_await(self.frame_processor(connection, pending_frame, pending_messages))
-                    store.mark_processed(pending_frame)
+                    store.mark_processed(
+                        pending_frame,
+                        checkpoint=await _checkpoint_for_processed_frame(
+                            self.frame_processor,
+                            connection,
+                            pending_frame,
+                        )
+                        if pending_messages
+                        else None,
+                    )
             while store.is_session_active():
                 upstream: IngestConnection | None = None
                 disconnect_started_at_us: int | None = None
@@ -187,7 +216,14 @@ class TimingIngestSupervisor:
                             if messages:
                                 if self.frame_processor is not None:
                                     await _maybe_await(self.frame_processor(connection, frame, messages))
-                                    store.mark_processed(frame)
+                                    store.mark_processed(
+                                        frame,
+                                        checkpoint=await _checkpoint_for_processed_frame(
+                                            self.frame_processor,
+                                            connection,
+                                            frame,
+                                        ),
+                                    )
                             else:
                                 # A malformed frame is terminally recorded as
                                 # failed by the store. An empty valid envelope

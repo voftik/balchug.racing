@@ -15,9 +15,10 @@ import sqlite3
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator
+from typing import Any, Iterator
 
 from .config import now_us
+from .db import RUNTIME_CHECKPOINT_FORMAT, RUNTIME_CHECKPOINT_FORMAT_VERSION, save_checkpoint
 from .protocol import Bootstrap, SignalRMessage, decode_envelope
 
 
@@ -46,6 +47,18 @@ class StoredFrame:
     sequence: int
     received_at_us: int
     source_key: str
+
+
+@dataclass(frozen=True)
+class ProcessedFrameCheckpoint:
+    """One reducer state committed atomically with a processed RAW frame."""
+
+    source_heat_id: int
+    source_frame_id: int
+    source_key: str
+    observed_at_us: int
+    reducer_version: str
+    state: Any
 
 
 @contextmanager
@@ -357,11 +370,51 @@ class RawIngestStore:
                 )
         return tuple(messages)
 
-    def mark_processed(self, frame: StoredFrame, *, processed_at_us: int | None = None) -> None:
-        """Mark a frame only after all derived writes for it have committed."""
+    def mark_processed(
+        self,
+        frame: StoredFrame,
+        *,
+        processed_at_us: int | None = None,
+        checkpoint: ProcessedFrameCheckpoint | None = None,
+    ) -> None:
+        """Atomically mark a frame processed and optionally anchor reducer state.
+
+        A runtime checkpoint must never point at a frame left pending by a
+        crash. The normalizer/metric writes have already committed before this
+        method starts; this transaction commits the marker and checkpoint as a
+        single durable boundary.
+        """
+
         timestamp_us = now_us() if processed_at_us is None else processed_at_us
         with _write_transaction(self.connection):
-            self.connection.execute(
+            row = self.connection.execute(
+                """
+                SELECT decode_state,processed_at_us
+                FROM feed_frames
+                WHERE id = ? AND analysis_session_id = ? AND ingest_connection_id = ? AND frame_sequence = ?
+                """,
+                (frame.id, self.analysis_session_id, frame.connection_id, frame.sequence),
+            ).fetchone()
+            if row is None:
+                raise IngestStoreError(f"Raw frame not found while marking processed: {frame.source_key}")
+            if row["decode_state"] != "decoded":
+                raise IngestStoreError(f"Only decoded frames can be marked processed: {frame.source_key}")
+            if row["processed_at_us"] is not None:
+                return
+            if checkpoint is not None:
+                self._validate_checkpoint(frame, checkpoint)
+                save_checkpoint(
+                    self.connection,
+                    source_heat_id=checkpoint.source_heat_id,
+                    source_frame_id=checkpoint.source_frame_id,
+                    source_key=checkpoint.source_key,
+                    observed_at_us=checkpoint.observed_at_us,
+                    state=checkpoint.state,
+                    checkpoint_format=RUNTIME_CHECKPOINT_FORMAT,
+                    checkpoint_format_version=RUNTIME_CHECKPOINT_FORMAT_VERSION,
+                    reducer_version=checkpoint.reducer_version,
+                )
+            cursor = self.connection.execute(
                 """
                 UPDATE feed_frames
                 SET processed_at_us = ?
@@ -369,6 +422,23 @@ class RawIngestStore:
                 """,
                 (timestamp_us, frame.id),
             )
+            if cursor.rowcount != 1:  # pragma: no cover - writer lock makes this defensive
+                raise IngestStoreError(f"Raw frame could not be marked processed: {frame.source_key}")
+
+    @staticmethod
+    def _validate_checkpoint(frame: StoredFrame, checkpoint: ProcessedFrameCheckpoint) -> None:
+        if not isinstance(checkpoint, ProcessedFrameCheckpoint):
+            raise IngestStoreError("checkpoint must be a ProcessedFrameCheckpoint")
+        if type(checkpoint.source_heat_id) is not int or checkpoint.source_heat_id <= 0:
+            raise IngestStoreError("checkpoint source_heat_id must be a positive integer")
+        if checkpoint.source_frame_id != frame.id:
+            raise IngestStoreError("checkpoint source_frame_id must match the processed frame")
+        if checkpoint.source_key != frame.source_key:
+            raise IngestStoreError("checkpoint source_key must match the processed frame")
+        if checkpoint.observed_at_us != frame.received_at_us:
+            raise IngestStoreError("checkpoint observed_at_us must match the processed frame")
+        if not isinstance(checkpoint.reducer_version, str) or not checkpoint.reducer_version:
+            raise IngestStoreError("checkpoint reducer_version must be a non-empty string")
 
     def pending_decoded_frames(self) -> tuple[StoredFrame, ...]:
         """Return replay work left after a process crash, in original receive order."""

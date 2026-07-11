@@ -16,6 +16,10 @@ from typing import Any
 from .normalization import ResultColumn, result_columns
 
 
+class ResultGridStateError(ValueError):
+    """A checkpoint cannot safely reconstruct the sparse result-grid reducer."""
+
+
 @dataclass(frozen=True)
 class ResultCell:
     """The primary source value plus any provider rendering metadata."""
@@ -169,3 +173,91 @@ class ResultGrid:
                 key: list(indexes) for key, indexes in sorted(self.schema_conflicts.items())
             },
         }
+
+    def restore_snapshot(self, state: Any) -> None:
+        """Restore a strict checkpoint without replaying provider mutations.
+
+        Reconstructing through :meth:`set_layout` would increment the layout
+        generation and make a previously accepted same-connection `r_c` look
+        unsafe. The checkpoint therefore stores the generation while this
+        method recomputes every derivable field from the raw layout and rejects
+        a mismatch rather than accepting synthetic sparse state.
+        """
+
+        if not isinstance(state, Mapping):
+            raise ResultGridStateError("result grid checkpoint must be an object")
+        layout = copy.deepcopy(state.get("layout"))
+        generation = _checkpoint_non_negative_integer(state.get("layout_generation"), "layout_generation")
+        schema_pending = state.get("schema_pending")
+        if type(schema_pending) is not bool:
+            raise ResultGridStateError("schema_pending must be a boolean")
+        columns = result_columns(layout)
+        conflicts = self._schema_conflicts(columns)
+        expected_conflicts = _checkpoint_conflicts(state.get("schema_conflicts"))
+        if conflicts != expected_conflicts:
+            raise ResultGridStateError("schema_conflicts do not match checkpoint layout")
+        metadata = state.get("metadata_changes")
+        if not isinstance(metadata, Sequence) or isinstance(metadata, (str, bytes, bytearray)):
+            raise ResultGridStateError("metadata_changes must be an array")
+        if len(metadata) > 200:
+            raise ResultGridStateError("metadata_changes exceeds reducer bound")
+        restored_metadata: list[tuple[Any, ...]] = []
+        for item in metadata:
+            if not isinstance(item, Sequence) or isinstance(item, (str, bytes, bytearray)):
+                raise ResultGridStateError("metadata_changes item must be an array")
+            restored_metadata.append(tuple(copy.deepcopy(value) for value in item))
+
+        raw_rows = state.get("rows")
+        if not isinstance(raw_rows, Mapping):
+            raise ResultGridStateError("rows must be an object")
+        restored_rows: dict[int, dict[int, ResultCell]] = {}
+        for row_key, raw_cells in raw_rows.items():
+            row_index = _checkpoint_non_negative_integer(row_key, "row index")
+            if not isinstance(raw_cells, Mapping):
+                raise ResultGridStateError("row cells must be an object")
+            cells: dict[int, ResultCell] = {}
+            for column_key, raw_cell in raw_cells.items():
+                column_index = _checkpoint_non_negative_integer(column_key, "column index")
+                if not isinstance(raw_cell, Sequence) or isinstance(raw_cell, (str, bytes, bytearray)) or not raw_cell:
+                    raise ResultGridStateError("result cell must be a non-empty array")
+                cells[column_index] = ResultCell(
+                    value=copy.deepcopy(raw_cell[0]),
+                    presentation=tuple(copy.deepcopy(value) for value in raw_cell[1:]),
+                )
+            restored_rows[row_index] = cells
+        if layout is None and restored_rows:
+            raise ResultGridStateError("rows require a result layout")
+        if schema_pending and restored_rows:
+            raise ResultGridStateError("schema-pending checkpoint cannot retain result rows")
+
+        self.layout = layout
+        self.columns = columns
+        self.rows = restored_rows
+        self.metadata_changes = restored_metadata
+        self.layout_generation = generation
+        self.schema_pending = schema_pending
+        self.schema_conflicts = conflicts
+
+
+def _checkpoint_non_negative_integer(value: Any, field_name: str) -> int:
+    if type(value) is int and value >= 0:
+        return value
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        return int(value)
+    raise ResultGridStateError(f"{field_name} must be a non-negative integer")
+
+
+def _checkpoint_conflicts(value: Any) -> dict[str, tuple[int, ...]]:
+    if not isinstance(value, Mapping):
+        raise ResultGridStateError("schema_conflicts must be an object")
+    result: dict[str, tuple[int, ...]] = {}
+    for key, indexes in value.items():
+        if not isinstance(key, str) or not key:
+            raise ResultGridStateError("schema conflict key must be a non-empty string")
+        if not isinstance(indexes, Sequence) or isinstance(indexes, (str, bytes, bytearray)):
+            raise ResultGridStateError("schema conflict indexes must be an array")
+        parsed = tuple(_checkpoint_non_negative_integer(index, "schema conflict index") for index in indexes)
+        if len(parsed) < 2:
+            raise ResultGridStateError("schema conflict must contain at least two indexes")
+        result[key] = parsed
+    return result

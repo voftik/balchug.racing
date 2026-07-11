@@ -412,6 +412,37 @@ class TimingRebuildTests(unittest.TestCase):
         finally:
             reader.close()
 
+    def test_rejects_a_raw_retention_floor_before_mutating_derived_state(self):
+        """A surviving tail is not sufficient evidence for a full rebuild."""
+
+        writer = connect(self.database)
+        try:
+            writer.execute(
+                """
+                INSERT INTO timing_raw_retention_floors(
+                  analysis_session_id,deleted_through_frame_id,deleted_through_received_at_us,
+                  checkpoint_id,created_at_us,updated_at_us
+                ) VALUES (?,?,?,?,?,?)
+                """,
+                (self.session_id, 1, 1, None, 1, 1),
+            )
+            writer.commit()
+        finally:
+            writer.close()
+
+        with self.assertRaisesRegex(RebuildError, "raw retention floor"):
+            plan_rebuild(self.database, self.session_id)
+        with self.assertRaisesRegex(RebuildError, "raw retention floor"):
+            rebuild_session(self.database, self.session_id)
+
+        reader = connect(self.database, readonly=True)
+        try:
+            self.assertEqual(reader.execute("SELECT COUNT(*) FROM feed_frames").fetchone()[0], 2)
+            self.assertEqual(reader.execute("SELECT COUNT(*) FROM source_heats").fetchone()[0], 1)
+            self.assertEqual(reader.execute("SELECT COUNT(*) FROM metric_current").fetchone()[0], 3)
+        finally:
+            reader.close()
+
     def test_rejects_incomplete_raw_evidence_before_mutating_derived_state(self):
         for decode_state in ("pending", "failed"):
             with self.subTest(decode_state=decode_state):

@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from timing.db import connect, migrate
-from timing.ingest_store import IngestStoreError, RawIngestStore
+from timing.ingest_store import IngestStoreError, ProcessedFrameCheckpoint, RawIngestStore
 from timing.lifecycle import create_session, start_session
 from timing.protocol import Bootstrap
 
@@ -116,6 +116,95 @@ class RawIngestStoreTests(unittest.TestCase):
         self.assertEqual(
             self.connection.execute("SELECT COUNT(*) FROM feed_messages WHERE frame_id = ?", (frame.id,)).fetchone()[0],
             1,
+        )
+
+    def test_processed_marker_and_runtime_checkpoint_are_atomic_and_frame_identified(self):
+        store = RawIngestStore(self.connection, analysis_session_id=self.session.id)
+        store.start_run(started_at_us=3_200_000)
+        upstream = store.open_connection(
+            Bootstrap("https://example.test/igora", "timekeeper", None), connected_at_us=3_200_001
+        )
+        heat_id = int(
+            self.connection.execute(
+                """
+                INSERT INTO source_heats(analysis_session_id,generation,created_at_us)
+                VALUES (?,?,?) RETURNING id
+                """,
+                (self.session.id, 1, 3_200_001),
+            ).fetchone()[0]
+        )
+        self.connection.commit()
+
+        def decoded_frame(sequence: int):
+            frame = store.persist_raw_frame(
+                upstream,
+                sequence=sequence,
+                raw_text='{"M":[["h_h",{"f":2}]]}',
+                # Deliberately equal: runtime identity is physical frame id.
+                received_at_us=3_200_002,
+                monotonic_ns=900 + sequence,
+            )
+            self.assertEqual([message.handle for message in store.decode_frame(frame)], ["h_h"])
+            return frame
+
+        first = decoded_frame(1)
+        store.mark_processed(
+            first,
+            checkpoint=ProcessedFrameCheckpoint(
+                source_heat_id=heat_id,
+                source_frame_id=first.id,
+                source_key=first.source_key,
+                observed_at_us=first.received_at_us,
+                reducer_version="checkpoint-test-v1",
+                state={"frame": first.id},
+            ),
+        )
+        second = decoded_frame(2)
+        store.mark_processed(
+            second,
+            checkpoint=ProcessedFrameCheckpoint(
+                source_heat_id=heat_id,
+                source_frame_id=second.id,
+                source_key=second.source_key,
+                observed_at_us=second.received_at_us,
+                reducer_version="checkpoint-test-v1",
+                state={"frame": second.id},
+            ),
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM state_checkpoints WHERE source_heat_id = ?", (heat_id,)
+            ).fetchone()[0],
+            2,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM feed_frames WHERE processed_at_us IS NOT NULL"
+            ).fetchone()[0],
+            2,
+        )
+
+        failed = decoded_frame(3)
+        with self.assertRaises(TypeError):
+            store.mark_processed(
+                failed,
+                checkpoint=ProcessedFrameCheckpoint(
+                    source_heat_id=heat_id,
+                    source_frame_id=failed.id,
+                    source_key=failed.source_key,
+                    observed_at_us=failed.received_at_us,
+                    reducer_version="checkpoint-test-v1",
+                    state={"not_json": {1, 2, 3}},
+                ),
+            )
+        self.assertIsNone(
+            self.connection.execute("SELECT processed_at_us FROM feed_frames WHERE id = ?", (failed.id,)).fetchone()[0]
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM state_checkpoints WHERE source_frame_id = ?", (failed.id,)
+            ).fetchone()[0],
+            0,
         )
 
     def test_inactive_session_cannot_start_a_live_writer(self):

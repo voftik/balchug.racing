@@ -20,7 +20,14 @@ from dataclasses import dataclass
 from typing import Any, Iterator
 
 from .config import now_us
-from .ingest_store import StoredFrame
+from .db import (
+    CheckpointError,
+    RUNTIME_CHECKPOINT_FORMAT,
+    RUNTIME_CHECKPOINT_FORMAT_VERSION,
+    decode_checkpoint,
+    runtime_checkpoint_rows,
+)
+from .ingest_store import ProcessedFrameCheckpoint, StoredFrame
 from .lifecycle import OUR_START_NUMBER, OUR_TEAM_NAME
 from .metric_runner import TimingMetricRunner
 from .normalization import (
@@ -40,10 +47,14 @@ from .normalization import (
 )
 from .protocol import SignalRMessage
 from .race_control_store import RaceControlSource, project_screen_message
-from .result_grid import ResultGrid
+from .result_grid import ResultGrid, ResultGridStateError
 
 
 NORMALIZER_VERSION = "timeservice-normalizer-v1"
+RUNTIME_CHECKPOINT_REDUCER_VERSION = "timeservice-normalizer-checkpoint-v1"
+RUNTIME_CHECKPOINT_PAYLOAD_FORMAT = "balchug.timing.normalizer-checkpoint"
+RUNTIME_CHECKPOINT_PAYLOAD_VERSION = 1
+RUNTIME_CHECKPOINT_INTERVAL_US = 30 * 1_000_000
 OUR_TEAM_KEY = " ".join(OUR_TEAM_NAME.casefold().split())
 # A live `h_h.f` transition and the matching Statistics history entry normally
 # arrive seconds apart. Older history must be inserted as its own event rather
@@ -179,6 +190,20 @@ def _integer(value: Any, *, minimum: int | None = None) -> int | None:
     else:
         return None
     return result if minimum is None or result >= minimum else None
+
+
+def _checkpoint_integer(value: Any, field: str, *, minimum: int = 0) -> int:
+    """Read an integer from our JSON checkpoint without coercing false data."""
+
+    if type(value) is not int or value < minimum:
+        raise NormalizerError(f"Checkpoint {field} must be an integer >= {minimum}")
+    return value
+
+
+def _checkpoint_mapping(value: Any, field: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise NormalizerError(f"Checkpoint {field} must be an object")
+    return value
 
 
 def _number(value: Any) -> float | None:
@@ -335,6 +360,7 @@ class TimingNormalizer:
         self._schema_baselines: dict[str, list[ResultSchemaBaseline]] = {}
         self._pending_last_schema_baseline_ids: dict[int, int | None] = {}
         self._pending_last_full_grid_refresh: dict[int, bool] = {}
+        self._restored_checkpoint_anchor_frame_id: int | None = None
         self._primed = False
         self._metric_runner = TimingMetricRunner()
 
@@ -394,18 +420,369 @@ class TimingNormalizer:
             replay_active=self._replay_active,
         )
 
+    def checkpoint_for_processed_frame(
+        self,
+        connection: sqlite3.Connection,
+        frame: StoredFrame,
+    ) -> ProcessedFrameCheckpoint | None:
+        """Return a reducer checkpoint to commit atomically with `processed_at`.
+
+        The caller invokes this only after normalized facts and metrics for the
+        frame have committed, but before RawIngestStore atomically marks that
+        same frame processed. Rebuild replay intentionally never emits runtime
+        checkpoints.
+        """
+
+        if self._replay_active or self._heat_id is None:
+            return None
+        if not self._checkpoint_due(connection, frame):
+            return None
+        return ProcessedFrameCheckpoint(
+            source_heat_id=self.heat_id,
+            source_frame_id=frame.id,
+            source_key=frame.source_key,
+            observed_at_us=frame.received_at_us,
+            reducer_version=RUNTIME_CHECKPOINT_REDUCER_VERSION,
+            state=self._checkpoint_payload(connection, frame),
+        )
+
+    def _checkpoint_due(self, connection: sqlite3.Connection, frame: StoredFrame) -> bool:
+        """Keep the replay tail bounded without treating receive time as identity."""
+
+        row = connection.execute(
+            """
+            SELECT source_frame_id,observed_at_us
+            FROM state_checkpoints
+            WHERE source_heat_id = ?
+              AND checkpoint_format = ?
+              AND checkpoint_format_version = ?
+              AND reducer_version = ?
+            ORDER BY source_frame_id DESC,id DESC
+            LIMIT 1
+            """,
+            (
+                self.heat_id,
+                RUNTIME_CHECKPOINT_FORMAT,
+                RUNTIME_CHECKPOINT_FORMAT_VERSION,
+                RUNTIME_CHECKPOINT_REDUCER_VERSION,
+            ),
+        ).fetchone()
+        if row is None:
+            return True
+        if row["source_frame_id"] is not None and int(row["source_frame_id"]) == frame.id:
+            return False
+        return frame.received_at_us - int(row["observed_at_us"]) >= RUNTIME_CHECKPOINT_INTERVAL_US
+
+    def _checkpoint_payload(self, connection: sqlite3.Connection, frame: StoredFrame) -> dict[str, Any]:
+        """Serialize every sparse reducer input needed after a process restart."""
+
+        heat = connection.execute(
+            """
+            SELECT id,generation FROM source_heats
+            WHERE id = ? AND analysis_session_id = ?
+            """,
+            (self.heat_id, self.analysis_session_id),
+        ).fetchone()
+        if heat is None:
+            raise NormalizerError("Cannot checkpoint a source heat outside this analysis session")
+        grid_snapshot = self.grid.snapshot()
+        layout_fingerprint = _fingerprint(self.grid.layout) if self.grid.layout is not None else None
+        payload: dict[str, Any] = {
+            "format": RUNTIME_CHECKPOINT_PAYLOAD_FORMAT,
+            "format_version": RUNTIME_CHECKPOINT_PAYLOAD_VERSION,
+            "reducer_version": RUNTIME_CHECKPOINT_REDUCER_VERSION,
+            "analysis_session_id": self.analysis_session_id,
+            "source_heat": {
+                "id": int(heat["id"]),
+                "generation": int(heat["generation"]),
+                "provider_heat_start_ts": self._provider_heat_start_ts,
+            },
+            "anchor": {
+                "source_frame_id": frame.id,
+                "source_key": frame.source_key,
+                "observed_at_us": frame.received_at_us,
+            },
+            "reducer": {
+                "heat": copy.deepcopy(self.heat),
+                "statistics": copy.deepcopy(self.statistics),
+                "grid": grid_snapshot,
+                "layout_version": {
+                    "id": self._layout_id,
+                    "fingerprint": layout_fingerprint,
+                },
+                "calibrators": {
+                    connection_id: calibrator.snapshot()
+                    for connection_id, calibrator in sorted(self._calibrators.items())
+                },
+                "finish_sector_ids": sorted(self._finish_sector_ids),
+                "schema_baselines": {
+                    connection_id: [
+                        {
+                            "id": baseline.id,
+                            "connection_id": baseline.connection_id,
+                            "layout_version_id": baseline.layout_version_id,
+                            "layout_generation": baseline.layout_generation,
+                            "source_frame_id": baseline.source_frame_id,
+                            "source_message_id": baseline.source_message_id,
+                            "source_message_ordinal": baseline.source_message_ordinal,
+                        }
+                        for baseline in baselines
+                    ]
+                    for connection_id, baselines in sorted(self._schema_baselines.items())
+                },
+            },
+        }
+        try:
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError) as error:  # pragma: no cover - raw JSON should already be serializable
+            raise NormalizerError("Reducer checkpoint contains non-JSON state") from error
+        return payload
+
+    def _restore_checkpoint_payload(
+        self,
+        connection: sqlite3.Connection,
+        checkpoint: sqlite3.Row,
+        payload: Any,
+    ) -> None:
+        """Validate and atomically install one self-contained reducer snapshot."""
+
+        envelope = _checkpoint_mapping(payload, "envelope")
+        if envelope.get("format") != RUNTIME_CHECKPOINT_PAYLOAD_FORMAT:
+            raise NormalizerError("Checkpoint payload format is unsupported")
+        if envelope.get("format_version") != RUNTIME_CHECKPOINT_PAYLOAD_VERSION:
+            raise NormalizerError("Checkpoint payload format version is unsupported")
+        if envelope.get("reducer_version") != RUNTIME_CHECKPOINT_REDUCER_VERSION:
+            raise NormalizerError("Checkpoint reducer version is unsupported")
+        if envelope.get("analysis_session_id") != self.analysis_session_id:
+            raise NormalizerError("Checkpoint belongs to a different analysis session")
+        if checkpoint["analysis_session_id"] != self.analysis_session_id:
+            raise NormalizerError("Checkpoint row belongs to a different analysis session")
+        if checkpoint["anchor_analysis_session_id"] != self.analysis_session_id:
+            raise NormalizerError("Checkpoint anchor belongs to a different analysis session")
+
+        source_heat = _checkpoint_mapping(envelope.get("source_heat"), "source_heat")
+        source_heat_id = _checkpoint_integer(source_heat.get("id"), "source_heat.id", minimum=1)
+        if source_heat_id != int(checkpoint["source_heat_id"]):
+            raise NormalizerError("Checkpoint source heat does not match its row")
+        heat_generation = _checkpoint_integer(source_heat.get("generation"), "source_heat.generation", minimum=1)
+        provider_start = source_heat.get("provider_heat_start_ts")
+        if provider_start is not None:
+            provider_start = _checkpoint_integer(provider_start, "source_heat.provider_heat_start_ts")
+        heat_row = connection.execute(
+            """
+            SELECT generation FROM source_heats
+            WHERE id = ? AND analysis_session_id = ?
+            """,
+            (source_heat_id, self.analysis_session_id),
+        ).fetchone()
+        if heat_row is None or int(heat_row["generation"]) != heat_generation:
+            raise NormalizerError("Checkpoint source heat provenance is invalid")
+
+        anchor = _checkpoint_mapping(envelope.get("anchor"), "anchor")
+        anchor_frame_id = _checkpoint_integer(anchor.get("source_frame_id"), "anchor.source_frame_id", minimum=1)
+        anchor_observed_at_us = _checkpoint_integer(anchor.get("observed_at_us"), "anchor.observed_at_us")
+        anchor_source_key = anchor.get("source_key")
+        expected_source_key = f"{checkpoint['anchor_connection_id']}:{checkpoint['anchor_frame_sequence']}"
+        if not isinstance(anchor_source_key, str) or anchor_source_key != expected_source_key:
+            raise NormalizerError("Checkpoint anchor source key is invalid")
+        if (
+            anchor_frame_id != int(checkpoint["source_frame_id"])
+            or anchor_observed_at_us != int(checkpoint["anchor_received_at_us"])
+            or anchor_source_key != checkpoint["source_key"]
+            or anchor_observed_at_us != int(checkpoint["observed_at_us"])
+        ):
+            raise NormalizerError("Checkpoint anchor does not match its immutable frame")
+
+        reducer = _checkpoint_mapping(envelope.get("reducer"), "reducer")
+        raw_heat = _checkpoint_mapping(reducer.get("heat"), "reducer.heat")
+        raw_statistics = _checkpoint_mapping(reducer.get("statistics"), "reducer.statistics")
+        candidate_grid = ResultGrid()
+        candidate_grid.restore_snapshot(reducer.get("grid"))
+        layout_version = _checkpoint_mapping(reducer.get("layout_version"), "reducer.layout_version")
+        layout_id_value = layout_version.get("id")
+        layout_id = (
+            None
+            if layout_id_value is None
+            else _checkpoint_integer(layout_id_value, "reducer.layout_version.id", minimum=1)
+        )
+        fingerprint = layout_version.get("fingerprint")
+        expected_fingerprint = _fingerprint(candidate_grid.layout) if candidate_grid.layout is not None else None
+        if fingerprint != expected_fingerprint:
+            raise NormalizerError("Checkpoint result layout fingerprint is invalid")
+        if layout_id is not None:
+            layout_row = connection.execute(
+                """
+                SELECT source_heat_id,layout_fingerprint FROM result_layout_versions
+                WHERE id = ?
+                """,
+                (layout_id,),
+            ).fetchone()
+            if (
+                layout_row is None
+                or int(layout_row["source_heat_id"]) != source_heat_id
+                or layout_row["layout_fingerprint"] != expected_fingerprint
+            ):
+                raise NormalizerError("Checkpoint result layout provenance is invalid")
+
+        calibrators_payload = _checkpoint_mapping(reducer.get("calibrators"), "reducer.calibrators")
+        candidate_calibrators: dict[str, ConnectionClockCalibrator] = {}
+        for connection_id, state in calibrators_payload.items():
+            if not isinstance(connection_id, str) or not connection_id:
+                raise NormalizerError("Checkpoint calibrator connection id is invalid")
+            candidate_calibrators[connection_id] = ConnectionClockCalibrator.from_snapshot(state)
+
+        finish_sector_values = reducer.get("finish_sector_ids")
+        if not isinstance(finish_sector_values, list):
+            raise NormalizerError("Checkpoint finish_sector_ids must be an array")
+        candidate_finish_sectors = {
+            _checkpoint_integer(value, "reducer.finish_sector_ids item") for value in finish_sector_values
+        }
+        if len(candidate_finish_sectors) != len(finish_sector_values):
+            raise NormalizerError("Checkpoint finish_sector_ids must not contain duplicates")
+
+        baselines_payload = _checkpoint_mapping(reducer.get("schema_baselines"), "reducer.schema_baselines")
+        candidate_baselines: dict[str, list[ResultSchemaBaseline]] = {}
+        baseline_ids: set[int] = set()
+        for connection_id, records in baselines_payload.items():
+            if not isinstance(connection_id, str) or not connection_id:
+                raise NormalizerError("Checkpoint schema-baseline connection id is invalid")
+            if not isinstance(records, list):
+                raise NormalizerError("Checkpoint schema-baseline records must be an array")
+            restored: list[ResultSchemaBaseline] = []
+            for record in records:
+                data = _checkpoint_mapping(record, "reducer.schema_baselines item")
+                baseline = ResultSchemaBaseline(
+                    id=_checkpoint_integer(data.get("id"), "schema baseline id", minimum=1),
+                    connection_id=data.get("connection_id"),
+                    layout_version_id=_checkpoint_integer(
+                        data.get("layout_version_id"), "schema baseline layout_version_id", minimum=1
+                    ),
+                    layout_generation=_checkpoint_integer(
+                        data.get("layout_generation"), "schema baseline layout_generation"
+                    ),
+                    source_frame_id=_checkpoint_integer(
+                        data.get("source_frame_id"), "schema baseline source_frame_id", minimum=1
+                    ),
+                    source_message_id=_checkpoint_integer(
+                        data.get("source_message_id"), "schema baseline source_message_id", minimum=1
+                    ),
+                    source_message_ordinal=_checkpoint_integer(
+                        data.get("source_message_ordinal"), "schema baseline source_message_ordinal"
+                    ),
+                )
+                if baseline.connection_id != connection_id:
+                    raise NormalizerError("Checkpoint schema baseline has the wrong connection id")
+                if baseline.id in baseline_ids:
+                    raise NormalizerError("Checkpoint schema baseline id is duplicated")
+                if baseline.layout_generation != candidate_grid.layout_generation:
+                    raise NormalizerError("Checkpoint schema baseline layout generation is stale")
+                if layout_id is None or baseline.layout_version_id != layout_id:
+                    raise NormalizerError("Checkpoint schema baseline layout is stale")
+                baseline_ids.add(baseline.id)
+                restored.append(baseline)
+            restored.sort(key=self._baseline_sort_key)
+            candidate_baselines[connection_id] = restored
+
+        # Assign only after every invariant has been checked; a corrupt newest
+        # checkpoint must leave this normalizer fresh for an older fallback.
+        self.grid = candidate_grid
+        self.heat = copy.deepcopy(dict(raw_heat))
+        self.statistics = copy.deepcopy(dict(raw_statistics))
+        self._calibrators = candidate_calibrators
+        self._heat_id = source_heat_id
+        self._layout_id = layout_id
+        self._provider_heat_start_ts = provider_start
+        self._finish_sector_ids = candidate_finish_sectors
+        self._schema_baselines = candidate_baselines
+        self._pending_pit_events = []
+        self._pending_last_schema_baseline_ids = {}
+        self._pending_last_full_grid_refresh = {}
+
+    def _record_restore_event(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        source_heat_id: int | None,
+        checkpoint_id: int | None,
+        anchor_frame_id: int | None,
+        outcome: str,
+        reason: str,
+        replayed_tail_frames: int,
+    ) -> None:
+        with _write_transaction(connection):
+            connection.execute(
+                """
+                INSERT INTO normalizer_restore_events(
+                  analysis_session_id,source_heat_id,checkpoint_id,anchor_frame_id,outcome,reason,
+                  replayed_tail_frames,created_at_us
+                ) VALUES (?,?,?,?,?,?,?,?)
+                """,
+                (
+                    self.analysis_session_id,
+                    source_heat_id,
+                    checkpoint_id,
+                    anchor_frame_id,
+                    outcome,
+                    reason[:1_000],
+                    replayed_tail_frames,
+                    now_us(),
+                ),
+            )
+
     def _prime(self, connection: sqlite3.Connection) -> None:
-        """Restore in-memory sparse state from already committed derived frames."""
+        """Restore reducer state from a checkpoint then replay only its tail."""
         if self._primed:
             return
+        after_frame_id = 0
+        checkpoint_id: int | None = None
+        checkpoint_heat_id: int | None = None
+        outcome = "COLD_REPLAY"
+        reason = "no_compatible_checkpoint"
+        if not self._replay_active:
+            for checkpoint in runtime_checkpoint_rows(
+                connection,
+                analysis_session_id=self.analysis_session_id,
+                reducer_version=RUNTIME_CHECKPOINT_REDUCER_VERSION,
+            ):
+                try:
+                    payload = decode_checkpoint(
+                        checkpoint["codec"],
+                        checkpoint["payload"],
+                        expected_hash=checkpoint["state_hash"],
+                    )
+                    self._restore_checkpoint_payload(connection, checkpoint, payload)
+                except (CheckpointError, NormalizerError, ResultGridStateError, ValueError, TypeError, KeyError, IndexError) as error:
+                    outcome = "FALLBACK"
+                    reason = f"invalid_checkpoint:{type(error).__name__}"[:1_000]
+                    continue
+                after_frame_id = int(checkpoint["source_frame_id"])
+                self._restored_checkpoint_anchor_frame_id = after_frame_id
+                checkpoint_id = int(checkpoint["id"])
+                checkpoint_heat_id = int(checkpoint["source_heat_id"])
+                outcome = "RESTORED"
+                reason = "checkpoint_restored"
+                break
+            if after_frame_id == 0:
+                floor = connection.execute(
+                    """
+                    SELECT deleted_through_frame_id FROM timing_raw_retention_floors
+                    WHERE analysis_session_id = ?
+                    """,
+                    (self.analysis_session_id,),
+                ).fetchone()
+                if floor is not None:
+                    raise NormalizerError(
+                        "Cannot cold-replay a session whose RAW evidence was retained from a checkpoint tail"
+                    )
         rows = connection.execute(
             """
             SELECT id,ingest_connection_id,frame_sequence,received_at_us
             FROM feed_frames
             WHERE analysis_session_id = ? AND decode_state = 'decoded' AND processed_at_us IS NOT NULL
+              AND id > ?
             ORDER BY id
             """,
-            (self.analysis_session_id,),
+            (self.analysis_session_id, after_frame_id),
         ).fetchall()
         for row in rows:
             frame = StoredFrame(
@@ -418,6 +795,16 @@ class TimingNormalizer:
             for context in self._frame_messages(connection, frame):
                 self._apply_message(connection, context, write=False)
         self._primed = True
+        if not self._replay_active:
+            self._record_restore_event(
+                connection,
+                source_heat_id=checkpoint_heat_id,
+                checkpoint_id=checkpoint_id,
+                anchor_frame_id=after_frame_id or None,
+                outcome=outcome,
+                reason=reason,
+                replayed_tail_frames=len(rows),
+            )
 
     def _frame_messages(self, connection: sqlite3.Connection, frame: StoredFrame) -> tuple[FrameMessage, ...]:
         rows = connection.execute(
@@ -477,6 +864,46 @@ class TimingNormalizer:
         else:
             self._heat_id = int(row["id"])
         return self._heat_id
+
+    def _restore_existing_heat_for_context(
+        self,
+        connection: sqlite3.Connection,
+        context: FrameMessage,
+        provider_start_ts: int | None,
+    ) -> None:
+        """Map a read-only `h_i` to the heat created during original ingest.
+
+        Priming never creates source heats. A calibrated provider start is the
+        strongest identity; the original receive-time generation boundary is a
+        conservative fallback for the uncommon `h_i` before any `s_i` sample.
+        """
+
+        row: sqlite3.Row | None = None
+        calibrated_start = self._clock(context.connection_id).to_utc_us(provider_start_ts)
+        if calibrated_start is not None:
+            candidates = connection.execute(
+                """
+                SELECT id FROM source_heats
+                WHERE analysis_session_id = ? AND provider_started_at_us = ?
+                ORDER BY generation DESC
+                """,
+                (self.analysis_session_id, calibrated_start),
+            ).fetchall()
+            if len(candidates) == 1:
+                row = candidates[0]
+        if row is None:
+            row = connection.execute(
+                """
+                SELECT id FROM source_heats
+                WHERE analysis_session_id = ? AND created_at_us <= ?
+                ORDER BY generation DESC
+                LIMIT 1
+                """,
+                (self.analysis_session_id, context.received_at_us),
+            ).fetchone()
+        if row is None:
+            raise NormalizerError("Cannot map replayed heat initialization to a durable source heat")
+        self._heat_id = int(row["id"])
 
     @property
     def heat_id(self) -> int:
@@ -554,12 +981,16 @@ class TimingNormalizer:
                 if is_new_heat:
                     if write:
                         self._start_new_heat(connection, context)
+                    else:
+                        self._restore_existing_heat_for_context(connection, context, next_start)
                     self.grid = ResultGrid()
                     self.statistics = {}
                     self._layout_id = None
                     self._schema_baselines.clear()
                     self._finish_sector_ids.clear()
                     old_flag = None
+                elif not write and self._heat_id is None:
+                    self._restore_existing_heat_for_context(connection, context, next_start)
                 if next_start is not None:
                     self._provider_heat_start_ts = next_start
             self.heat = _deep_merge(self.heat, patch) if handle == "h_h" else copy.deepcopy(dict(patch))
@@ -4462,3 +4893,39 @@ class TimingNormalizerRegistry:
         session_id = row["analysis_session_id"]
         normalizer = self._normalizers.setdefault(session_id, TimingNormalizer(session_id))
         normalizer(connection, frame, messages)
+
+    def checkpoint_for_processed_frame(
+        self,
+        connection: sqlite3.Connection,
+        frame: StoredFrame,
+    ) -> ProcessedFrameCheckpoint | None:
+        """Expose the frame's reducer anchor to the raw ingest boundary."""
+
+        row = connection.execute(
+            "SELECT analysis_session_id FROM feed_frames WHERE id = ?", (frame.id,)
+        ).fetchone()
+        if row is None:
+            raise NormalizerError(f"Cannot find analysis session for checkpoint frame {frame.id}")
+        normalizer = self._normalizers.get(row["analysis_session_id"])
+        if normalizer is None:
+            return None
+        return normalizer.checkpoint_for_processed_frame(connection, frame)
+
+
+def validate_runtime_checkpoint(connection: sqlite3.Connection, checkpoint: sqlite3.Row) -> None:
+    """Semantically validate one enriched runtime checkpoint without writes.
+
+    Retention uses this before deleting immutable RAW evidence. The row must
+    come from :func:`timing.db.runtime_checkpoint_rows`, which supplies the
+    joined session and anchor-frame provenance required by the reducer.
+    """
+
+    session_id = checkpoint["analysis_session_id"]
+    if not isinstance(session_id, str) or not session_id:
+        raise NormalizerError("Runtime checkpoint is missing its analysis session")
+    payload = decode_checkpoint(
+        checkpoint["codec"],
+        checkpoint["payload"],
+        expected_hash=checkpoint["state_hash"],
+    )
+    TimingNormalizer(session_id)._restore_checkpoint_payload(connection, checkpoint, payload)

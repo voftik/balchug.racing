@@ -309,6 +309,13 @@ class TimingApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state.json()["schema_version"], "timing-live.v1")
         self.assertEqual(state.json()["measured"]["participants"][0]["driver_name"], "Лобода Михаил")
 
+        ingest_health = await self.client.get(f"/sessions/{session_id}/ingest-health")
+        self.assertEqual(ingest_health.status_code, 200)
+        self.assertEqual(ingest_health.headers["cache-control"], "no-store")
+        self.assertEqual(ingest_health.json()["schema_version"], "timing-live.v1")
+        self.assertEqual(ingest_health.json()["raw"]["retained_frame_count"], 0)
+        self.assertIsNone(ingest_health.json()["runtime_checkpoints"]["latest"])
+
         metrics = await self.client.get(f"/sessions/{session_id}/metrics?scope_kind=participant&scope_key=ours")
         self.assertEqual(metrics.status_code, 200)
         self.assertEqual(metrics.json()["metrics"][0]["values"]["pace_5_ms"], 107200)

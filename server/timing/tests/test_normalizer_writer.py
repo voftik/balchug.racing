@@ -6,10 +6,11 @@ from pathlib import Path
 
 from timing.db import connect, migrate
 from timing.ingest_store import RawIngestStore
-from timing.lifecycle import create_session, start_session
+from timing.lifecycle import create_session, start_session, stop_session
 from timing.normalization import OPEN_ENDED_TS_TIME, TIME_SERVICE_EPOCH_UNIX_US
-from timing.normalizer_writer import TimingNormalizer
+from timing.normalizer_writer import NormalizerError, TimingNormalizer
 from timing.protocol import Bootstrap
+from timing.retention import apply_retention, plan_retention
 
 
 class TimingNormalizerWriterTests(unittest.TestCase):
@@ -39,7 +40,7 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         self.connection.close()
         self.temporary.cleanup()
 
-    def apply(self, messages, *, received_at_us, upstream=None):
+    def apply(self, messages, *, received_at_us, upstream=None, checkpoint=False):
         self.sequence += 1
         raw = json.dumps({"M": messages}, ensure_ascii=False, separators=(",", ":"))
         frame = self.store.persist_raw_frame(
@@ -51,8 +52,145 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         )
         decoded = self.store.decode_frame(frame)
         self.normalizer(self.connection, frame, decoded)
-        self.store.mark_processed(frame)
+        self.store.mark_processed(
+            frame,
+            checkpoint=self.normalizer.checkpoint_for_processed_frame(self.connection, frame) if checkpoint else None,
+        )
         return frame
+
+    def test_runtime_checkpoint_restores_sparse_grid_and_replays_only_unanchored_tail(self):
+        base = TIME_SERVICE_EPOCH_UNIX_US + 1_000_000
+        checkpoint_frame = self.apply(
+            [
+                ["s_i", 1_000_000],
+                ["h_i", {"n": "Practice", "s": 1_000_000, "f": 1}],
+                ["t_i", {"l": [[0, False, 0]], "d": []}],
+                [
+                    "r_i",
+                    {
+                        "l": {"h": [{"n": "POS"}, {"n": "NR"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "STATE"}, {"n": "LAST"}]},
+                        "r": [
+                            [0, 0, "1"],
+                            [0, 1, "21"],
+                            [0, 2, "BALCHUG Racing"],
+                            [0, 3, "CN PRO"],
+                            [0, 4, "E1000000"],
+                            [0, 5, "110000000"],
+                        ],
+                    },
+                ],
+            ],
+            received_at_us=base,
+            checkpoint=True,
+        )
+        tail_frame = self.apply([["r_c", [[0, 4, "In Pit"]]]], received_at_us=base + 10_000_000)
+
+        checkpoint = self.connection.execute(
+            "SELECT source_frame_id,checkpoint_format,reducer_version FROM state_checkpoints"
+        ).fetchone()
+        self.assertEqual(
+            tuple(checkpoint),
+            (checkpoint_frame.id, "timing-normalizer", "timeservice-normalizer-checkpoint-v1"),
+        )
+
+        self.normalizer = TimingNormalizer(self.session.id)
+        self.apply([["r_c", [[0, 5, "107000000"]]]], received_at_us=base + 11_000_000)
+
+        self.assertEqual(self.normalizer.grid.row_values(0)["last_lap"], "107000000")
+        self.assertEqual(self.normalizer.grid.row_values(0)["state"], "In Pit")
+        restore = self.connection.execute(
+            "SELECT outcome,replayed_tail_frames FROM normalizer_restore_events ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(tuple(restore), ("RESTORED", 1))
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM participant_result_cell_observations WHERE source_key = ?",
+                (f"{tail_frame.source_key}:0",),
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_corrupt_runtime_checkpoint_falls_back_to_full_processed_raw_replay(self):
+        base = TIME_SERVICE_EPOCH_UNIX_US + 2_000_000
+        self.apply(
+            [
+                ["s_i", 2_000_000],
+                ["h_i", {"n": "Practice", "s": 2_000_000, "f": 1}],
+                [
+                    "r_i",
+                    {
+                        "l": {"h": [{"n": "NR"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "STATE"}]},
+                        "r": [[0, 0, "21"], [0, 1, "BALCHUG Racing"], [0, 2, "CN PRO"], [0, 3, "E2000000"]],
+                    },
+                ],
+            ],
+            received_at_us=base,
+            checkpoint=True,
+        )
+        self.connection.execute("UPDATE state_checkpoints SET state_hash = 'corrupt'")
+        self.connection.commit()
+
+        self.normalizer = TimingNormalizer(self.session.id)
+        self.apply([["r_c", [[0, 3, "In Pit"]]]], received_at_us=base + 1_000_000)
+
+        self.assertEqual(self.normalizer.grid.row_values(0)["state"], "In Pit")
+        restore = self.connection.execute(
+            "SELECT outcome,replayed_tail_frames FROM normalizer_restore_events ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(tuple(restore), ("FALLBACK", 1))
+
+    def test_retention_floor_rejects_an_older_checkpoint_when_receive_times_regress(self):
+        """A retained old anchor cannot bridge RAW deleted later in frame order."""
+
+        base = TIME_SERVICE_EPOCH_UNIX_US + 1_000_000
+        early_anchor = self.apply(
+            [
+                ["s_i", 1_000_000],
+                ["h_i", {"n": "Practice", "s": 1_000_000, "f": 1}],
+                [
+                    "r_i",
+                    {
+                        "l": {"h": [{"n": "NR"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "STATE"}]},
+                        "r": [[0, 0, "21"], [0, 1, "BALCHUG Racing"], [0, 2, "CN PRO"], [0, 3, "E1000000"]],
+                    },
+                ],
+            ],
+            # The provider/reconnect can produce source frames whose receipt
+            # clock is not ordered with the durable frame id.
+            received_at_us=base + 1_000_000_000,
+            checkpoint=True,
+        )
+        deleted_tail = self.apply([["r_c", [[0, 3, "In Pit"]]]], received_at_us=base)
+        later_anchor = self.apply(
+            [["h_h", {"f": 2}]],
+            received_at_us=base + 1_100_000_000,
+            checkpoint=True,
+        )
+        self.assertGreater(later_anchor.id, deleted_tail.id)
+        self.assertLess(early_anchor.id, deleted_tail.id)
+
+        stop_session(
+            self.connection,
+            session_id=self.session.id,
+            idempotency_key="stop-retention-floor-checkpoint",
+        )
+        plan = plan_retention(
+            self.connection,
+            now_at_us=base + 500_000_000,
+            raw_days=0,
+            stream_days=999_999,
+        )
+        self.assertEqual(plan.feed_frame_ids, (deleted_tail.id,))
+        self.assertEqual(apply_retention(self.connection, plan), 1)
+        self.connection.execute(
+            "UPDATE state_checkpoints SET state_hash = 'corrupt' WHERE source_frame_id = ?",
+            (later_anchor.id,),
+        )
+        self.connection.commit()
+
+        self.normalizer = TimingNormalizer(self.session.id)
+        with self.assertRaisesRegex(NormalizerError, "Cannot cold-replay"):
+            self.normalizer._prime(self.connection)
 
     def test_red_flag_is_provisional_then_reconciled_to_precise_provider_boundaries(self):
         provider_start = 1_000_000
