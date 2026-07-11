@@ -466,6 +466,8 @@ class ResultState:
 _STATE_LITERALS = {
     "inpit": "IN_PIT",
     "outlap": "OUT_LAP",
+    "finshd": "FINISHED",
+    "finished": "FINISHED",
 }
 
 
@@ -477,9 +479,9 @@ def parse_result_state(value: Any) -> ResultState:
     """Parse source ``STATE`` values without treating timers as durations.
 
     ``E<TsTime>`` represents a provider-clock target while a car is on track.
-    ``S<literal>`` is a source status; currently only ``In Pit`` and ``OutLap``
-    have canonical meanings.  A new literal stays ``UNKNOWN`` with its source
-    text intact for future schema work.
+    ``S<literal>`` is a source status. Recognized values include ``In Pit``,
+    ``OutLap`` and the provider's observed finish spelling ``Finshd``. A new
+    literal stays ``UNKNOWN`` with its source text intact for future schema work.
     """
 
     if not isinstance(value, str):

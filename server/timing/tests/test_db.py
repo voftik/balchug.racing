@@ -78,12 +78,77 @@ class TimingDatabaseTests(unittest.TestCase):
         message_id = connection.execute("SELECT id FROM feed_messages WHERE frame_id=?", (frame_id,)).fetchone()[0]
         return frame_id, message_id
 
+    def test_finished_state_migration_backfills_only_explicit_provider_literals(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "timing.db"
+            migrate(path)
+            connection = connect(path)
+            try:
+                source_id = self.insert_source(connection)
+                heat_id = self.insert_session(connection, "finished-state", source_id)
+                timestamp = now_us()
+                for participant_id, number in (("finished-car", "21"), ("unknown-car", "67")):
+                    connection.execute(
+                        """
+                        INSERT INTO participants(
+                          id,source_heat_id,external_key,start_number,first_seen_at_us,last_seen_at_us
+                        ) VALUES (?,?,?,?,?,?)
+                        """,
+                        (participant_id, heat_id, participant_id, number, timestamp, timestamp),
+                    )
+                for participant_id, raw in (("finished-car", "SFinshd"), ("unknown-car", "SStopped")):
+                    connection.execute(
+                        """
+                        INSERT INTO participant_state_current(
+                          source_heat_id,participant_id,state,state_raw,state_kind,source_key,updated_at_us
+                        ) VALUES (?,?, 'UNKNOWN',?,'UNKNOWN',?,?)
+                        """,
+                        (heat_id, participant_id, raw, f"current:{participant_id}", timestamp),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO participant_state_observations(
+                          source_heat_id,participant_id,provider_row_index,state_raw,state_kind,
+                          source_key,source_event_key,observed_at_us,created_at_us
+                        ) VALUES (?,?,0,?,'UNKNOWN',?,?,?,?)
+                        """,
+                        (heat_id, participant_id, raw, f"observation:{participant_id}", participant_id, timestamp, timestamp),
+                    )
+                connection.execute("DELETE FROM schema_migrations WHERE version = '0020'")
+                connection.commit()
+            finally:
+                connection.close()
+
+            self.assertEqual(migrate(path), ["0020"])
+            connection = connect(path)
+            try:
+                current = {
+                    row["participant_id"]: (row["state"], row["state_raw"], row["state_kind"])
+                    for row in connection.execute(
+                        "SELECT participant_id,state,state_raw,state_kind FROM participant_state_current"
+                    )
+                }
+                observations = {
+                    row["participant_id"]: (row["state_raw"], row["state_kind"])
+                    for row in connection.execute(
+                        "SELECT participant_id,state_raw,state_kind FROM participant_state_observations"
+                    )
+                }
+                self.assertEqual(current["finished-car"], ("FINISHED", "SFinshd", "FINISHED"))
+                self.assertEqual(current["unknown-car"], ("UNKNOWN", "SStopped", "UNKNOWN"))
+                self.assertEqual(observations["finished-car"], ("SFinshd", "FINISHED"))
+                self.assertEqual(observations["unknown-car"], ("SStopped", "UNKNOWN"))
+                self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+            finally:
+                connection.close()
+            self.assertEqual(migrate(path), [])
+
     def test_migration_is_repeatable_and_enables_wal(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "timing.db"
             self.assertEqual(
                 migrate(path),
-                ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018", "0019"],
+                ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018", "0019", "0020"],
             )
             self.assertEqual(migrate(path), [])
             connection = connect(path)
@@ -498,7 +563,7 @@ class TimingDatabaseTests(unittest.TestCase):
 
             self.assertEqual(
                 migrate(path),
-                ["0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018", "0019"],
+                ["0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018", "0019", "0020"],
             )
             connection = connect(path)
             try:
@@ -614,7 +679,7 @@ class TimingDatabaseTests(unittest.TestCase):
             finally:
                 connection.close()
 
-            self.assertEqual(migrate(path), ["0013", "0014", "0015", "0016", "0017", "0018", "0019"])
+            self.assertEqual(migrate(path), ["0013", "0014", "0015", "0016", "0017", "0018", "0019", "0020"])
             connection = connect(path)
             try:
                 current = connection.execute(
@@ -726,7 +791,7 @@ class TimingDatabaseTests(unittest.TestCase):
             finally:
                 connection.close()
 
-            self.assertEqual(migrate(path), ["0014", "0015", "0016", "0017", "0018", "0019"])
+            self.assertEqual(migrate(path), ["0014", "0015", "0016", "0017", "0018", "0019", "0020"])
             connection = connect(path)
             try:
                 observation = connection.execute(
@@ -916,7 +981,7 @@ class TimingDatabaseTests(unittest.TestCase):
             finally:
                 connection.close()
 
-            self.assertEqual(migrate(path), ["0016", "0017", "0018", "0019"])
+            self.assertEqual(migrate(path), ["0016", "0017", "0018", "0019", "0020"])
             connection = connect(path)
             try:
                 row = connection.execute(
