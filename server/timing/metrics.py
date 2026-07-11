@@ -21,6 +21,7 @@ GAP_RELATION_AHEAD = "AHEAD"
 GAP_RELATION_BEHIND = "BEHIND"
 GAP_RELATIONS = frozenset((GAP_RELATION_AHEAD, GAP_RELATION_BEHIND))
 GAP_WINDOWS_S = (30, 60, 180)
+GAP_LAP_WINDOWS = (3, 5)
 
 GAP_DIRECTION_CLOSING = "CLOSING"
 GAP_DIRECTION_LOSING_GROUND = "LOSING_GROUND"
@@ -307,6 +308,21 @@ class GapTrend:
     direction: str
 
 
+@dataclass(frozen=True)
+class GapLapTrend:
+    """Average source interval movement across an exact completed-lap window."""
+
+    relation: str
+    window_laps: int
+    started_at_us: int
+    ended_at_us: int
+    started_gap_ms: int
+    ended_gap_ms: int
+    gap_change_ms: int
+    closure_ms_per_lap: float
+    direction: str
+
+
 def _gap_direction(relation: str, gap_change_ms: int) -> str:
     if gap_change_ms == 0:
         return GAP_DIRECTION_STABLE
@@ -398,6 +414,71 @@ def calculate_gap_trends(
     """Calculate the standard 30/60/180-second trend set in a stable order."""
 
     return {window_s: calculate_gap_trend(samples, relation=relation, window_s=window_s) for window_s in windows_s}
+
+
+def calculate_gap_lap_trend(
+    samples: Sequence[GapSample], *, relation: str, window_laps: int
+) -> GapLapTrend | None:
+    """Calculate interval movement over exactly ``window_laps`` completed laps.
+
+    Only the current contiguous eligible suffix is considered. This makes a
+    target change, pit/non-racing state, flag phase, feed gap, or lap mismatch
+    a hard reset instead of leaking an old trend into the current battle.
+    """
+
+    if relation not in GAP_RELATIONS or not _is_int(window_laps, minimum=1):
+        return None
+    ordered = _ordered_gap_samples(samples)
+    if len(ordered) < 2 or not is_eligible_gap_sample(ordered[-1]):
+        return None
+    latest = ordered[-1]
+    if not _is_int(latest.our_lap_number, minimum=window_laps):
+        return None
+    latest_target = latest.target_participant_id
+    suffix_start = len(ordered) - 1
+    while (
+        suffix_start > 0
+        and is_eligible_gap_sample(ordered[suffix_start - 1])
+        and ordered[suffix_start - 1].target_participant_id == latest_target
+    ):
+        suffix_start -= 1
+    target_lap = latest.our_lap_number - window_laps
+    candidates = [
+        sample
+        for sample in ordered[suffix_start:-1]
+        if sample.our_lap_number == target_lap
+    ]
+    if not candidates:
+        return None
+    first = candidates[-1]
+    assert first.observed_at_us is not None and latest.observed_at_us is not None
+    assert first.gap_ms is not None and latest.gap_ms is not None
+    if latest.observed_at_us <= first.observed_at_us:
+        return None
+    gap_change = latest.gap_ms - first.gap_ms
+    closure = first.gap_ms - latest.gap_ms if relation == GAP_RELATION_AHEAD else latest.gap_ms - first.gap_ms
+    return GapLapTrend(
+        relation=relation,
+        window_laps=window_laps,
+        started_at_us=first.observed_at_us,
+        ended_at_us=latest.observed_at_us,
+        started_gap_ms=first.gap_ms,
+        ended_gap_ms=latest.gap_ms,
+        gap_change_ms=gap_change,
+        closure_ms_per_lap=closure / window_laps,
+        direction=_gap_direction(relation, gap_change),
+    )
+
+
+def calculate_gap_lap_trends(
+    samples: Sequence[GapSample], *, relation: str, windows_laps: Sequence[int] = GAP_LAP_WINDOWS
+) -> dict[int, GapLapTrend | None]:
+    """Return exact rolling lap-window trends in a stable order."""
+
+    return {
+        window_laps: calculate_gap_lap_trend(samples, relation=relation, window_laps=window_laps)
+        for window_laps in windows_laps
+    }
 
 
 @dataclass(frozen=True)

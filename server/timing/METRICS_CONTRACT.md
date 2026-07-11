@@ -640,6 +640,14 @@ not engineer inputs.
           "display": {"sign": "closure_behind_ms_per_lap", "dimension": "window"}
         },
         {
+          "key": "battle_lap_trend",
+          "unit": "record(window_laps,ms_per_lap,label,catch_laps)",
+          "formula": "For each current class neighbour, use the current gap minus the gap at exactly N completed Balchug laps earlier. Prefer N=5 and fall back to N=3. AHEAD shrinking is dogonyaem; BEHIND shrinking is nas_dogonyayut. catch_laps is current same-lap gap divided by the directional per-lap closure rate.",
+          "window": "5 completed laps, fallback 3; bounded 30-minute indexed evidence tail",
+          "null_when": ["fewer than 3 complete laps", "target changed", "pit/non-racing state", "flag is not GREEN", "feed gap", "participants are on different laps"],
+          "display": {"surface": "overview_battle_rows", "sign": "relation_specific", "dimension": "ahead|behind"}
+        },
+        {
           "key": "catch_range",
           "unit": "record(min_laps,max_laps,min_s,max_s,direction)",
           "formula": "For ahead use every positive valid closure_ahead estimate; for behind use abs(negative valid closure_behind). Divide current interval by each directional rate, then take min/max. Convert each bound with ours Pace5.",

@@ -410,7 +410,7 @@
       positionClass: 2, positionOverall: 3, lastLapMs: 106742, bestLapMs: 105911,
       pace3Ms: 106480, pace5Ms: 106620, pace10Ms: 106910, tyreAge: 12, pitsCompleted: 1,
       stateKind: "ON_TRACK", observedLaps: 37, lapCountExact: true,
-      gapCoordinate: { status: "EXACT", observedAtUs: 1783771500000000, gapToLeaderLaps: 1, gapToLeaderResidualMs: 8365 },
+      gapCoordinate: { status: "EXACT", observedAtUs: 1783771500000000, gapToLeaderLaps: 0, gapToLeaderResidualMs: 8420 },
       stintNumber: 2, stintElapsedS: 1288,
       stintTrend: 42,
       stintSummary: [
@@ -422,7 +422,7 @@
     var participants = [
       { id: "demo-9", startNumber: "9", teamName: "Про Моторспорт", driverName: "Мухин Игорь", carName: "Norma", className: "CN PRO", classKey: "cn pro", active: true, isOurs: false, positionClass: 1, positionOverall: 1, lastLapMs: 106105, bestLapMs: 105260, pace3Ms: 106310, pace5Ms: 106460, pace10Ms: 106720, tyreAge: 8, pitsCompleted: 2, stateKind: "ON_TRACK", observedLaps: 38, lapCountExact: true, gapCoordinate: { status: "EXACT", observedAtUs: 1783771500000000, gapToLeaderLaps: 0, gapToLeaderResidualMs: 0 }, stintNumber: 3, stintElapsedS: 866, stintSummary: [{ stint_number: 1, completed_laps: 14 }, { stint_number: 2, completed_laps: 16 }, { stint_number: 3, completed_laps: 8 }], pitHistory: [{ stop_number: 1, pit_in_at_us: 1783768200000000, pit_out_at_us: 1783768385010000, pit_in_lap: 14, pit_out_lap: 15, pit_lane_duration_ms: 185010 }, { stop_number: 2, pit_in_at_us: 1783770600000000, pit_out_at_us: 1783770783200000, pit_in_lap: 30, pit_out_lap: 31, pit_lane_duration_ms: 183200 }] },
       ours,
-      { id: "demo-29", startNumber: "29", teamName: "TEAMGARIS 29", driverName: "Сидорук Станислав", carName: "LIGIER JS P325", className: "CN PRO", classKey: "cn pro", active: true, isOurs: false, positionClass: 3, positionOverall: 4, lastLapMs: 107149, bestLapMs: 106887, pace3Ms: 106940, pace5Ms: 107080, pace10Ms: 107220, tyreAge: 16, pitsCompleted: 1, stateKind: "ON_TRACK", observedLaps: 37, lapCountExact: true, gapCoordinate: { status: "EXACT", observedAtUs: 1783771500000000, gapToLeaderLaps: 1, gapToLeaderResidualMs: 13497 }, stintNumber: 2, stintElapsedS: 1754, stintSummary: [{ stint_number: 1, completed_laps: 21 }, { stint_number: 2, completed_laps: 16 }], pitHistory: [{ stop_number: 1, pit_in_at_us: 1783769350000000, pit_out_at_us: 1783769533240000, pit_in_lap: 21, pit_out_lap: 22, pit_lane_duration_ms: 183240 }] },
+      { id: "demo-29", startNumber: "29", teamName: "TEAMGARIS 29", driverName: "Сидорук Станислав", carName: "LIGIER JS P325", className: "CN PRO", classKey: "cn pro", active: true, isOurs: false, positionClass: 3, positionOverall: 4, lastLapMs: 107149, bestLapMs: 106887, pace3Ms: 106940, pace5Ms: 107080, pace10Ms: 107220, tyreAge: 16, pitsCompleted: 1, stateKind: "ON_TRACK", observedLaps: 37, lapCountExact: true, gapCoordinate: { status: "EXACT", observedAtUs: 1783771500000000, gapToLeaderLaps: 0, gapToLeaderResidualMs: 13530 }, stintNumber: 2, stintElapsedS: 1754, stintSummary: [{ stint_number: 1, completed_laps: 21 }, { stint_number: 2, completed_laps: 16 }], pitHistory: [{ stop_number: 1, pit_in_at_us: 1783769350000000, pit_out_at_us: 1783769533240000, pit_in_lap: 21, pit_out_lap: 22, pit_lane_duration_ms: 183240 }] },
       { id: "demo-67", startNumber: "67", teamName: "Quasar Motorsport", driverName: "Громов Сергей", carName: "Ligier LMP3", className: "CN PRO", classKey: "cn pro", active: true, isOurs: false, positionClass: 4, positionOverall: 6, lastLapMs: 108221, bestLapMs: 107460, pace3Ms: 108050, pace5Ms: 108130, pace10Ms: 108340, tyreAge: 5, pitsCompleted: 2, stateKind: "ON_TRACK", observedLaps: 36, stintNumber: 3, stintElapsedS: 540, stintSummary: [{ stint_number: 1, completed_laps: 12 }, { stint_number: 2, completed_laps: 19 }, { stint_number: 3, completed_laps: 5 }], pitHistory: [{ stop_number: 1, pit_in_at_us: 1783767800000000, pit_out_at_us: 1783767984100000, pit_in_lap: 12, pit_out_lap: 13, pit_lane_duration_ms: 184100 }, { stop_number: 2, pit_in_at_us: 1783771080000000, pit_out_at_us: 1783771267550000, pit_in_lap: 31, pit_out_lap: 32, pit_lane_duration_ms: 187550 }] }
     ];
     var history = buildDemoHistory(participants, state.longDemo ? 720 : 25);
@@ -435,6 +435,10 @@
         gap_to_ahead_ms: 8420, gap_to_behind_ms: 5110,
         closure_ahead: { "60": { slope_ms_per_lap: -310 } },
         closure_behind: { "60": { slope_ms_per_lap: -120 } },
+        battle_lap_trend: {
+          ahead: { window_laps: 5, closure_ms_per_lap: 310, direction: "CLOSING", label: "догоняем", catch_laps: 27.16 },
+          behind: { window_laps: 5, closure_ms_per_lap: -120, direction: "BEING_CAUGHT", label: "нас догоняют", catch_laps: 42.58 }
+        },
         pace_delta_to_reference_ms: { class_ahead: 160, class_behind: -460 },
         pits_completed: 1, pits_required: 4, pits_remaining: 3,
         expected_remaining_laps_range: { minimum: 75, maximum: 78 },
@@ -737,8 +741,8 @@
     var alerts = (metric.alerts || []).slice(-3).reverse();
     element.innerHTML =
       '<div class="panel-section"><div class="section-heading"><h3>Борьба на трассе</h3><span>наш класс</span></div>' +
-        battleMarkup("До соперника впереди", view.ahead, metric.gap_to_ahead_ms, metric.pace_delta_to_reference_ms && metric.pace_delta_to_reference_ms.class_ahead, mixedGap(ours, view.ahead)) +
-        battleMarkup("До соперника сзади", view.behind, metric.gap_to_behind_ms, metric.pace_delta_to_reference_ms && metric.pace_delta_to_reference_ms.class_behind, mixedGap(view.behind, ours)) +
+        battleMarkup("До соперника впереди", view.ahead, metric.gap_to_ahead_ms, mixedGap(ours, view.ahead), metric.battle_lap_trend && metric.battle_lap_trend.ahead, "ahead") +
+        battleMarkup("До соперника сзади", view.behind, metric.gap_to_behind_ms, mixedGap(view.behind, ours), metric.battle_lap_trend && metric.battle_lap_trend.behind, "behind") +
       '</div>' +
       '<div class="panel-section"><div class="section-heading"><h3>Темп и стинт</h3><span>обновление 1 с</span></div><div class="metric-grid">' +
         metricCell("Последний круг", formatLap(ours.lastLapMs)) +
@@ -752,11 +756,6 @@
         metricCell("Время стинта", formatDuration(ours.stintElapsedS)) +
         metricCell("Тренд", isNumber(ours.stintTrend) ? (ours.stintTrend > 0 ? "+" : "") + ours.stintTrend.toFixed(0) + " мс/круг" : "—") +
       '</div></div>' +
-      '<div class="panel-section"><div class="section-heading"><h3>Обязательные питы</h3><span>шины меняются на каждом пите</span></div><div class="metric-grid">' +
-        metricCell("Выполнено", isNumber(ours.pitsCompleted) ? String(ours.pitsCompleted) : "—") +
-        metricCell("Требуется", isNumber(view.requiredPits) ? String(view.requiredPits) : "—") +
-        metricCell("Осталось", isNumber(view.requiredPits) && isNumber(ours.pitsCompleted) ? String(Math.max(0, view.requiredPits - ours.pitsCompleted)) : "—") +
-      '</div></div>' +
       '<div class="panel-section"><div class="section-heading"><h3>Последние сигналы</h3><span>' + alerts.length + '</span></div>' +
         (alerts.length ? alerts.map(function (alert) {
           return '<div class="event-row"><span class="event-time">' + html(formatClockAt(alert.at_us)) + '</span><i class="event-mark" data-kind="ours"></i><span>' + html(alertLabel(alert)) + '</span></div>';
@@ -764,12 +763,40 @@
       '</div>';
   }
 
-  function battleMarkup(label, participant, gapMs, paceDeltaMs, mixedValue) {
-    var context = participant ? participantLabel(participant) : "Нет подтверждённого соседа";
-    if (isNumber(paceDeltaMs)) {
-      context += " · " + (paceDeltaMs > 0 ? "мы медленнее на " : "мы быстрее на ") + Math.abs(paceDeltaMs / 1000).toFixed(3) + " с";
+  function battleForecastLaps(value) {
+    if (!isNumber(value) || value <= 0) return null;
+    return value < 10
+      ? value.toFixed(1).replace(".", ",") + " круга"
+      : formatLaps(Math.round(value));
+  }
+
+  function battleTrendMarkup(trend, relation) {
+    if (!trend || !isNumber(trend.closure_ms_per_lap) || !isNumber(trend.window_laps)) {
+      return '<div class="battle-trend" data-tone="neutral"><b>Динамика недоступна</b><span>нет непрерывного окна 3 кругов</span></div>';
     }
-    return '<div class="battle-row"><div><span class="metric-label">' + html(label) + '</span><div class="battle-name">' + html(context) + '</div></div><b class="battle-number">' + html(formatMixedGap(mixedValue, gapMs)) + '</b></div>';
+    var favorable = trend.direction === "CLOSING" || trend.direction === "PULLING_AWAY";
+    var unfavorable = trend.direction === "LOSING_GROUND" || trend.direction === "BEING_CAUGHT";
+    var directionLabels = {
+      CLOSING: "Догоняем",
+      LOSING_GROUND: "Отстаём",
+      PULLING_AWAY: "Отрываемся",
+      BEING_CAUGHT: "Нас догоняют",
+      STABLE: "Интервал стабилен"
+    };
+    var label = directionLabels[trend.direction] || String(trend.label || "Стабильно");
+    var forecast = battleForecastLaps(trend.catch_laps);
+    var forecastText = forecast
+      ? (relation === "ahead" ? "догоним примерно через " : "нас догонят примерно через ") + forecast
+      : "контакт не прогнозируется";
+    return '<div class="battle-trend" data-tone="' + (favorable ? "good" : unfavorable ? "bad" : "neutral") + '"><b>' +
+      html(label + " на " + Math.abs(trend.closure_ms_per_lap / 1000).toFixed(3) + " с/круг") + '</b><span>' +
+      html("окно " + trend.window_laps + " кругов · " + forecastText) + '</span></div>';
+  }
+
+  function battleMarkup(label, participant, gapMs, mixedValue, trend, relation) {
+    var context = participant ? participantLabel(participant) : "Нет подтверждённого соседа";
+    return '<div class="battle-row"><div><span class="metric-label">' + html(label) + '</span><div class="battle-name">' + html(context) + '</div>' +
+      (participant ? battleTrendMarkup(trend, relation) : "") + '</div><b class="battle-number">' + html(formatMixedGap(mixedValue, gapMs)) + '</b></div>';
   }
 
   function metricCell(label, value) {

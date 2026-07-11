@@ -41,6 +41,8 @@ from .stream_events import StreamEventCandidate
 
 STREAM_SCHEMA_VERSION = "timing-live.v1"
 _INTERVAL_FACT_BOUNDARY_PREFIX = "interval_fact:"
+METRIC_HISTORY_LOOKBACK_US = 30 * 60 * 1_000_000
+"""Bounded evidence for five-lap battle and ten-minute track trends."""
 
 
 class MetricRunnerError(RuntimeError):
@@ -107,14 +109,15 @@ class TimingMetricRunner:
         )
         if replay_active:
             heat = replace(heat, session=replace(heat.session, lifecycle="active"))
-        # 180 s is the longest tactical closure window. Keep a small extra
-        # cadence margin so a sample immediately before the cutoff is present.
+        # Five completed laps can span much longer than the old 180-second
+        # closure window. Keep a bounded indexed tail that also admits the
+        # ten-minute track-evolution baseline without scanning a full race.
         history = load_metric_history(
             connection,
             source_heat_id=source_heat_id,
             scope_kind="session",
             scope_key=heat.session.id,
-            since_at_us=max(0, observed_at_us - 185_000_000 - METRIC_SAMPLE_INTERVAL_US),
+            since_at_us=max(0, observed_at_us - METRIC_HISTORY_LOOKBACK_US - METRIC_SAMPLE_INTERVAL_US),
             metric_version=METRIC_ENGINE_VERSION,
         )
         previous = self._previous.get(source_heat_id)
