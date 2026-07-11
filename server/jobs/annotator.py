@@ -254,11 +254,14 @@ def annotate(date, start_hms, duration_sec, video_key, video_path=None, parts=No
             llm = None
         if llm:
             st = str(llm.get("session_type", "")).strip()
-            if st in SESSION_TYPES and st != stype:
+            # A long capture on the scheduled race day is an authoritative
+            # race classification. Vision can enrich its summary, but a single
+            # sampled frame must not break archive/telemetry matching.
+            if st in SESSION_TYPES and st != stype and stype != "Гонка":
                 ann["session_info"]["session_type"] = st
                 ann["ui_metadata"]["display_title"] = build_title(ev, date, start_hms, st)
             dt = str(llm.get("display_title", "")).strip()
-            if dt and len(dt) <= 120:
+            if dt and len(dt) <= 120 and stype != "Гонка":
                 ann["ui_metadata"]["display_title"] = dt
             summary = str(llm.get("summary", "")).strip()
             if summary:

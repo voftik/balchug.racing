@@ -35,43 +35,51 @@ def transcode(video_key):
     src = s3.generate_presigned_url("get_object",
         Params={"Bucket": C.S3_BUCKET, "Key": video_key}, ExpiresIn=6 * 3600)
     out = tempfile.mkdtemp(prefix="balchug_hls_")
-    for v in ("v0", "v1"):
-        os.makedirs(os.path.join(out, v), exist_ok=True)
-    cmd = [
-        "nice", "-n", "19", "ffmpeg", "-y", "-loglevel", "error",
-        "-threads", "2", "-i", src,
-        "-filter_complex", VF,
-        "-map", "[v1o]", "-map", "[v2o]",
-        "-map", "0:a?", "-map", "0:a?",
-        "-c:v", "libx264", "-preset", "veryfast", "-g", "48", "-keyint_min", "48", "-sc_threshold", "0",
-        "-b:v:0", "3000k", "-maxrate:v:0", "3200k", "-bufsize:v:0", "6000k",
-        "-b:v:1", "1200k", "-maxrate:v:1", "1400k", "-bufsize:v:1", "2800k",
-        "-c:a", "aac", "-b:a", "128k", "-ac", "2",
-        "-f", "hls", "-hls_time", "4", "-hls_playlist_type", "vod",
-        "-hls_flags", "independent_segments",
-        "-hls_segment_filename", os.path.join(out, "v%v", "seg_%03d.ts"),
-        "-master_pl_name", "master.m3u8",
-        "-var_stream_map", "v:0,a:0 v:1,a:1",
-        os.path.join(out, "v%v", "index.m3u8"),
-    ]
-    subprocess.run(cmd, check=True)
+    try:
+        for v in ("v0", "v1"):
+            os.makedirs(os.path.join(out, v), exist_ok=True)
+        cmd = [
+            "nice", "-n", "19", "ffmpeg", "-y", "-loglevel", "error",
+            # LiveU reconnects can leave a damaged final packet in a copied FLV.
+            # VOD must keep the valid media, rather than fail the entire archive job.
+            "-fflags", "+genpts+discardcorrupt", "-err_detect", "ignore_err",
+            "-threads", "2", "-i", src,
+            "-filter_complex", VF,
+            "-map", "[v1o]", "-map", "[v2o]",
+            "-map", "0:a?", "-map", "0:a?",
+            "-c:v", "libx264", "-preset", "veryfast", "-g", "48", "-keyint_min", "48", "-sc_threshold", "0",
+            "-b:v:0", "3000k", "-maxrate:v:0", "3200k", "-bufsize:v:0", "6000k",
+            "-b:v:1", "1200k", "-maxrate:v:1", "1400k", "-bufsize:v:1", "2800k",
+            "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+            "-f", "hls", "-hls_time", "4", "-hls_playlist_type", "vod",
+            "-hls_flags", "independent_segments",
+            "-hls_segment_filename", os.path.join(out, "v%v", "seg_%03d.ts"),
+            "-master_pl_name", "master.m3u8",
+            "-var_stream_map", "v:0,a:0 v:1,a:1",
+            os.path.join(out, "v%v", "index.m3u8"),
+        ]
+        subprocess.run(cmd, check=True)
 
-    prefix = f"hls_vod/{item_id}"
-    for root, _, files in os.walk(out):
-        for fn in files:
-            full = os.path.join(root, fn)
-            rel = os.path.relpath(full, out)
-            ct = CT.get(os.path.splitext(fn)[1], "application/octet-stream")
-            # Приватная загрузка (как и весь бакет); отдаём через /api/hls (same-origin).
-            s3.upload_file(full, C.S3_BUCKET, f"{prefix}/{rel}",
-                           ExtraArgs={"ContentType": ct})
-    shutil.rmtree(out, ignore_errors=True)
+        prefix = f"hls_vod/{item_id}"
+        for root, _, files in os.walk(out):
+            for fn in files:
+                full = os.path.join(root, fn)
+                rel = os.path.relpath(full, out)
+                ct = CT.get(os.path.splitext(fn)[1], "application/octet-stream")
+                # Приватная загрузка (как и весь бакет); отдаём через /api/hls (same-origin).
+                s3.upload_file(full, C.S3_BUCKET, f"{prefix}/{rel}",
+                               ExtraArgs={"ContentType": ct})
 
-    hls_key = f"{prefix}/master.m3u8"
-    conn = C.db()
-    conn.execute("UPDATE items SET hls_key=? WHERE id=?", (hls_key, item_id))
-    conn.commit(); conn.close()
-    return f"ok → {hls_key}"
+        hls_key = f"{prefix}/master.m3u8"
+        conn = C.db()
+        try:
+            conn.execute("UPDATE items SET hls_key=? WHERE id=?", (hls_key, item_id))
+            conn.commit()
+        finally:
+            conn.close()
+        return f"ok → {hls_key}"
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
 
 
 def live_active():
@@ -101,7 +109,10 @@ def main():
             print("  ", transcode(key), flush=True)
         except Exception as e:
             print("  ERR:", e, file=sys.stderr, flush=True)
-        finally:
+            # Keep the durable queue item. A transient S3/ffmpeg failure must
+            # not silently remove the only path to archive HLS playback.
+            time.sleep(60)
+        else:
             try: os.remove(job)
             except Exception: pass
         time.sleep(2)
