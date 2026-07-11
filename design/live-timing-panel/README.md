@@ -1,9 +1,10 @@
-# Live timing engineer panel
+# Live timing engineer dashboard
 
-This document is the implementation contract for GitHub issues #25, #18 and
-#19. The prototype is the production telemetry page itself with a disposable
-client-side fixture enabled by `?demo=1` or the 24-hour upper-bound fixture by
-`?demo=24h`. Demo values never reach the timing API or timing database.
+This document is the implementation contract for GitHub issues #25, #54, #18
+and #19. The prototype is the production telemetry page itself with a
+disposable client-side fixture enabled by `?demo=1` or the 24-hour upper-bound
+fixture by `?demo=24h`. Demo values never reach the timing API or timing
+database.
 
 ## Operator contract
 
@@ -12,47 +13,51 @@ client-side fixture enabled by `?demo=1` or the 24-hour upper-bound fixture by
   pit stops (2 through 8).
 - Authentication is a separate access step. It is not a tactical input and the
   token is retained only in `sessionStorage` until the tab closes.
+- The lifecycle controls and tactical dashboard are rendered only when the
+  existing `balchug_admin` ("Я Борис") mode is active. Public page loads do not
+  initialize timing API or SSE traffic.
 - Team, car, driver, class, laps, tyres, flags, gaps, sectors and pit facts are
   always derived from the normalized source feed.
-- The panel never reads or changes the third-party iframe DOM. Opening,
-  closing, pinning and tab changes leave the iframe element and connection in
-  place.
+- The dashboard never reads or changes the third-party iframe DOM. Tab and
+  comparison changes leave the iframe element and connection in place.
 
 ## Annotated wireframes
 
-### Desktop overlay and docked layout
+### Desktop inline layout
 
 ```text
-session mode bar: Practice | Qualifying | Race        lifecycle / time / Stop
 +-------------------------------------------------------------------------+
-|56 px rail| 440-520 px overlay panel       | interactive timing iframe   |
-|flag      | flag strip                     |                              |
-|PIC       | session / freshness / identity |                              |
-|tyres     | PIC | ahead | behind           |                              |
-|pits      | Pace5 | tyre age | pits         |                              |
-|open      | tabs + comparison + view       |                              |
+|                    interactive timing iframe                           |
++-------------------------------------------------------------------------+
+| session: Practice | Qualifying | Race       lifecycle / time / Stop     |
+| flag strip                                                               |
+| session / freshness / identity                                           |
+| PIC | ahead | behind | last lap | tyre age | pits                        |
+| tabs                                  comparison selector                 |
+| full-width tactical view / chart / event stream                          |
 +-------------------------------------------------------------------------+
 ```
 
-At 1440 px and wider, Pin changes the same workspace into two stable tracks:
-panel on the left and iframe on the right. It does not recreate either node.
+The dashboard is the next document-flow block after the live timing iframe.
+There is no rail, overlay, open/close state, pin action or nested work-surface
+scroll. It uses the available page width and does not recreate the iframe.
 
 ![Desktop 1440 x 900](screenshots/desktop-1440x900.png)
 
 ![Wide desktop 2048 x 1152](screenshots/wide-2048x1152.png)
 
-### Tablet overlay
+### Tablet
 
-At 768-1439 px the panel overlays the left side of the iframe. There is no
-backdrop, so the remaining timing table stays visible. Pin is unavailable.
+At tablet width, lifecycle controls wrap into two rows, decision metrics use a
+three-column grid and the dashboard remains below the iframe.
 
 ![Tablet 768 x 1024](screenshots/tablet-768x1024.png)
 
-### Mobile full screen
+### Mobile
 
-Below 768 px the open panel is a full-viewport work surface with safe-area
-padding and internal scrolling. The page scroll is locked while open. Close
-restores the prior page/iframe position and iframe keyboard eligibility.
+Below 768 px the dashboard follows the iframe in normal page scroll. Decision
+and metric grids use two columns; charts retain a stable 280 px height. No
+fixed panel or body scroll lock is used.
 
 ![Mobile 390 x 844](screenshots/mobile-390x844.png)
 
@@ -62,12 +67,13 @@ The Race dialog contains only the two permitted race parameters:
 
 ## Information hierarchy
 
-1. Flag and source freshness are always visible.
-2. The decision strip exposes PIC/OA, confirmed gaps, Pace5, tyre age and pit
+1. Flag and source freshness lead the admin dashboard immediately below the
+   lifecycle bar.
+2. The decision strip exposes PIC/OA, confirmed gaps, source LAST, tyre age and pit
    obligation without scrolling.
 3. Tabs separate repeated decisions: Overview, Pace, Intervals, Pits, Class
    and Events.
-4. Overview uses full-width bands and one bordered metric grid. It does not
+4. Overview uses full-width bands and bordered metric grids. It does not
    nest cards.
 5. Class view prioritizes `PIC | Team/Car | Pace5 | Tyres | Pits | Compare`.
    `Last` is intentionally hidden in the compact panel because it duplicates a
@@ -115,16 +121,16 @@ markers without changing these layout or selection contracts.
 
 ## Responsive matrix
 
-| Viewport | Closed | Open | Pin | Decision strip | Class priorities |
-| --- | --- | --- | --- | --- | --- |
-| 390 x 844 | 52 px rail | fixed full viewport | no | 3 x 2 | PIC, team, Pace5, tyres, pits |
-| 768 x 1024 | 56 px rail | 440 px overlay | no | 3 x 2 | same |
-| 1440 x 900 | 56 px rail | 440-520 px overlay | yes | 3 x 2 | same |
-| 2048 x 1152 | 56 px rail | 520 px overlay/docked | yes | 3 x 2 | same |
+| Viewport | Public mode | Boris mode | Decision strip | Metric grid |
+| --- | --- | --- | --- | --- |
+| 390 x 844 | iframe only | inline below iframe | 2 x 3 | 2 columns |
+| 768 x 1024 | iframe only | inline below iframe | 3 x 2 | 3 columns |
+| 1440 x 900 | iframe only | full page width | 6 x 1 | 6 columns |
+| 2048 x 1152 | iframe only | full page width | 6 x 1 | 6 columns |
 
 ## Component states
 
-| State | Header/rail | Main view | Actions |
+| State | Header | Main view | Actions |
 | --- | --- | --- | --- |
 | mode not started | OFFLINE, empty values | explicit start prompt | mode buttons enabled |
 | connecting | connecting badge, frozen values | prior snapshot or loader | duplicate start disabled |
@@ -148,7 +154,7 @@ markers without changing these layout or selection contracts.
 | flag and flag clock | `measured.track_flag.*`, session metric `flag_phase_elapsed_s` |
 | team/driver/car/class/POS/PIC/state | `measured.participants[]` |
 | our identity | `session.our_participant_id`, participant `is_ours` |
-| Last/Best/Pace3/5/10 | participant metric values |
+| Last/Best/Pace3/5/10 | participant metric values; decision strip uses source LAST |
 | tyre age/stint | `tyre_age_laps`, `stint_*` |
 | completed/required pits | participant `pits_completed`, `session.required_pits` |
 | ahead/behind | session metric IDs and `gap_to_ahead_ms/gap_to_behind_ms` |
@@ -180,10 +186,10 @@ theme:
 
 - tabs implement `tablist/tab/tabpanel`, arrow keys, Home and End;
 - all commands have visible text or an aria-label and a portal tooltip;
-- Escape closes comparison first, then a non-pinned overlay;
-- mobile open traps Tab within the panel and removes iframe from tab order;
+- Escape closes the comparison selector;
+- dashboard controls remain in normal document tab order after the iframe;
 - touch controls are at least 44 px on mobile;
 - status meaning is not color-only;
-- `prefers-reduced-motion` removes panel transitions;
+- `prefers-reduced-motion` removes incidental transitions;
 - tooltip positioning uses viewport coordinates, flips at edges, and is
   suppressed after pointer activation until the pointer leaves.
