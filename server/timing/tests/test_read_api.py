@@ -14,6 +14,7 @@ from timing.read_api import (
     ReadValidationError,
     ScopeNotFoundError,
     TimingReadModel,
+    _archive_comparison_lap_rows,
     _archive_result_last_rows,
     _archive_raw_last_or_lap_rows,
     _bounded_archive_lap_rows,
@@ -736,10 +737,27 @@ class TimingReadModelTests(unittest.TestCase):
             """
             UPDATE laps
             SET duration_source_cell_observation_id = ?, duration_source_message_id = 1,
-                duration_source_key = 'raw:2', duration_source_kind = 'RESULT_GRID_LAST'
+                duration_source_key = 'raw:2', duration_source_kind = 'RESULT_GRID_LAST',
+                sectors_json = ?, sectors_source_cell_observation_ids_json = ?
             WHERE id = 'lap-12'
             """,
-            (linked_cell,),
+            (
+                linked_cell,
+                json.dumps(
+                    {
+                        "sector_1": "34800000",
+                        "sector_2": None,
+                        "sector_3": "36500000",
+                    }
+                ),
+                json.dumps(
+                    {
+                        "sector_1": 101,
+                        "sector_2": 102,
+                        "sector_3": 103,
+                    }
+                ),
+            ),
         )
         payload = {
             "schema_version": "timing-archive.v1",
@@ -777,7 +795,68 @@ class TimingReadModelTests(unittest.TestCase):
         self.assertEqual(raw[2]["completed_at_us"], None)
         self.assertEqual(raw[2]["source"]["cell_observation_id"], raw_cell)
         self.assertEqual(raw[0]["source"]["cell_observation_id"], baseline_cell)
+        self.assertIsNone(raw[0]["sectors"])
+        self.assertEqual(
+            raw[1]["sectors"],
+            {
+                "sector_1": {"duration_ms": 34_800, "source_cell_observation_id": 101},
+                "sector_2": None,
+                "sector_3": {"duration_ms": 36_500, "source_cell_observation_id": 103},
+            },
+        )
+        self.assertIsNone(raw[2]["sectors"])
+        self.assertIn("individual source cell", comparison["semantics"]["lap_series_sectors"])
         self.assertIn("not an invented finish crossing", comparison["semantics"]["lap_series_ours_raw"])
+
+    def test_archive_fallback_lap_sectors_require_result_grid_last_provenance(self):
+        [source_cell] = self._add_result_last_cells((("r_c", "107200000", 12_000_000),))
+        sectors_json = json.dumps(
+            {
+                "sector_1": "34800000",
+                "sector_2": "35900000",
+                "sector_3": "36500000",
+            }
+        )
+        source_ids_json = json.dumps(
+            {
+                "sector_1": 101,
+                "sector_2": 102,
+                "sector_3": 103,
+            }
+        )
+        self.connection.execute(
+            """
+            UPDATE laps
+            SET sectors_json = ?, sectors_source_cell_observation_ids_json = ?,
+                duration_source_cell_observation_id = ?, duration_source_kind = 'RESULT_GRID_LAST'
+            WHERE id = 'lap-12'
+            """,
+            (sectors_json, source_ids_json, source_cell),
+        )
+        rows = _archive_comparison_lap_rows(
+            self.connection,
+            heat_id=self.heat_id,
+            participant_ids=["ours"],
+            first_at_us=10_000_000,
+            last_at_us=13_000_000,
+            include_unplaced=True,
+            clip_to_archive_range=False,
+        )["ours"]
+        proven = next(row for row in rows if row["lap_number"] == 12)
+        self.assertEqual(proven["sectors"]["sector_1"]["duration_ms"], 34_800)
+
+        self.connection.execute("UPDATE laps SET duration_source_kind = NULL WHERE id = 'lap-12'")
+        rows_without_last_provenance = _archive_comparison_lap_rows(
+            self.connection,
+            heat_id=self.heat_id,
+            participant_ids=["ours"],
+            first_at_us=10_000_000,
+            last_at_us=13_000_000,
+            include_unplaced=True,
+            clip_to_archive_range=False,
+        )["ours"]
+        unproven = next(row for row in rows_without_last_provenance if row["lap_number"] == 12)
+        self.assertIsNone(unproven["sectors"])
 
     def test_archive_raw_last_fails_closed_on_duplicate_last_columns(self):
         self.connection.execute("UPDATE analysis_sessions SET lifecycle = 'stopped' WHERE id = 'session-1'")

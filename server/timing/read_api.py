@@ -1922,6 +1922,8 @@ def _archive_comparison_lap_rows(
     rows = connection.execute(
         f"""
         SELECT f.participant_id,p.start_number,p.team_name,f.lap_number,f.completed_at_us,f.duration_ms,
+               f.sectors_json,f.sectors_source_cell_observation_ids_json,
+               f.duration_source_cell_observation_id,f.duration_source_kind,
                f.flag,f.is_in_lap,f.is_out_lap,f.crosses_pit,f.is_clean
         FROM laps f
         JOIN participants p ON p.id = f.participant_id
@@ -1979,6 +1981,14 @@ def _archive_comparison_lap_rows(
                 "lap_number": int(row["lap_number"]),
                 "completed_at_us": completed_at_us,
                 "duration_ms": row["duration_ms"],
+                "sectors": _archive_source_proven_sectors(
+                    sectors_json=row["sectors_json"],
+                    source_cell_observation_ids_json=row["sectors_source_cell_observation_ids_json"],
+                    is_linked_to_last=(
+                        row["duration_source_cell_observation_id"] is not None
+                        and row["duration_source_kind"] == "RESULT_GRID_LAST"
+                    ),
+                ),
                 "flag": row["flag"],
                 "is_in_lap": bool(row["is_in_lap"]),
                 "is_out_lap": bool(row["is_out_lap"]),
@@ -1997,6 +2007,50 @@ def _result_grid_duration_ms(value: Any) -> int | None:
     if source_us is None or not 1_000_000 <= source_us < OPEN_ENDED_TS_TIME:
         return None
     return source_us // 1_000
+
+
+_ARCHIVE_SECTOR_KEYS = ("sector_1", "sector_2", "sector_3")
+
+
+def _archive_source_proven_sectors(
+    *,
+    sectors_json: Any,
+    source_cell_observation_ids_json: Any,
+    is_linked_to_last: bool,
+) -> dict[str, dict[str, int] | None] | None:
+    """Publish only sector values tied to an exact persisted ``LAST`` cell.
+
+    ``laps.sectors_json`` is useful for historical inspection only once the
+    corresponding lap has an immutable result-grid ``LAST`` source link.  The
+    per-sector source-cell mapping is required as well: without it, a value
+    could be an old derived/legacy projection rather than an auditable timing
+    fact.  Missing or malformed individual values remain explicit ``null``;
+    this read path must never fill them from a neighboring lap or a current
+    participant-state field.
+    """
+
+    if not is_linked_to_last or sectors_json is None or source_cell_observation_ids_json is None:
+        return None
+    sectors = _json_value(sectors_json, context="linked lap sectors")
+    source_ids = _json_value(
+        source_cell_observation_ids_json,
+        context="linked lap sector source-cell observations",
+    )
+    if not isinstance(sectors, Mapping) or not isinstance(source_ids, Mapping):
+        return None
+
+    result: dict[str, dict[str, int] | None] = {}
+    for sector_key in _ARCHIVE_SECTOR_KEYS:
+        duration_ms = _result_grid_duration_ms(sectors.get(sector_key))
+        source_cell_observation_id = _archive_int(source_ids.get(sector_key))
+        if duration_ms is None or source_cell_observation_id is None or source_cell_observation_id <= 0:
+            result[sector_key] = None
+            continue
+        result[sector_key] = {
+            "duration_ms": duration_ms,
+            "source_cell_observation_id": source_cell_observation_id,
+        }
+    return result if any(value is not None for value in result.values()) else None
 
 
 def _archive_result_last_rows(
@@ -2031,7 +2085,9 @@ def _archive_result_last_rows(
                frame.id AS frame_id,
                participant.start_number,participant.team_name,
                lap.id AS linked_lap_id,lap.lap_number,lap.completed_at_us,
-               lap.flag,lap.is_in_lap,lap.is_out_lap,lap.crosses_pit,lap.is_clean
+               lap.flag,lap.is_in_lap,lap.is_out_lap,lap.crosses_pit,lap.is_clean,
+               lap.sectors_json,lap.sectors_source_cell_observation_ids_json,
+               lap.duration_source_kind
         FROM participant_result_cell_observations AS observation
         JOIN result_column_definitions AS definition
           ON definition.layout_version_id = observation.layout_version_id
@@ -2087,6 +2143,11 @@ def _archive_result_last_rows(
                 "completed_at_us": int(row["completed_at_us"]) if linked_lap and row["completed_at_us"] is not None else None,
                 "duration_ms": _result_grid_duration_ms(row["duration_raw"]),
                 "duration_raw": row["duration_raw"],
+                "sectors": _archive_source_proven_sectors(
+                    sectors_json=row["sectors_json"],
+                    source_cell_observation_ids_json=row["sectors_source_cell_observation_ids_json"],
+                    is_linked_to_last=linked_lap and row["duration_source_kind"] == "RESULT_GRID_LAST",
+                ),
                 "timeline_kind": timeline_kind,
                 "flag": row["flag"] if linked_lap else None,
                 "source_is_clean": bool(row["is_clean"]) if linked_lap else None,
@@ -2365,6 +2426,10 @@ def read_archive_comparison(
                         "unaggregated raw lap facts for the requested competitors; no raw lap is filtered, "
                         "averaged, or decimated"
                     ),
+                    "lap_series_sectors": (
+                        "sector durations appear only for an exact result-grid LAST cell linked to a persisted lap "
+                        "and to its individual source cell; missing sectors are null and never interpolated"
+                    ),
                     "missing_values": "null values are not interpolated",
                 },
             }
@@ -2522,6 +2587,10 @@ def read_archive_comparison(
                     "unaggregated result-grid LAST observations for BALCHUG Racing, ordered by source stream position "
                     "without averaging or decimation; board_observed_at_us is the table observation time, not an "
                     "invented finish crossing timestamp"
+                ),
+                "lap_series_sectors": (
+                    "sector durations appear only for an exact result-grid LAST cell linked to a persisted lap "
+                    "and to its individual source cell; missing sectors are null and never interpolated"
                 ),
                 "pit_stops": "confirmed pit in/out facts clipped only for timeline display; pit_lane_ms is populated only from an explicit Time Service L-PIT source",
                 "missing_values": "null values are not interpolated or converted to zero",

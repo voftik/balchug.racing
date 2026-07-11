@@ -122,9 +122,11 @@
     var focusReturn = trigger || null;
     if (modal.classList.contains("open")) {
       var currentCard = state.currentItem && state.cards[state.currentItem.id];
-      var cardTrigger = currentCard && currentCard.querySelector(".timing-card-link");
+      if (currentCard) {
+        currentCard.tabIndex = -1;
+        focusReturn = currentCard;
+      }
       closeModal();
-      if (cardTrigger) focusReturn = cardTrigger;
     }
     window.dispatchEvent(new CustomEvent("balchug:open-timing-archive", {
       detail: { selection: selected, trigger: focusReturn }
@@ -142,23 +144,6 @@
       chooseTimingEntry(entry, button);
     });
     return button;
-  }
-  function renderCardTimingLinks(item, card) {
-    var slot = card && card.querySelector("[data-timing-links]");
-    if (!slot) return;
-    slot.replaceChildren();
-    var entries = timingEntriesForItem(item);
-    if (!entries.length) {
-      slot.hidden = true;
-      return;
-    }
-    slot.hidden = false;
-    var label = document.createElement("span");
-    label.className = "timing-card-label";
-    label.textContent = "Телеметрия трассы";
-    label.title = "Совпали дата, трасса и тип. Временные шкалы записей независимы.";
-    slot.appendChild(label);
-    slot.appendChild(timingButton(entries[0], "timing-card-link", "Открыть"));
   }
   function renderModalTimingLinks(item) {
     var slot = $("timingRelation");
@@ -184,7 +169,6 @@
     slot.appendChild(links);
   }
   function refreshTimingLinks() {
-    Object.keys(state.cards).forEach(function (id) { renderCardTimingLinks(state.items[id], state.cards[id]); });
     if (state.currentItem) renderModalTimingLinks(state.currentItem);
   }
   function loadTimingEntries() {
@@ -272,14 +256,12 @@
       '<div class="play">▶</div></div>' +
       '<div class="body"><div class="ttl">' + esc(it.title) + '</div>' +
       '<div class="meta">' + metaBits.join("") + '</div>' +
-      '<div class="timing-card-relation" data-timing-links hidden></div>' +
       '<div class="admin-actions"><button class="edit">Редактировать</button><button class="del">Удалить</button></div>' +
       '</div>';
     el.addEventListener("click", function () { openItem(it.id); });
     el.querySelector(".edit").addEventListener("click", function (e) { e.stopPropagation(); openItem(it.id); });
     el.querySelector(".del").addEventListener("click", function (e) { e.stopPropagation(); delItem(it, el); });
     grid.appendChild(el);
-    if (state.timingLoaded) renderCardTimingLinks(it, el);
   }
 
   // ---- удаление записи (админ) ----

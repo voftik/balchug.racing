@@ -43,6 +43,16 @@
     lapLegendKey: $("timingLapLegendKey"),
     lapLegendTitle: $("timingLapLegendTitle"),
     lapLegendText: $("timingLapLegendText"),
+    sectorPanel: $("timingSectorPanel"),
+    sectorMode: $("timingSectorMode"),
+    sectorCompetitorWrap: $("timingSectorCompetitorWrap"),
+    sectorCompetitor: $("timingSectorCompetitor"),
+    sectorWindow: $("timingSectorWindow"),
+    sectorCells: [
+      { key: "sector_1", title: "Сектор 1", canvas: $("timingSector1Chart"), delta: $("timingSector1Delta"), tooltip: $("timingSector1Tooltip") },
+      { key: "sector_2", title: "Сектор 2", canvas: $("timingSector2Chart"), delta: $("timingSector2Delta"), tooltip: $("timingSector2Tooltip") },
+      { key: "sector_3", title: "Сектор 3", canvas: $("timingSector3Chart"), delta: $("timingSector3Delta"), tooltip: $("timingSector3Tooltip") }
+    ],
     events: $("timingEvents"),
     play: $("timingPlay"),
     stepBack: $("timingStepBack"),
@@ -101,6 +111,11 @@
     lapGeometry: null,
     lapLastPlayheadX: null,
     lapReadoutKey: "",
+    sectorMode: "self",
+    sectorCompetitorId: null,
+    sectorControlKey: "",
+    sectorGeometry: Object.create(null),
+    sectorHovered: null,
     visualsLastDrawMs: 0,
     chartRangeText: "",
     observedText: "",
@@ -123,6 +138,8 @@
   };
 
   var COMPETITOR_COLORS = ["#007B91", "#526276", "#D08000", "#7D55B8", "#16824F", "#A44469"];
+  var SECTOR_KEYS = ["sector_1", "sector_2", "sector_3"];
+  var SECTOR_WINDOW_OFFSETS = [-2, -1, 0, 1, 2];
 
   function asObject(value) { return value && typeof value === "object" ? value : {}; }
   function valueOrDash(value) { return value === null || value === undefined || value === "" ? "—" : String(value); }
@@ -725,6 +742,7 @@
     elements.benchmark.hidden = true;
     elements.pitPanel.hidden = true;
     elements.lapPanel.hidden = true;
+    if (elements.sectorPanel) elements.sectorPanel.hidden = true;
   }
 
   function applyComparison(response, selection) {
@@ -831,6 +849,11 @@
     state.lapGeometry = null;
     state.lapLastPlayheadX = null;
     state.lapReadoutKey = "";
+    state.sectorMode = "self";
+    state.sectorCompetitorId = null;
+    state.sectorControlKey = "";
+    state.sectorGeometry = Object.create(null);
+    state.sectorHovered = null;
     state.visualsLastDrawMs = 0;
     state.chartRangeText = "";
     state.observedText = "";
@@ -853,6 +876,7 @@
     elements.lapReadout.hidden = true;
     hideArchiveTooltip(elements.chartTooltip);
     hideArchiveTooltip(elements.pitTooltip);
+    hideSectorTooltips();
     renderComparisonLoading();
     controlsDisabled(true);
     setEmpty("Загрузка телеметрической сессии…");
@@ -1589,7 +1613,8 @@
         crossesPit: !!lap.crosses_pit,
         isInLap: !!lap.is_in_lap,
         isOutLap: !!lap.is_out_lap,
-        flag: lap.flag || null
+        flag: lap.flag || null,
+        sectors: asObject(lap.sectors)
       };
     }).filter(Boolean);
   }
@@ -1619,6 +1644,197 @@
         participant: participant,
         color: competitorColor(participant.participant_id),
         points: rawLapPoints(entry.laps, participant)
+      };
+    });
+  }
+
+  function sectorDuration(point, key) {
+    var sector = asObject(asObject(point).sectors)[key];
+    return numericValue(asObject(sector).duration_ms);
+  }
+
+  function sectorSourceCellId(point, key) {
+    var sector = asObject(asObject(point).sectors)[key];
+    return numericValue(asObject(sector).source_cell_observation_id);
+  }
+
+  function hasSourceProvenSector(point) {
+    return SECTOR_KEYS.some(function (key) { return sectorDuration(point, key) !== null; });
+  }
+
+  function sourceProvenSectorPoints(laps, participant) {
+    return rawLapPoints(laps, participant).filter(function (point) {
+      return point.timelineKind === "confirmed_lap" && hasSourceProvenSector(point);
+    }).sort(function (left, right) {
+      return left.atUs - right.atUs || String(left.id).localeCompare(String(right.id));
+    });
+  }
+
+  function sectorComparisonData() {
+    var all = state.comparisonCache.all;
+    if (all && all.comparison && all.comparison.available) return all;
+    return comparisonVisualData();
+  }
+
+  function sectorParticipant(data, participantId) {
+    return (Array.isArray(data && data.participants) ? data.participants : []).find(function (participant) {
+      return participant && participant.participant_id === participantId;
+    }) || null;
+  }
+
+  function sectorPointsForParticipant(data, participantId) {
+    if (!data || !participantId) return [];
+    var participant = sectorParticipant(data, participantId) || { participant_id: participantId, is_ours: false };
+    var lapSeries = asObject(data.lap_series);
+    var oursId = asObject(data.comparison).ours_participant_id;
+    if (participantId === oursId) {
+      return sourceProvenSectorPoints(lapSeries.ours_raw || lapSeries.ours, participant);
+    }
+    var entry = (Array.isArray(lapSeries.competitors) ? lapSeries.competitors : []).find(function (candidate) {
+      return candidate && candidate.participant_id === participantId;
+    });
+    return entry ? sourceProvenSectorPoints(entry.laps, participant) : [];
+  }
+
+  function sectorValueCount(points) {
+    return (points || []).reduce(function (count, point) {
+      return count + SECTOR_KEYS.filter(function (key) { return sectorDuration(point, key) !== null; }).length;
+    }, 0);
+  }
+
+  function sectorCompetitorCandidates(data) {
+    var oursId = asObject(data && data.comparison).ours_participant_id;
+    return (Array.isArray(data && data.participants) ? data.participants : []).filter(function (participant) {
+      return participant && participant.participant_id && participant.participant_id !== oursId;
+    }).map(function (participant) {
+      return {
+        participant: participant,
+        pointCount: sectorValueCount(sectorPointsForParticipant(data, participant.participant_id))
+      };
+    });
+  }
+
+  function preferredSectorCompetitor(candidates) {
+    if (!candidates.length) return null;
+    var comparisonId = state.comparisonSelection.indexOf("participant:") === 0 ?
+      state.comparisonSelection.slice("participant:".length) : null;
+    if (comparisonId && candidates.some(function (candidate) { return candidate.participant.participant_id === comparisonId; })) {
+      return comparisonId;
+    }
+    return candidates.slice().sort(function (left, right) {
+      if (right.pointCount !== left.pointCount) return right.pointCount - left.pointCount;
+      return comparisonOptionLabel(left.participant).localeCompare(comparisonOptionLabel(right.participant), "ru");
+    })[0].participant.participant_id;
+  }
+
+  function renderSectorControls(data) {
+    if (!elements.sectorPanel || !elements.sectorMode || !elements.sectorCompetitor || !elements.sectorCompetitorWrap) return false;
+    var candidates = sectorCompetitorCandidates(data);
+    var validIds = candidates.map(function (candidate) { return candidate.participant.participant_id; });
+    if (state.sectorMode !== "self" && state.sectorMode !== "competitor") state.sectorMode = "self";
+    if (state.sectorMode === "competitor" && !candidates.length) state.sectorMode = "self";
+    if (validIds.indexOf(state.sectorCompetitorId) < 0) state.sectorCompetitorId = preferredSectorCompetitor(candidates);
+
+    var controlKey = state.sectorMode + "|" + state.sectorCompetitorId + "|" + candidates.map(function (candidate) {
+      return candidate.participant.participant_id + ":" + candidate.pointCount;
+    }).join(",");
+    if (state.sectorControlKey !== controlKey) {
+      state.sectorControlKey = controlKey;
+      elements.sectorMode.value = state.sectorMode;
+      elements.sectorCompetitor.replaceChildren();
+      candidates.forEach(function (candidate) {
+        var option = document.createElement("option");
+        option.value = candidate.participant.participant_id;
+        option.textContent = comparisonOptionLabel(candidate.participant);
+        elements.sectorCompetitor.appendChild(option);
+      });
+      elements.sectorCompetitor.value = state.sectorCompetitorId || "";
+    }
+    elements.sectorCompetitor.disabled = !candidates.length;
+    elements.sectorCompetitorWrap.hidden = state.sectorMode !== "competitor";
+    elements.sectorPanel.dataset.mode = state.sectorMode;
+    elements.sectorPanel.hidden = false;
+    return true;
+  }
+
+  function nearestSectorPointIndex(points, atUs) {
+    if (!points || !points.length || typeof atUs !== "number") return -1;
+    var nearest = 0;
+    var nearestDistance = Math.abs(points[0].atUs - atUs);
+    for (var index = 1; index < points.length; index += 1) {
+      var distance = Math.abs(points[index].atUs - atUs);
+      if (distance < nearestDistance || (distance === nearestDistance && points[index].atUs <= atUs)) {
+        nearest = index;
+        nearestDistance = distance;
+      }
+    }
+    return nearest;
+  }
+
+  function sectorFiveLapWindow(points, atUs) {
+    var center = nearestSectorPointIndex(points, atUs);
+    return SECTOR_WINDOW_OFFSETS.map(function (offset) {
+      var index = center + offset;
+      return { offset: offset, point: center >= 0 && index >= 0 && index < points.length ? points[index] : null };
+    });
+  }
+
+  function sectorWindowConfiguration() {
+    var data = sectorComparisonData();
+    if (!data || !data.comparison || !data.comparison.available || !state.manifest) return null;
+    if (!renderSectorControls(data)) return null;
+    var oursId = data.comparison.ours_participant_id;
+    var ours = sectorParticipant(data, oursId) || { participant_id: oursId, team_name: "BALCHUG Racing", is_ours: true };
+    var ownPoints = sectorPointsForParticipant(data, oursId);
+    var competitor = state.sectorMode === "competitor" ? sectorParticipant(data, state.sectorCompetitorId) : null;
+    var competitorPoints = competitor ? sectorPointsForParticipant(data, competitor.participant_id) : [];
+    return {
+      data: data,
+      ours: ours,
+      competitor: competitor,
+      ownWindow: sectorFiveLapWindow(ownPoints, state.atUs),
+      competitorWindow: sectorFiveLapWindow(competitorPoints, state.atUs)
+    };
+  }
+
+  function sectorLapLabel(point) {
+    if (!point) return "Круг не подтверждён";
+    return point.lapNumber === null ? "Номер круга не передан" : "Круг #" + point.lapNumber;
+  }
+
+  function formatSectorValue(value) {
+    return value === null ? "—" : formatLap(value);
+  }
+
+  function sectorDeltaClass(delta) {
+    if (delta === null) return "missing";
+    if (delta < 0) return "fast";
+    if (delta > 0) return "slow";
+    return "neutral";
+  }
+
+  function sectorDeltaText(delta) {
+    return delta === null ? "—" : formatGap(delta);
+  }
+
+  function sectorSamples(configuration, key) {
+    var anchor = configuration.ownWindow[2] && configuration.ownWindow[2].point;
+    var anchorValue = sectorDuration(anchor, key);
+    return SECTOR_WINDOW_OFFSETS.map(function (offset, index) {
+      var ownPoint = configuration.ownWindow[index].point;
+      var competitorPoint = configuration.competitorWindow[index].point;
+      var ownValue = sectorDuration(ownPoint, key);
+      var competitorValue = sectorDuration(competitorPoint, key);
+      var delta = configuration.competitor ?
+        (ownValue === null || competitorValue === null ? null : ownValue - competitorValue) :
+        (ownValue === null || anchorValue === null ? null : ownValue - anchorValue);
+      return {
+        offset: offset,
+        ownPoint: ownPoint,
+        competitorPoint: competitorPoint,
+        ownValue: ownValue,
+        competitorValue: competitorValue,
+        delta: delta
       };
     });
   }
@@ -1686,6 +1902,236 @@
     top = Math.max(8, Math.min(parentRect.height - height - 8, top));
     element.style.left = Math.round(left + parent.scrollLeft) + "px";
     element.style.top = Math.round(top + parent.scrollTop) + "px";
+  }
+
+  function hideSectorTooltips() {
+    (elements.sectorCells || []).forEach(function (cell) { hideArchiveTooltip(cell.tooltip); });
+  }
+
+  function sectorClockText(point) {
+    if (!point) return "—";
+    var moment = timelineClockAt(point.atUs);
+    return formatClockLabel(moment.atUs, false, false);
+  }
+
+  function renderSectorWindowCaption(configuration) {
+    if (!elements.sectorWindow) return;
+    var cursorClock = timelineClockAt(state.atUs);
+    var ownCenter = configuration.ownWindow[2] && configuration.ownWindow[2].point;
+    var parts = [
+      "Курсор " + formatClockLabel(cursorClock.atUs, false, false),
+      "центр BALCHUG: " + sectorLapLabel(ownCenter) + (ownCenter ? " · " + sectorClockText(ownCenter) : "")
+    ];
+    if (configuration.competitor) {
+      var competitorCenter = configuration.competitorWindow[2] && configuration.competitorWindow[2].point;
+      parts.push("центр соперника: " + sectorLapLabel(competitorCenter) + (competitorCenter ? " · " + sectorClockText(competitorCenter) : ""));
+    }
+    elements.sectorWindow.textContent = parts.join(" · ");
+  }
+
+  function renderSectorDeltaRow(cell, samples, configuration) {
+    if (!cell.delta) return;
+    cell.delta.replaceChildren();
+    samples.forEach(function (sample) {
+      var item = document.createElement("span");
+      var deltaClass = sectorDeltaClass(sample.delta);
+      item.className = "ta-sector-delta " + deltaClass;
+      var offset = document.createElement("b");
+      offset.textContent = sample.offset > 0 ? "+" + sample.offset : String(sample.offset);
+      var value = document.createElement("i");
+      value.textContent = sectorDeltaText(sample.delta);
+      item.appendChild(offset);
+      item.appendChild(value);
+      var modeDescription = configuration.competitor ? "BALCHUG минус соперник" : "к центральному кругу BALCHUG";
+      item.title = "Шаг " + offset.textContent + ": " + value.textContent + " " + modeDescription;
+      cell.delta.appendChild(item);
+    });
+  }
+
+  function sectorAxisValue(value) {
+    return typeof value === "number" ? (value / 1000).toFixed(1) + "с" : "—";
+  }
+
+  function sectorChartDomain(samples) {
+    var values = [];
+    samples.forEach(function (sample) {
+      if (sample.ownValue !== null) values.push(sample.ownValue);
+      if (sample.competitorValue !== null) values.push(sample.competitorValue);
+    });
+    if (!values.length) return null;
+    var minimum = Math.min.apply(Math, values);
+    var maximum = Math.max.apply(Math, values);
+    var padding = Math.max(90, Math.round((maximum - minimum || 500) * 0.18));
+    return { min: minimum - padding, max: maximum + padding };
+  }
+
+  function drawSectorLine(context, samples, key, xAt, yAt, color, lineWidth) {
+    var previous = null;
+    context.save();
+    context.strokeStyle = color;
+    context.fillStyle = color;
+    context.lineWidth = lineWidth;
+    samples.forEach(function (sample) {
+      var value = sample[key];
+      if (value === null) {
+        previous = null;
+        return;
+      }
+      var x = xAt(sample.offset);
+      var y = yAt(value);
+      if (previous) {
+        context.beginPath();
+        context.moveTo(xAt(previous.offset), yAt(previous[key]));
+        context.lineTo(x, y);
+        context.stroke();
+      }
+      previous = sample;
+    });
+    samples.forEach(function (sample) {
+      var value = sample[key];
+      if (value === null) return;
+      context.beginPath();
+      context.arc(xAt(sample.offset), yAt(value), key === "ownValue" ? 3.2 : 2.8, 0, Math.PI * 2);
+      context.fill();
+    });
+    context.restore();
+  }
+
+  function drawSectorChart(cell, configuration) {
+    if (!cell.canvas) return null;
+    var samples = sectorSamples(configuration, cell.key);
+    renderSectorDeltaRow(cell, samples, configuration);
+    var surface = prepareCanvas(cell.canvas, 180, true);
+    var context = surface.context;
+    var width = surface.width;
+    var height = surface.height;
+    var left = 43;
+    var right = 10;
+    var top = 14;
+    var bottom = height - 28;
+    var domain = sectorChartDomain(samples);
+    var xAt = function (offset) {
+      var index = SECTOR_WINDOW_OFFSETS.indexOf(offset);
+      return left + index / (SECTOR_WINDOW_OFFSETS.length - 1) * Math.max(1, width - left - right);
+    };
+    var geometry = { cell: cell, samples: samples, width: width, height: height, domain: domain, xAt: xAt, yAt: null };
+    if (!domain) {
+      context.fillStyle = "#6E7E98";
+      context.font = "12px Arial";
+      context.fillText("В этом окне нет подтверждённых значений сектора", 12, Math.round(height / 2));
+      return geometry;
+    }
+    var yAt = function (value) {
+      return top + (value - domain.min) / Math.max(1, domain.max - domain.min) * (bottom - top);
+    };
+    geometry.yAt = yAt;
+    context.fillStyle = "rgba(240,20,61,.06)";
+    var centerX = xAt(0);
+    context.fillRect(centerX - 13, top, 26, bottom - top);
+    context.strokeStyle = "#E4E9F0";
+    context.lineWidth = 1;
+    [0, 0.5, 1].forEach(function (ratio) {
+      var y = Math.round(top + ratio * (bottom - top)) + .5;
+      context.beginPath(); context.moveTo(left, y); context.lineTo(width - right, y); context.stroke();
+    });
+    SECTOR_WINDOW_OFFSETS.forEach(function (offset) {
+      var x = Math.round(xAt(offset)) + .5;
+      context.strokeStyle = offset === 0 ? "#122846" : "#E4E9F0";
+      context.setLineDash(offset === 0 ? [3, 3] : []);
+      context.beginPath(); context.moveTo(x, top); context.lineTo(x, bottom); context.stroke();
+    });
+    context.setLineDash([]);
+    context.fillStyle = "#6E7E98";
+    context.font = "10px Arial";
+    context.fillText(sectorAxisValue(domain.min), 1, top + 9);
+    context.fillText(sectorAxisValue(domain.max), 1, bottom);
+    context.textAlign = "center";
+    SECTOR_WINDOW_OFFSETS.forEach(function (offset) {
+      context.fillStyle = offset === 0 ? "#122846" : "#6E7E98";
+      context.font = offset === 0 ? "bold 10px Arial" : "10px Arial";
+      context.fillText(offset > 0 ? "+" + offset : String(offset), xAt(offset), height - 8);
+    });
+    context.textAlign = "left";
+    drawSectorLine(context, samples, "ownValue", xAt, yAt, "#F0143D", 2.35);
+    if (configuration.competitor) drawSectorLine(context, samples, "competitorValue", xAt, yAt, "#007B91", 1.9);
+    return geometry;
+  }
+
+  function sectorTooltipLine(label, point, value, key) {
+    if (!point) return label + " · круг не подтверждён в этом шаге";
+    var sourceCell = sectorSourceCellId(point, key);
+    var source = sourceCell === null ? "" : " · LAST табло";
+    return label + " · " + sectorLapLabel(point) + " · " + formatSectorValue(value) + " · " + sectorClockText(point) + source;
+  }
+
+  function renderSectorTooltip(cell, geometry, sample, anchor) {
+    var tooltip = cell.tooltip;
+    if (!tooltip || !geometry || !sample) {
+      hideArchiveTooltip(tooltip);
+      return;
+    }
+    var point = sample.ownPoint || sample.competitorPoint;
+    var clock = timelineClockAt(point ? point.atUs : state.atUs);
+    var deltaClass = sectorDeltaClass(sample.delta);
+    var color = deltaClass === "fast" ? "#16824F" : (deltaClass === "slow" ? "#F0143D" : "#1B365D");
+    var modeTitle = geometry.configuration.competitor ?
+      "Δ BALCHUG − " + comparisonOptionLabel(geometry.configuration.competitor) :
+      "Δ к центральному кругу";
+    tooltip.style.setProperty("--ta-tooltip-accent", color);
+    tooltip.replaceChildren();
+    appendTooltipText(tooltip, "ta-tooltip-kicker", clock.source ? "Время табло" : "Время записи");
+    appendTooltipText(tooltip, "ta-tooltip-time", formatAbsolute(clock.atUs));
+    appendTooltipText(tooltip, "ta-tooltip-primary", cell.title + " · " + sectorDeltaText(sample.delta));
+    appendTooltipText(tooltip, "ta-tooltip-detail", sectorTooltipLine("BALCHUG Racing", sample.ownPoint, sample.ownValue, cell.key));
+    if (geometry.configuration.competitor) {
+      appendTooltipText(
+        tooltip,
+        "ta-tooltip-detail",
+        sectorTooltipLine(comparisonOptionLabel(geometry.configuration.competitor), sample.competitorPoint, sample.competitorValue, cell.key)
+      );
+    }
+    appendTooltipText(
+      tooltip,
+      "ta-tooltip-context",
+      "Шаг " + (sample.offset > 0 ? "+" : "") + sample.offset + " · " + modeTitle + ". Отрицательная дельта быстрее, положительная медленнее."
+    );
+    positionArchiveTooltip(tooltip, cell.canvas, anchor || { x: geometry.xAt(sample.offset), y: geometry.yAt ? geometry.yAt(sample.ownValue !== null ? sample.ownValue : sample.competitorValue) : geometry.height / 2 });
+  }
+
+  function sectorSampleAt(geometry, x) {
+    if (!geometry || !geometry.samples || !geometry.samples.length) return null;
+    var nearest = null;
+    geometry.samples.forEach(function (sample, index) {
+      var distance = Math.abs(geometry.xAt(sample.offset) - x);
+      if (!nearest || distance < nearest.distance) nearest = { index: index, sample: sample, distance: distance };
+    });
+    var maximum = Math.max(24, (geometry.width - 53) / 8);
+    return nearest && nearest.distance <= maximum ? nearest : null;
+  }
+
+  function drawSectorVisuals() {
+    var configuration = sectorWindowConfiguration();
+    if (!configuration) {
+      if (elements.sectorPanel) elements.sectorPanel.hidden = true;
+      hideSectorTooltips();
+      state.sectorGeometry = Object.create(null);
+      return;
+    }
+    renderSectorWindowCaption(configuration);
+    state.sectorGeometry = Object.create(null);
+    (elements.sectorCells || []).forEach(function (cell) {
+      var geometry = drawSectorChart(cell, configuration);
+      if (!geometry) return;
+      geometry.configuration = configuration;
+      state.sectorGeometry[cell.key] = geometry;
+      if (state.sectorHovered && state.sectorHovered.key === cell.key) {
+        var sample = geometry.samples[state.sectorHovered.index];
+        if (sample) renderSectorTooltip(cell, geometry, sample, state.sectorHovered.anchor);
+        else hideArchiveTooltip(cell.tooltip);
+      } else {
+        hideArchiveTooltip(cell.tooltip);
+      }
+    });
   }
 
   function historicalSnapshot(atUs) {
@@ -1817,7 +2263,6 @@
     var color = point.isOurs ? "#F0143D" : competitorColor(point.participantId);
     var team = point.isOurs ? "BALCHUG Racing" : (point.teamName || "Соперник");
     var crew = (point.startNumber ? "#" + point.startNumber + " · " : "") + team;
-    var gapText = formatBehindDistance(point.atUs);
     tooltip.style.setProperty("--ta-tooltip-accent", color);
     tooltip.replaceChildren();
     appendTooltipText(tooltip, "ta-tooltip-kicker", clock.source ? "Время табло" : "Время записи");
@@ -1825,10 +2270,6 @@
     appendTooltipText(tooltip, "ta-tooltip-primary", point.value === null ? "Время не передано" : formatLap(point.value));
     appendTooltipText(tooltip, "ta-tooltip-detail", archiveLapCaption(point.lapNumber, point.atUs) + " · " + crew);
     appendTooltipText(tooltip, "ta-tooltip-context", rawLapStatus(point));
-    var gap = appendTooltipText(tooltip, "ta-tooltip-gap", "До соперника сзади BALCHUG Racing");
-    var gapValue = document.createElement("b");
-    gapValue.textContent = gapText;
-    gap.appendChild(gapValue);
     var anchor = state.chartTooltipAnchor || rawLapTooltipAnchor(point, geometry);
     positionArchiveTooltip(tooltip, elements.chart, anchor);
   }
@@ -1840,7 +2281,6 @@
       return;
     }
     var clock = timelineClockAt(atUs);
-    var snapshot = historicalSnapshot(atUs);
     var ownPoint = latestLapPoint(geometry.own, atUs);
     var lapLabel = ownPoint && ownPoint.lapNumber !== null
       ? archiveLapCaption(ownPoint.lapNumber, ownPoint.atUs)
@@ -1849,9 +2289,9 @@
     tooltip.replaceChildren();
     appendTooltipText(tooltip, "ta-tooltip-kicker", clock.source ? "Срез · время табло" : "Срез · время записи");
     appendTooltipText(tooltip, "ta-tooltip-time", formatAbsolute(clock.atUs));
-    appendTooltipText(tooltip, "ta-tooltip-primary", formatBehindDistance(atUs));
-    appendTooltipText(tooltip, "ta-tooltip-detail", "До соперника сзади BALCHUG Racing · " + lapLabel);
-    appendTooltipText(tooltip, "ta-tooltip-context", "Наведите на точку, чтобы увидеть точное время круга");
+    appendTooltipText(tooltip, "ta-tooltip-primary", "Курсор диаграммы");
+    appendTooltipText(tooltip, "ta-tooltip-detail", "Последний BALCHUG: " + lapLabel);
+    appendTooltipText(tooltip, "ta-tooltip-context", "Наведите на точку, чтобы увидеть точное время круга. Интервалы до соперников не привязываются к чужим точкам графика.");
     positionArchiveTooltip(tooltip, elements.chart, state.chartTooltipAnchor || { x: geometry.xAt(atUs), y: geometry.top + 8 });
   }
 
@@ -2078,12 +2518,13 @@
   }
 
   function drawComparisonVisuals() {
-    // The lap chart is the primary canvas. The pit timeline only needs a
-    // readable playhead, so avoid redrawing it at every animation frame.
+    // These three compact views share the main cursor. Throttle playback so
+    // their readable annotations do not redraw more often than needed.
     var now = performance.now();
     if (state.playing && now - state.visualsLastDrawMs < 50) return;
     state.visualsLastDrawMs = now;
     drawPitTimeline();
+    drawSectorVisuals();
   }
 
   function drawStaticChart(context, width, height) {
@@ -2655,8 +3096,10 @@
     state.chartTooltipAnchor = null;
     state.hoveredPit = null;
     state.pitTooltipAnchor = null;
+    state.sectorHovered = null;
     hideArchiveTooltip(elements.chartTooltip);
     hideArchiveTooltip(elements.pitTooltip);
+    hideSectorTooltips();
     state.modalOpen = false;
     elements.modal.classList.remove("open");
     elements.modal.setAttribute("aria-hidden", "true");
@@ -2686,6 +3129,55 @@
   elements.comparison.addEventListener("change", function () {
     if (!state.manifest) return;
     loadComparison(elements.comparison.value);
+  });
+  if (elements.sectorMode) elements.sectorMode.addEventListener("change", function () {
+    state.sectorMode = elements.sectorMode.value === "competitor" ? "competitor" : "self";
+    state.sectorControlKey = "";
+    state.sectorHovered = null;
+    hideSectorTooltips();
+    drawSectorVisuals();
+  });
+  if (elements.sectorCompetitor) elements.sectorCompetitor.addEventListener("change", function () {
+    state.sectorCompetitorId = elements.sectorCompetitor.value || null;
+    state.sectorControlKey = "";
+    state.sectorHovered = null;
+    hideSectorTooltips();
+    drawSectorVisuals();
+  });
+  (elements.sectorCells || []).forEach(function (cell) {
+    if (!cell.canvas) return;
+    cell.canvas.addEventListener("pointermove", function (event) {
+      var geometry = state.sectorGeometry[cell.key];
+      if (!geometry) return;
+      var rect = cell.canvas.getBoundingClientRect();
+      var anchor = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+      var hit = sectorSampleAt(geometry, anchor.x);
+      if (!hit) {
+        if (state.sectorHovered && state.sectorHovered.key === cell.key) state.sectorHovered = null;
+        hideArchiveTooltip(cell.tooltip);
+        return;
+      }
+      state.sectorHovered = { key: cell.key, index: hit.index, anchor: anchor };
+      renderSectorTooltip(cell, geometry, hit.sample, anchor);
+    });
+    cell.canvas.addEventListener("pointerleave", function () {
+      if (state.sectorHovered && state.sectorHovered.key === cell.key) state.sectorHovered = null;
+      hideArchiveTooltip(cell.tooltip);
+    });
+    cell.canvas.addEventListener("click", function (event) {
+      var geometry = state.sectorGeometry[cell.key];
+      if (!geometry) return;
+      var rect = cell.canvas.getBoundingClientRect();
+      var anchor = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+      var hit = sectorSampleAt(geometry, anchor.x);
+      if (!hit) return;
+      var point = hit.sample.ownPoint || hit.sample.competitorPoint;
+      state.sectorHovered = { key: cell.key, index: hit.index, anchor: anchor };
+      renderSectorTooltip(cell, geometry, hit.sample, anchor);
+      if (!point || !state.manifest) return;
+      stopPlayback();
+      setAt(point.atUs, true);
+    });
   });
   elements.play.addEventListener("click", togglePlayback);
   elements.stepBack.addEventListener("click", function () { step(-1); });
