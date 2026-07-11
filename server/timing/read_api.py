@@ -1413,6 +1413,21 @@ def _archive_position(entry: Mapping[str, Any]) -> int | None:
     return value if value is not None and value >= 1 else None
 
 
+def _archive_interval_participant_is_on_track(entry: Mapping[str, Any]) -> bool:
+    """Accept an archive time interval only for an active on-track relation.
+
+    Result-grid fields are incremental.  A participant can enter the pits
+    while its prior ``GAP`` cell remains the latest durable table value.  That
+    historical cell is retained verbatim in RAW, but it must not be presented
+    as a current race interval for a lap point while either side is in pit or
+    has an unknown state.
+    """
+
+    state = _archive_participant_state(entry)
+    kind = _comparison_text(state.get("state_kind"), state.get("state"))
+    return kind in {"ON_TRACK", "OUT_LAP"}
+
+
 def _archive_relative_gap_ms(
     ours: Mapping[str, Any], target: Mapping[str, Any],
 ) -> int | None:
@@ -1426,6 +1441,8 @@ def _archive_relative_gap_ms(
 
     if _archive_participant_id(ours) == _archive_participant_id(target):
         return 0
+    if not _archive_interval_participant_is_on_track(ours) or not _archive_interval_participant_is_on_track(target):
+        return None
     ours_laps = _archive_explicit_laps(ours)
     target_laps = _archive_explicit_laps(target)
     if ours_laps is not None and target_laps is not None and ours_laps != target_laps:

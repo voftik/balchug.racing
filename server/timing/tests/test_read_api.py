@@ -475,6 +475,7 @@ class TimingReadModelTests(unittest.TestCase):
                         "position_overall": position,
                         "position_class": position,
                         "laps": source_laps,
+                        "state_kind": "ON_TRACK",
                         "gap_ms": gap_ms,
                         "gap_kind": "TIME" if gap_ms is not None else None,
                     },
@@ -526,6 +527,44 @@ class TimingReadModelTests(unittest.TestCase):
         self.assertEqual(explicit["lap_count_scope"], "source_grid")
         self.assertIsNone(explicit["gap_to_behind_ms"])
         self.assertEqual(explicit["lap_delta_to_behind"], 10)
+
+    def test_archive_intervals_hide_gap_when_relation_participant_is_in_pit(self):
+        self.connection.execute("UPDATE analysis_sessions SET lifecycle = 'stopped' WHERE id = 'session-1'")
+        payload = {
+            "schema_version": "timing-archive.v1",
+            "observed_at_us": 2_000_000,
+            "measured": {"track_flag": {"flag": "GREEN"}},
+            "computed": {
+                "session": {
+                    "ours_participant_id": "ours",
+                    "class_leader_id": "ours",
+                    "class_ahead_id": None,
+                    "class_behind_id": "behind",
+                },
+            },
+            "class_participants": [
+                {
+                    "measured": {
+                        "participant_id": "ours",
+                        "is_ours": True,
+                        "state": {"position_overall": 1, "state_kind": "ON_TRACK", "gap_ms": None},
+                    },
+                    "computed": {"participant_id": "ours", "position_overall": 1},
+                },
+                {
+                    "measured": {
+                        "participant_id": "behind",
+                        "state": {"position_overall": 2, "state_kind": "IN_PIT", "gap_ms": 1_246, "gap_kind": "TIME"},
+                    },
+                    "computed": {"participant_id": "behind", "position_overall": 2, "source_gap_ms": 1_246},
+                },
+            ],
+        }
+        self._add_playback_snapshot(2_000_000, payload)
+        self.connection.commit()
+
+        snapshot = self.model.archive_snapshot("session-1", at_us=2_000_000)
+        self.assertIsNone(snapshot["snapshot"]["archive_intervals"]["gap_to_behind_ms"])
 
     def test_archive_comparison_returns_one_bounded_competitor_benchmark(self):
         def participant(participant_id, number, team, pace, state, *, ours=False):
