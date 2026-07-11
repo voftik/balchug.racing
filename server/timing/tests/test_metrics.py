@@ -171,6 +171,36 @@ class GapMetricsTests(unittest.TestCase):
         self.assertEqual(forecast.maximum_time_ms, 300_000.0)
         self.assertEqual(forecast.source_windows_s, (30, 60))
 
+    def test_source_time_gap_without_laps_keeps_time_trend_but_not_lap_forecast(self):
+        samples = tuple(
+            GapSample(
+                target_participant_id="target",
+                observed_at_us=timestamp,
+                gap_ms=gap,
+                flag_kind=GREEN_FLAG,
+                our_state_kind=ON_TRACK_STATE,
+                target_state_kind=ON_TRACK_STATE,
+                has_feed_gap=False,
+                source_time_interval=True,
+            )
+            for timestamp, gap in ((0, 10_000), (30_000_000, 8_500), (60_000_000, 6_000))
+        )
+
+        trend = calculate_gap_trend(samples, relation=GAP_RELATION_AHEAD, window_s=60)
+
+        self.assertIsNotNone(trend)
+        self.assertEqual(trend.closure_ms_per_min, 4_000.0)
+        self.assertIsNone(trend.closure_ms_per_lap)
+        trends = calculate_gap_trends(samples, relation=GAP_RELATION_AHEAD, windows_s=(30, 60))
+        self.assertIsNone(
+            calculate_catch_range(
+                samples[-1],
+                tuple(trends.values()),
+                relation=GAP_RELATION_AHEAD,
+                reference_pace_ms=100_000,
+            )
+        )
+
 
 class TireAndPitTests(unittest.TestCase):
     def test_completed_pit_out_resets_automatic_tire_age(self):

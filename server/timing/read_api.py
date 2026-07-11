@@ -1336,6 +1336,135 @@ def _manifest_playback_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     return manifest_payload
 
 
+def _archive_int(value: Any) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _archive_participant_state(entry: Mapping[str, Any]) -> Mapping[str, Any]:
+    measured = entry.get("measured")
+    measured = measured if isinstance(measured, Mapping) else {}
+    state = measured.get("state")
+    return state if isinstance(state, Mapping) else {}
+
+
+def _archive_participant_values(entry: Mapping[str, Any]) -> Mapping[str, Any]:
+    computed = entry.get("computed")
+    return computed if isinstance(computed, Mapping) else {}
+
+
+def _archive_participant_id(entry: Mapping[str, Any]) -> str | None:
+    values = _archive_participant_values(entry)
+    measured = entry.get("measured")
+    measured = measured if isinstance(measured, Mapping) else {}
+    return _comparison_text(values.get("participant_id"), measured.get("participant_id"))
+
+
+def _archive_explicit_laps(entry: Mapping[str, Any]) -> int | None:
+    """Read only the provider's current LAPS field, never tracker fallback."""
+
+    laps = _archive_int(_archive_participant_state(entry).get("laps"))
+    return laps if laps is not None and laps >= 0 else None
+
+
+def _archive_source_time(entry: Mapping[str, Any], field: Literal["gap", "diff"]) -> int | None:
+    state = _archive_participant_state(entry)
+    value = _archive_int(state.get(f"{field}_ms"))
+    if value is not None and state.get(f"{field}_kind") == "TIME":
+        return value
+    return _archive_int(_archive_participant_values(entry).get(f"source_{field}_ms"))
+
+
+def _archive_position(entry: Mapping[str, Any]) -> int | None:
+    values = _archive_participant_values(entry)
+    state = _archive_participant_state(entry)
+    value = _archive_int(values.get("position_overall"))
+    if value is None:
+        value = _archive_int(state.get("position_overall"))
+    return value if value is not None and value >= 1 else None
+
+
+def _archive_relative_gap_ms(
+    ours: Mapping[str, Any], target: Mapping[str, Any],
+) -> int | None:
+    """Re-evaluate one source interval from immutable archive facts.
+
+    Older playback projections can contain tracker-derived local lap counts
+    when a partial capture had no grid LAPS column.  Those counts are not
+    allowed to veto a provider TIME GAP.  Explicit source LAPS still protect
+    against presenting a time interval for genuinely lapped cars.
+    """
+
+    if _archive_participant_id(ours) == _archive_participant_id(target):
+        return 0
+    ours_laps = _archive_explicit_laps(ours)
+    target_laps = _archive_explicit_laps(target)
+    if ours_laps is not None and target_laps is not None and ours_laps != target_laps:
+        return None
+    ours_gap = _archive_source_time(ours, "gap")
+    target_gap = _archive_source_time(target, "gap")
+    if ours_gap is not None and target_gap is not None:
+        return abs(ours_gap - target_gap)
+    ours_position = _archive_position(ours)
+    target_position = _archive_position(target)
+    if target_position == 1 and ours_gap is not None:
+        return ours_gap
+    if ours_position == 1 and target_gap is not None:
+        return target_gap
+    if ours_position is not None and target_position == ours_position - 1:
+        return _archive_source_time(ours, "diff")
+    if ours_position is not None and target_position == ours_position + 1:
+        return _archive_source_time(target, "diff")
+    return None
+
+
+def _archive_interval_derivation(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Return read-time interval values without mutating durable projections."""
+
+    computed = payload.get("computed")
+    computed = computed if isinstance(computed, Mapping) else {}
+    session = computed.get("session")
+    session = session if isinstance(session, Mapping) else {}
+    ours_id = _comparison_text(session.get("ours_participant_id"))
+    raw_participants = payload.get("class_participants")
+    if ours_id is None or not isinstance(raw_participants, list):
+        return {"lap_count_scope": "unknown"}
+    participants: dict[str, Mapping[str, Any]] = {}
+    for candidate in raw_participants:
+        if not isinstance(candidate, Mapping):
+            continue
+        participant_id = _archive_participant_id(candidate)
+        if participant_id is not None:
+            participants[participant_id] = candidate
+    ours = participants.get(ours_id)
+    if ours is None:
+        return {"lap_count_scope": "unknown"}
+    result: dict[str, Any] = {
+        "lap_count_scope": "source_grid" if _archive_explicit_laps(ours) is not None else "capture_tracker",
+    }
+    for relation, gap_key, lap_key in (
+        ("class_leader", "gap_to_class_leader_ms", "lap_delta_to_class_leader"),
+        ("class_ahead", "gap_to_ahead_ms", "lap_delta_to_ahead"),
+        ("class_behind", "gap_to_behind_ms", "lap_delta_to_behind"),
+    ):
+        target_id = _comparison_text(session.get(f"{relation}_id"))
+        target = participants.get(target_id) if target_id is not None else None
+        result[gap_key] = _archive_relative_gap_ms(ours, target) if target is not None else None
+        ours_laps = _archive_explicit_laps(ours)
+        target_laps = _archive_explicit_laps(target) if target is not None else None
+        result[lap_key] = (
+            ours_laps - target_laps
+            if ours_laps is not None and target_laps is not None
+            else None
+        )
+    return result
+
+
+def _with_archive_interval_derivation(payload: Mapping[str, Any]) -> dict[str, Any]:
+    derived = dict(payload)
+    derived["archive_intervals"] = _archive_interval_derivation(payload)
+    return derived
+
+
 def _archive_point_rows(
     connection: sqlite3.Connection,
     *,
@@ -2429,7 +2558,9 @@ def read_archive_manifest(
                         "message_id": row["source_message_id"],
                         "key": row["source_key"],
                     },
-                    "snapshot": _manifest_playback_payload(_decode_playback_payload(row)),
+                    "snapshot": _manifest_playback_payload(
+                        _with_archive_interval_derivation(_decode_playback_payload(row))
+                    ),
                 }
                 for row in point_rows
             ],
@@ -2501,7 +2632,7 @@ def read_archive_snapshot(
                 "next_at_us": int(next_row["observed_at_us"]) if next_row is not None else None,
                 "is_event_boundary": bool(row["is_event_boundary"]),
             },
-            "snapshot": _decode_playback_payload(row),
+            "snapshot": _with_archive_interval_derivation(_decode_playback_payload(row)),
             "semantics": {"state": "last_observed", "series": "step"},
             "system_assumption": _system_assumptions(),
         }

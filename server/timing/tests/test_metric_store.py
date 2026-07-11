@@ -461,6 +461,43 @@ class MetricStoreTests(unittest.TestCase):
                 scope_key="session-1",
             )
 
+    def test_formula_version_upgrade_starts_a_separate_history_window(self):
+        candidate = MetricSampleCandidate("session", "session-1", {"gap_to_ahead_ms": 1_250})
+        materialize_metric_samples(
+            self.connection,
+            source_heat_id=self.source_heat_id,
+            observed_at_us=1_100_000,
+            metric_version=1,
+            source_key="frame:v1",
+            samples=[candidate],
+        )
+        materialize_metric_samples(
+            self.connection,
+            source_heat_id=self.source_heat_id,
+            observed_at_us=2_100_000,
+            metric_version=2,
+            source_key="frame:v2",
+            samples=[candidate],
+        )
+
+        legacy = load_metric_history(
+            self.connection,
+            source_heat_id=self.source_heat_id,
+            scope_kind="session",
+            scope_key="session-1",
+            metric_version=1,
+        )
+        current = load_metric_history(
+            self.connection,
+            source_heat_id=self.source_heat_id,
+            scope_kind="session",
+            scope_key="session-1",
+            metric_version=2,
+        )
+
+        self.assertEqual([point.observed_at_us for point in legacy], [1_100_000])
+        self.assertEqual([point.observed_at_us for point in current], [2_100_000])
+
     def test_rejects_ambiguous_or_invalid_materialization_requests(self):
         candidate = MetricSampleCandidate("participant", "ours", {"pace_5_ms": 107_200})
         with self.assertRaisesRegex(MetricStoreError, "Duplicate metric scope"):

@@ -48,7 +48,7 @@ from .metrics import (
 )
 
 
-METRIC_ENGINE_VERSION = 1
+METRIC_ENGINE_VERSION = 2
 """Version of the deterministic value schema emitted by this module."""
 
 FRESHNESS_STALE_MS = 3_000
@@ -300,6 +300,19 @@ def _completed_laps(participant: ParticipantMetricInput) -> int | None:
         return participant.state.laps
     observed = [lap.lap_number for lap in participant.laps if _lap_count(lap.lap_number) is not None]
     return max(observed) if observed else None
+
+
+def _source_lap_count(participant: ParticipantMetricInput) -> int | None:
+    """Return only an explicit current source LAPS value.
+
+    Tracker passings are useful to reconstruct a local stint after capture
+    starts, but a partial capture cannot promote them to the provider's
+    official class-lap total.  Position gaps and lap deltas therefore use this
+    narrower helper rather than ``_completed_laps``.
+    """
+
+    state = participant.state
+    return _lap_count(state.laps) if state is not None else None
 
 
 def _last_lap_ms(participant: ParticipantMetricInput) -> int | None:
@@ -713,7 +726,7 @@ def _participant_values(
         "current_driver_name": state.current_driver_name if state is not None else None,
         "position_overall": _rank(state.position_overall) if state is not None else None,
         "position_class": _rank(state.position_class) if state is not None else None,
-        "completed_laps": _completed_laps(participant),
+        "completed_laps": _source_lap_count(participant),
         "current_state": state.state_kind if state is not None else None,
         "last_lap_ms": last_lap,
         "best_lap_ms": best_lap,
@@ -1006,13 +1019,16 @@ def _class_best_lap_ms(scope: ClassScopeInput) -> int | None:
 
 
 def _relative_gap_ms(ours: ParticipantMetricInput, target: ParticipantMetricInput) -> int | None:
-    """Return a same-lap source interval without assuming an unobserved order."""
+    """Return a source time interval unless explicit LAPS proves cars are apart."""
 
-    ours_laps = _completed_laps(ours)
-    target_laps = _completed_laps(target)
+    ours_laps = _source_lap_count(ours)
+    target_laps = _source_lap_count(target)
     if target.id == ours.id:
         return 0
-    if ours_laps is None or target_laps is None or ours_laps != target_laps:
+    # Only explicit source LAPS can prove that a time interval is invalid.
+    # A partial capture may have tracker-derived local lap counts that differ
+    # simply because one transponder was first observed later in the capture.
+    if ours_laps is not None and target_laps is not None and ours_laps != target_laps:
         return None
     ours_state = ours.state
     target_state = target.state
@@ -1040,8 +1056,8 @@ def _relative_gap_ms(ours: ParticipantMetricInput, target: ParticipantMetricInpu
 def _lap_delta(ours: ParticipantMetricInput, target: ParticipantMetricInput | None) -> int | None:
     if target is None:
         return None
-    ours_laps = _completed_laps(ours)
-    target_laps = _completed_laps(target)
+    ours_laps = _source_lap_count(ours)
+    target_laps = _source_lap_count(target)
     return ours_laps - target_laps if ours_laps is not None and target_laps is not None else None
 
 
@@ -1185,6 +1201,7 @@ def _gap_sample_from_values(
     relation: str,
 ) -> GapSample:
     suffix = "ahead" if relation == GAP_RELATION_AHEAD else "behind"
+    gap_ms = _mapping_int(values, f"gap_to_{suffix}_ms")
     ours_laps = _mapping_int(values, "completed_laps")
     lap_delta = _mapping_int(values, f"lap_delta_to_{suffix}")
     target_laps = ours_laps - lap_delta if ours_laps is not None and lap_delta is not None else None
@@ -1195,7 +1212,7 @@ def _gap_sample_from_values(
             else None
         ),
         observed_at_us=observed_at_us,
-        gap_ms=_mapping_int(values, f"gap_to_{suffix}_ms"),
+        gap_ms=gap_ms,
         our_lap_number=ours_laps,
         target_lap_number=target_laps,
         flag_kind=values.get("track_flag") if isinstance(values.get("track_flag"), str) else None,
@@ -1206,6 +1223,11 @@ def _gap_sample_from_values(
             else None
         ),
         has_feed_gap=values.get("channel_status") != CHANNEL_LIVE,
+        # ``gap_ms`` can only be non-null after _relative_gap_ms accepted an
+        # explicit provider TIME GAP/DIFF.  When LAPS is absent, it permits a
+        # time-based closure trend but intentionally never invents a per-lap
+        # rate or a lap-based catch projection.
+        source_time_interval=gap_ms is not None,
     )
 
 
@@ -1276,7 +1298,7 @@ def _projected_gaps(
 
 
 def _class_density(ours: ParticipantMetricInput, scope: ClassScopeInput | None) -> dict[str, int] | None:
-    if scope is None or _completed_laps(ours) is None:
+    if scope is None:
         return None
     gaps = [
         _relative_gap_ms(ours, participant)
@@ -1877,9 +1899,9 @@ def _ours_tactical_values(
         "class_leader_id": leader.id if leader is not None else None,
         "class_ahead_id": ahead.id if ahead is not None else None,
         "class_behind_id": behind.id if behind is not None else None,
-        "class_leader_completed_laps": _completed_laps(leader) if leader is not None else None,
-        "class_ahead_completed_laps": _completed_laps(ahead) if ahead is not None else None,
-        "class_behind_completed_laps": _completed_laps(behind) if behind is not None else None,
+        "class_leader_completed_laps": _source_lap_count(leader) if leader is not None else None,
+        "class_ahead_completed_laps": _source_lap_count(ahead) if ahead is not None else None,
+        "class_behind_completed_laps": _source_lap_count(behind) if behind is not None else None,
         "class_leader_state": leader.state.state_kind if leader is not None and leader.state is not None else None,
         "class_ahead_state": ahead.state.state_kind if ahead is not None and ahead.state is not None else None,
         "class_behind_state": behind.state.state_kind if behind is not None and behind.state is not None else None,

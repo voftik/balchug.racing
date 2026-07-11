@@ -361,6 +361,99 @@ class MetricEngineTests(unittest.TestCase):
         self.assertEqual(lapped_session["lap_delta_to_class_leader"], -1)
         self.assertIsNone(lapped_session["gap_to_class_leader_ms"])
 
+    def test_partial_capture_tracker_laps_do_not_reject_source_gap_behind(self):
+        """Missing source LAPS must not turn local tracker counts into class gaps."""
+
+        base = heat_input(flag="GREEN")
+        _, ours, follower = base.participants
+        partial_ours = replace(
+            ours,
+            state=replace(
+                ours.state,
+                position_overall=1,
+                position_class=1,
+                laps=None,
+                gap_ms=None,
+                gap_raw=None,
+                gap_kind=None,
+            ),
+        )
+        partial_follower = replace(
+            follower,
+            state=replace(
+                follower.state,
+                position_overall=2,
+                position_class=2,
+                laps=None,
+                gap_ms=1_246,
+                gap_raw="1.246",
+                gap_kind="TIME",
+            ),
+            # These are tracker passings seen only after this capture began,
+            # not a source LAPS column for the whole heat.
+            laps=laps((108_000, 108_100), first_lap=1),
+        )
+        partial_scope = replace(base.class_scopes[0], participants=(partial_ours, partial_follower))
+        partial = replace(base, participants=(partial_ours, partial_follower), class_scopes=(partial_scope,))
+        partial_session = candidate_values(evaluate_heat_metrics(partial), "session", "session-1")
+
+        self.assertEqual(partial_session["gap_to_behind_ms"], 1_246)
+        self.assertIsNone(partial_session["lap_delta_to_behind"])
+        self.assertIsNone(partial_session["completed_laps"])
+        self.assertIsNone(partial_session["class_behind_completed_laps"])
+        self.assertEqual(partial_session["class_density"], {"5000": 1, "10000": 1, "30000": 1})
+
+        explicit_follower = replace(partial_follower, state=replace(partial_follower.state, laps=2))
+        explicit_ours = replace(partial_ours, state=replace(partial_ours.state, laps=12))
+        explicit_scope = replace(base.class_scopes[0], participants=(explicit_ours, explicit_follower))
+        explicit = replace(base, participants=(explicit_ours, explicit_follower), class_scopes=(explicit_scope,))
+        explicit_session = candidate_values(evaluate_heat_metrics(explicit), "session", "session-1")
+
+        self.assertIsNone(explicit_session["gap_to_behind_ms"])
+        self.assertEqual(explicit_session["lap_delta_to_behind"], 10)
+
+    def test_missing_source_laps_keeps_time_closure_without_per_lap_forecast(self):
+        base = heat_input(flag="GREEN")
+        leader, ours, follower = base.participants
+        no_laps_leader = replace(leader, state=replace(leader.state, laps=None))
+        no_laps_ours = replace(ours, state=replace(ours.state, laps=None))
+        no_laps_follower = replace(follower, state=replace(follower.state, laps=None))
+        scope = replace(base.class_scopes[0], participants=(no_laps_leader, no_laps_ours, no_laps_follower))
+        heat = replace(
+            base,
+            participants=(no_laps_leader, no_laps_ours, no_laps_follower),
+            class_scopes=(scope,),
+            provider_started_at_us=0,
+            observed_at_us=180_000_000,
+            current_flag=replace(base.current_flag, started_at_us=0, calibrated_started_at_us=0),
+        )
+        history = tuple(
+            MetricHistoryPoint(
+                observed_at_us=timestamp,
+                metric_version=METRIC_ENGINE_VERSION,
+                values={
+                    "track_flag": "GREEN",
+                    "channel_status": "LIVE",
+                    "current_state": "ON_TRACK",
+                    "completed_laps": None,
+                    "class_ahead_id": "leader",
+                    "class_ahead_state": "ON_TRACK",
+                    "lap_delta_to_ahead": None,
+                    "gap_to_ahead_ms": gap,
+                },
+            )
+            for timestamp, gap in ((0, 5_000), (30_000_000, 4_000), (60_000_000, 3_000), (120_000_000, 2_000))
+        )
+
+        session = candidate_values(evaluate_heat_metrics(heat, history=history), "session", "session-1")
+
+        closure = session["closure_ahead"]["60"]
+        self.assertIsNotNone(closure)
+        self.assertEqual(closure["closure_ms_per_min"], 750.0)
+        self.assertIsNone(closure["closure_ms_per_lap"])
+        self.assertIsNone(session["catch_range"]["ahead"])
+        self.assertIsNone(session["projected_gap_ms"]["ahead"])
+
     def test_event_boundary_is_stateful_and_ignores_ordinary_repeat(self):
         initial = heat_input()
         first = evaluate_heat_metrics(initial)

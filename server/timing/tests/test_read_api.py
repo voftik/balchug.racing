@@ -329,6 +329,70 @@ class TimingReadModelTests(unittest.TestCase):
         with self.assertRaises(ReadValidationError):
             self.model.archive_snapshot("session-1", at_us=1_999_999)
 
+    def test_archive_intervals_rederive_source_gap_without_source_laps(self):
+        self.connection.execute("UPDATE analysis_sessions SET lifecycle = 'stopped' WHERE id = 'session-1'")
+
+        def participant(participant_id, position, source_laps, gap_ms, *, ours=False):
+            return {
+                "measured": {
+                    "participant_id": participant_id,
+                    "is_ours": ours,
+                    "state": {
+                        "position_overall": position,
+                        "position_class": position,
+                        "laps": source_laps,
+                        "gap_ms": gap_ms,
+                        "gap_kind": "TIME" if gap_ms is not None else None,
+                    },
+                },
+                "computed": {
+                    "participant_id": participant_id,
+                    "is_ours": ours,
+                    "position_overall": position,
+                    "position_class": position,
+                    "source_gap_ms": gap_ms,
+                    "source_diff_ms": None,
+                },
+            }
+
+        def payload(observed_at_us, source_laps):
+            return {
+                "schema_version": "timing-archive.v1",
+                "observed_at_us": observed_at_us,
+                "measured": {"track_flag": {"flag": "GREEN"}},
+                "computed": {
+                    "session": {
+                        "ours_participant_id": "ours",
+                        "class_leader_id": "ours",
+                        "class_ahead_id": None,
+                        "class_behind_id": "behind",
+                        # This is the old immutable materialization.  The
+                        # reader must derive the source interval separately.
+                        "gap_to_behind_ms": None,
+                        "lap_delta_to_behind": 10,
+                    },
+                },
+                "class_participants": [
+                    participant("ours", 1, source_laps[0], None, ours=True),
+                    participant("behind", 2, source_laps[1], 1_246),
+                ],
+            }
+
+        self._add_playback_snapshot(2_000_000, payload(2_000_000, (None, None)))
+        self._add_playback_snapshot(4_000_000, payload(4_000_000, (12, 2)))
+        self.connection.commit()
+
+        manifest = self.model.archive_manifest("session-1")
+        partial = manifest["keyframes"][0]["snapshot"]["archive_intervals"]
+        explicit = manifest["keyframes"][1]["snapshot"]["archive_intervals"]
+
+        self.assertEqual(partial["lap_count_scope"], "capture_tracker")
+        self.assertEqual(partial["gap_to_behind_ms"], 1_246)
+        self.assertIsNone(partial["lap_delta_to_behind"])
+        self.assertEqual(explicit["lap_count_scope"], "source_grid")
+        self.assertIsNone(explicit["gap_to_behind_ms"])
+        self.assertEqual(explicit["lap_delta_to_behind"], 10)
+
     def test_archive_comparison_returns_one_bounded_competitor_benchmark(self):
         def participant(participant_id, number, team, pace, state, *, ours=False):
             return {

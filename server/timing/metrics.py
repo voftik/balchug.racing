@@ -259,18 +259,29 @@ class GapSample:
     our_state_kind: str | None = None
     target_state_kind: str | None = None
     has_feed_gap: bool | None = None
+    # A numeric provider GAP/DIFF can be an authoritative comparable interval
+    # even when the result layout does not expose its LAPS column.  This flag
+    # never creates a lap axis: it only admits a time-based trend.
+    source_time_interval: bool | None = None
 
 
 def is_eligible_gap_sample(sample: GapSample) -> bool:
     """Whether an observation is safe for an interval/catch calculation."""
 
+    has_lap_axis = _is_int(sample.our_lap_number, minimum=0) and _is_int(
+        sample.target_lap_number, minimum=0
+    )
+    same_lap = (
+        sample.our_lap_number == sample.target_lap_number
+        if has_lap_axis
+        else sample.source_time_interval is True
+    )
     return (
         isinstance(sample.target_participant_id, str)
         and bool(sample.target_participant_id)
         and _is_int(sample.observed_at_us, minimum=0)
         and _is_int(sample.gap_ms, minimum=0)
-        and _is_int(sample.our_lap_number, minimum=0)
-        and sample.our_lap_number == sample.target_lap_number
+        and same_lap
         and sample.flag_kind == GREEN_FLAG
         and sample.our_state_kind == ON_TRACK_STATE
         and sample.target_state_kind == ON_TRACK_STATE
@@ -280,7 +291,7 @@ def is_eligible_gap_sample(sample: GapSample) -> bool:
 
 @dataclass(frozen=True)
 class GapTrend:
-    """A Green, same-lap rolling trend with relation-specific signed closure."""
+    """A Green source-interval trend with relation-specific signed closure."""
 
     relation: str
     window_s: int
@@ -359,7 +370,12 @@ def calculate_gap_trend(
     # expanding interval is positive (we are pulling away).  The semantic
     # labels below make this sign safe for the dashboard and catch helper.
     closure = first.gap_ms - latest.gap_ms if relation == GAP_RELATION_AHEAD else latest.gap_ms - first.gap_ms
-    lap_delta = latest.our_lap_number - first.our_lap_number
+    lap_delta = (
+        latest.our_lap_number - first.our_lap_number
+        if _is_int(latest.our_lap_number, minimum=0)
+        and _is_int(first.our_lap_number, minimum=0)
+        else None
+    )
     return GapTrend(
         relation=relation,
         window_s=window_s,
@@ -370,7 +386,7 @@ def calculate_gap_trend(
         ended_gap_ms=latest.gap_ms,
         gap_change_ms=gap_change,
         closure_ms_per_min=closure * 60_000_000.0 / elapsed_us,
-        closure_ms_per_lap=closure / lap_delta if lap_delta > 0 else None,
+        closure_ms_per_lap=closure / lap_delta if lap_delta is not None and lap_delta > 0 else None,
         direction=_gap_direction(relation, gap_change),
     )
 
@@ -403,7 +419,7 @@ def calculate_catch_range(
     relation: str,
     reference_pace_ms: int | float | None,
 ) -> CatchRange | None:
-    """Return a Green/same-lap catch range, or ``None`` without valid inputs.
+    """Return a Green per-lap catch range, or ``None`` without valid inputs.
 
     For an ahead target this means Balchug catches the target.  For a behind
     target this means the target catches Balchug.  The source contract uses a

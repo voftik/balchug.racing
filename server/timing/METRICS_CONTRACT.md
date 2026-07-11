@@ -47,7 +47,7 @@ not engineer inputs.
       "remaining_time": "For race, max(0, race_duration_s - session_elapsed_s). For practice/qualifying it is source-supplied only; otherwise null."
     },
     "lap_and_stint_rules": {
-      "completed_lap": "A provider-confirmed finish-loop crossing, using the grid LAPS value when present or the dynamic tracker topology when it is absent. Do not double count both sources.",
+      "completed_lap": "A provider-confirmed finish-loop crossing, using the grid LAPS value when present or the dynamic tracker topology when it is absent. Do not double count both sources. Public official lap totals remain null when the grid does not expose LAPS; tracker crossings remain available only for observed stint and chronology logic.",
       "clean_lap": "A valid timed lap whose full lap interval is Green, is not an in-lap or out-lap, has no pit crossing, and does not intersect a feed/source gap.",
       "tyre_age_laps": "The number of provider-confirmed completed laps after the current stint start. At confirmed pit_out it is 0. The first partial stint begins at analysis activation and counts from that point until its first pit; it is not presented as a manual correction.",
       "mandatory_pit": "Count only a completed, ordered pit_in -> pit_out pair. A raw provider PIT counter alone cannot complete a mandatory stop."
@@ -65,8 +65,8 @@ not engineer inputs.
       "interval_ms": "A non-negative time distance. For lapped cars, time distance is null and lap_delta is displayed instead.",
       "lap_delta_to_class_leader": "ours.completed_laps minus class_leader.completed_laps. Zero means same lap; negative means Balchug is lap(s) down.",
       "position_change": "previous position minus current position. Positive means positions gained; negative means positions lost.",
-      "closure_ahead_ms_per_lap": "previous gap_to_ahead minus current gap_to_ahead, divided by Balchug completed laps. Positive label: dogonyaem (closing). Negative label: ahead_pulls_away.",
-      "closure_behind_ms_per_lap": "current gap_to_behind minus previous gap_to_behind, divided by Balchug completed laps. Positive label: otryvaemsya (pulling away). Negative label: nas_dogonyayut (being caught).",
+      "closure_ahead_ms_per_lap": "previous gap_to_ahead minus current gap_to_ahead, divided by Balchug completed laps. Positive label: dogonyaem (closing). Negative label: ahead_pulls_away. A provider TIME GAP without a source LAPS axis still yields closure_ms_per_min, but closure_ms_per_lap stays null.",
+      "closure_behind_ms_per_lap": "current gap_to_behind minus previous gap_to_behind, divided by Balchug completed laps. Positive label: otryvaemsya (pulling away). Negative label: nas_dogonyayut (being caught). A provider TIME GAP without a source LAPS axis still yields closure_ms_per_min, but closure_ms_per_lap stays null.",
       "closure_ms_per_min": "The corresponding signed gap change scaled to one minute with the same direction labels.",
       "projected_gap_ms": "Positive means the current order remains separated in its reference direction; zero or negative means a projected catch/pass within the stated horizon.",
       "stint_trend_ms_per_lap": "Positive means lap time worsens with stint age; negative means it improves.",
@@ -170,7 +170,7 @@ not engineer inputs.
         {
           "key": "completed_laps",
           "unit": "lap",
-          "formula": "Current completed-lap ledger count, using one authoritative source path only.",
+          "formula": "Current official provider-grid LAPS count. It remains null when the result layout exposes no LAPS column; tracker crossings are not promoted to a whole-session public total.",
           "window": "current tick",
           "null_when": ["no authoritative lap source"],
           "display": {"sign": "non_negative_count"}
@@ -210,7 +210,7 @@ not engineer inputs.
         {
           "key": "gap_to_class_leader_ms",
           "unit": "ms",
-          "formula": "Official normalized time interval from ours to class leader, only when both are on the same completed lap.",
+          "formula": "Official normalized time interval from ours to class leader. If explicit LAPS exist for both rows they must match; if the grid has no LAPS column, a provider TIME GAP/DIFF remains usable while lap delta stays null.",
           "window": "current tick",
           "null_when": ["not same lap", "official interval absent or invalid"],
           "display": {"sign": "interval_ms", "lapped_fallback": "lap_delta_to_class_leader"}
@@ -218,7 +218,7 @@ not engineer inputs.
         {
           "key": "gap_to_ahead_ms",
           "unit": "ms",
-          "formula": "Official normalized time interval from ours to class_ahead_id, only when both are on the same completed lap.",
+          "formula": "Official normalized time interval from ours to class_ahead_id. If explicit LAPS exist for both rows they must match; if the grid has no LAPS column, a provider TIME GAP/DIFF remains usable while lap delta stays null.",
           "window": "current tick",
           "null_when": ["no class_ahead_id", "not same lap", "official interval absent or invalid"],
           "display": {"sign": "interval_ms", "lapped_fallback": "lap delta"}
@@ -226,7 +226,7 @@ not engineer inputs.
         {
           "key": "gap_to_behind_ms",
           "unit": "ms",
-          "formula": "Official normalized time interval from ours to class_behind_id, only when both are on the same completed lap.",
+          "formula": "Official normalized time interval from ours to class_behind_id. If explicit LAPS exist for both rows they must match; if the grid has no LAPS column, a provider TIME GAP/DIFF remains usable while lap delta stays null.",
           "window": "current tick",
           "null_when": ["no class_behind_id", "not same lap", "official interval absent or invalid"],
           "display": {"sign": "interval_ms", "lapped_fallback": "lap delta"}

@@ -177,7 +177,7 @@
   .ta-benchmark-metric:last-child{border-right:0;}.ta-benchmark-metric b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--display);font-size:12px;color:var(--navy);font-variant-numeric:tabular-nums;}
   .ta-benchmark-metric span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:3px;font-family:var(--display);font-size:8.5px;text-transform:uppercase;color:var(--muted);}
   .ta-benchmark-metric.delta-fast b{color:#16824f;}.ta-benchmark-metric.delta-slow b{color:var(--red);}
-  .ta-chart-wrap{padding:14px 16px 10px;border-bottom:1px solid var(--line);}
+  .ta-chart-wrap{position:relative;padding:14px 16px 10px;border-bottom:1px solid var(--line);}
   .ta-chart-head{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:8px 14px;margin:0 0 8px;}
   .ta-chart-title{display:block;font-family:var(--display);font-size:10px;text-transform:uppercase;color:var(--navy);}
   .ta-chart-help{display:block;margin-top:3px;color:var(--muted);font-size:10.5px;line-height:1.35;}
@@ -190,6 +190,8 @@
   .ta-legend-key{display:block;flex:none;width:12px;height:3px;margin-top:5px;background:var(--navy);}.ta-legend-key.ours{background:var(--red);}.ta-legend-key.competitor{background:#007b91;}.ta-legend-key.aggregate{background:#526276;}.ta-legend-key.line{height:2px;margin-top:6px;background:repeating-linear-gradient(90deg,#526276 0 5px,transparent 5px 8px);}.ta-legend-key.raw{width:10px;height:10px;margin-top:1px;border:2px solid #526276;background:#fff;box-sizing:border-box;}.ta-legend-key.missing{width:12px;height:12px;margin-top:0;background:transparent;color:#526276;font:14px/10px Arial;}.ta-legend-key.overflow{width:12px;height:12px;margin-top:0;background:transparent;color:#526276;font:14px/10px Arial;}.ta-legend-key.overflow::before{content:"\2193";}.ta-legend-key.track{height:10px;margin-top:1px;background:linear-gradient(90deg,#2eac72 0 35%,#d89a00 35% 65%,var(--red) 65% 100%);}.ta-legend-key.pit{width:2px;height:12px;margin:0 5px;background:#122846;}
   .ta-competitor-legend{margin-top:-3px;}.ta-competitor-legend[hidden]{display:none;}
   .ta-chart{display:block;width:100%;height:224px;cursor:crosshair;touch-action:manipulation;}
+  .ta-chart-tooltip{--ta-tooltip-accent:var(--red);position:absolute;z-index:5;min-width:214px;max-width:min(286px,calc(100% - 16px));padding:10px 12px 11px;border:1px solid rgba(18,40,70,.2);border-left:4px solid var(--ta-tooltip-accent);border-radius:6px;background:rgba(255,255,255,.98);color:var(--navy);box-shadow:0 14px 30px -16px rgba(5,8,13,.65);pointer-events:none;font-variant-numeric:tabular-nums;}
+  .ta-chart-tooltip[hidden]{display:none;}.ta-tooltip-kicker{display:block;font-family:var(--display);font-size:8.5px;text-transform:uppercase;color:var(--muted);}.ta-tooltip-time{display:block;margin-top:2px;font-family:var(--display);font-size:14px;line-height:1.2;color:var(--navy);}.ta-tooltip-primary{display:block;margin-top:7px;font-family:var(--display);font-size:19px;line-height:1.05;color:var(--ta-tooltip-accent);}.ta-tooltip-detail{display:block;margin-top:5px;font-size:10.5px;line-height:1.35;color:var(--navy);}.ta-tooltip-context{display:block;margin-top:3px;font-size:9.5px;line-height:1.35;color:var(--muted);}.ta-tooltip-gap{display:block;margin-top:7px;padding-top:7px;border-top:1px solid var(--line);font-family:var(--display);font-size:9px;text-transform:uppercase;color:var(--muted);}.ta-tooltip-gap b{margin-left:5px;font-size:11px;color:var(--navy);}
   .ta-stream-axis{--axis-left:42px;--axis-right:10px;position:relative;height:44px;margin:0;border-top:1px solid var(--line);background:#f8fafc;color:var(--muted);font-variant-numeric:tabular-nums;}
   .ta-stream-axis.has-lap-axis{height:74px;}.ta-stream-axis[hidden]{display:none;}.ta-stream-axis::before{content:attr(data-axis-label);position:absolute;left:4px;top:4px;font-family:var(--display);font-size:9px;text-transform:uppercase;color:var(--navy);white-space:nowrap;}
   .ta-stream-axis.has-lap-axis::after{content:attr(data-lap-label);position:absolute;left:4px;top:39px;font-family:var(--display);font-size:9px;text-transform:uppercase;color:var(--navy);white-space:nowrap;}
@@ -200,7 +202,7 @@
   .ta-stream-lap-tick{position:absolute;top:-3px;width:1px;height:6px;background:#8795aa;transform:translateX(-50%);}.ta-stream-lap-tick.major{height:11px;background:var(--navy);}.ta-stream-lap-tick b{position:absolute;top:13px;left:50%;font-family:var(--display);font-size:9px;line-height:1;color:var(--navy);font-weight:400;white-space:nowrap;transform:translateX(-50%);}.ta-stream-lap-tick:first-child b{left:0;transform:none;}.ta-stream-lap-tick:last-child b{left:auto;right:0;transform:none;}
   .ta-visual{padding:14px 16px 10px;border-bottom:1px solid var(--line);}.ta-visual[hidden]{display:none;}
   .ta-visual-head{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin:0 0 8px;}.ta-visual-title{display:block;font-family:var(--display);font-size:10px;text-transform:uppercase;color:var(--navy);}.ta-visual-help{display:block;margin-top:3px;color:var(--muted);font-size:10.5px;line-height:1.35;}.ta-visual-meta{flex:none;padding-top:1px;font-family:var(--display);font-size:9px;text-align:right;text-transform:uppercase;color:var(--muted);white-space:nowrap;}
-  .ta-pit-scroll{max-height:330px;overflow:auto;border-top:1px solid var(--line);border-bottom:1px solid var(--line);}.ta-pit-chart{display:block;width:100%;height:96px;touch-action:manipulation;}
+  .ta-pit-scroll{position:relative;max-height:330px;overflow:auto;border-top:1px solid var(--line);border-bottom:1px solid var(--line);}.ta-pit-chart{display:block;width:100%;height:96px;cursor:crosshair;touch-action:manipulation;}
   .ta-lap-readout{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));border-top:1px solid var(--line);border-bottom:1px solid var(--line);margin:0 0 9px;background:#f8fafc;}.ta-lap-readout[hidden]{display:none;}
   .ta-lap-readout-item{min-width:0;padding:8px 10px;border-right:1px solid var(--line);}.ta-lap-readout-item:last-child{border-right:0;}.ta-lap-readout-item.selected{grid-column:1/-1;border-right:0;border-bottom:1px solid var(--line);background:#fff7f8;}.ta-lap-readout-item b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--display);font-size:11px;color:var(--navy);font-variant-numeric:tabular-nums;}.ta-lap-readout-item span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:3px;font-family:var(--display);font-size:8px;text-transform:uppercase;color:var(--muted);}.ta-lap-readout-item.ours b{color:var(--red);}.ta-lap-readout-item.competitor b{color:#007b91;}.ta-lap-readout-item.aggregate b{color:#526276;}
   .ta-lap-chart{display:block;width:100%;height:186px;touch-action:manipulation;cursor:crosshair;}
@@ -307,12 +309,12 @@
             <div class="ta-benchmark" id="timingBenchmark" hidden></div>
             <div class="ta-chart-wrap">
               <div class="ta-chart-head">
-                <div><span class="ta-chart-title">Время каждого круга</span><span class="ta-chart-help">Реальные времена из табло без медиан и сглаживания. Кликните точку, чтобы увидеть номер круга, точное время и статус.</span></div>
+                <div><span class="ta-chart-title">Времена кругов в сохранённом интервале</span><span class="ta-chart-help">Реальные времена из табло без медиан и сглаживания. Наведите или кликните точку, чтобы увидеть время табло, круг, точное значение и статус.</span></div>
                 <div class="ta-compare"><label for="timingComparison">Сравнить с</label><select id="timingComparison" aria-label="Выбор соперника для сравнения" disabled><option>Загрузка…</option></select></div>
                 <span class="ta-chart-range" id="timingChartRange">—</span>
               </div>
               <ul class="ta-chart-legend" aria-label="Легенда диаграммы">
-                <li><i class="ta-legend-key ours"></i><span><b>BALCHUG Racing</b><small>Каждый круг #21</small></span></li>
+                <li><i class="ta-legend-key ours"></i><span><b>BALCHUG Racing</b><small>Каждый зафиксированный круг #21</small></span></li>
                 <li><i class="ta-legend-key line"></i><span><b>Линия серии</b><small>Сплошная - боевые круги; пунктир - pit, in/out или флаг</small></span></li>
                 <li><i class="ta-legend-key raw"></i><span><b>Контурная точка</b><small>Круг через pit, in/out lap или флаг</small></span></li>
                 <li><i class="ta-legend-key missing"></i><span><b>&times; Без времени</b><small>Источник сообщил круг без длительности</small></span></li>
@@ -322,13 +324,14 @@
               </ul>
               <ul class="ta-chart-legend ta-competitor-legend" id="timingComparisonLegend" aria-label="Легенда соперников" hidden></ul>
               <div class="ta-lap-readout" id="timingLapReadout" aria-live="polite"></div>
-              <canvas class="ta-chart" id="timingChart" aria-label="Хронологический график реальных времен каждого круга BALCHUG Racing и выбранных соперников" aria-describedby="timingLapReadout timingChartAxis" role="img"></canvas>
+              <canvas class="ta-chart" id="timingChart" aria-label="Хронологический график реальных времен кругов BALCHUG Racing и выбранных соперников в сохранённом интервале" aria-describedby="timingLapReadout timingChartAxis" role="img"></canvas>
+              <div class="ta-chart-tooltip" id="timingChartTooltip" role="tooltip" hidden></div>
               <div class="ta-stream-axis" id="timingChartAxis" aria-label="Шкала времени табло"></div>
             </div>
             <section class="ta-visual" id="timingPitPanel" hidden aria-labelledby="timingPitTitle">
               <div class="ta-visual-head"><div><span class="ta-visual-title" id="timingPitTitle">Хронология пит-стопов</span><span class="ta-visual-help">На общей шкале показаны все машины выбранного сравнения. Пустая строка означает, что подтверждённого пит-стопа в сохранённом интервале нет; полоса показывает pit in, pit out и измеренную длительность.</span></div><span class="ta-visual-meta" id="timingPitMeta"></span></div>
               <div id="timingPitDescription" class="ta-sr-only"></div>
-              <div class="ta-pit-scroll"><canvas class="ta-pit-chart" id="timingPitChart" aria-label="Хронология пит-стопов BALCHUG Racing и соперников" aria-describedby="timingPitDescription" role="img"></canvas></div>
+              <div class="ta-pit-scroll"><canvas class="ta-pit-chart" id="timingPitChart" aria-label="Хронология пит-стопов BALCHUG Racing и соперников" aria-describedby="timingPitDescription" role="img"></canvas><div class="ta-chart-tooltip" id="timingPitTooltip" role="tooltip" hidden></div></div>
               <div class="ta-stream-axis" id="timingPitAxis" aria-label="Шкала времени табло"></div>
             </section>
             <section class="ta-visual" id="timingLapPanel" hidden aria-labelledby="timingLapTitle">
@@ -367,6 +370,6 @@
 
   <script src="/assets/hls.min.js"></script>
   <script src="/assets/archive.js?v=20260711-timing-card-cta-r2"></script>
-  <script src="/assets/timing-archive.js?v=20260711-raw-laps-r8"></script>
+  <script src="/assets/timing-archive.js?v=20260711-raw-laps-r9"></script>
 </body>
 </html>

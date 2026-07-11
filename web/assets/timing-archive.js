@@ -21,6 +21,7 @@
     kpis: $("timingKpis"),
     benchmark: $("timingBenchmark"),
     chart: $("timingChart"),
+    chartTooltip: $("timingChartTooltip"),
     chartAxis: $("timingChartAxis"),
     chartRange: $("timingChartRange"),
     comparison: $("timingComparison"),
@@ -31,6 +32,7 @@
     pitPanel: $("timingPitPanel"),
     pitMeta: $("timingPitMeta"),
     pitChart: $("timingPitChart"),
+    pitTooltip: $("timingPitTooltip"),
     pitAxis: $("timingPitAxis"),
     pitDescription: $("timingPitDescription"),
     lapPanel: $("timingLapPanel"),
@@ -83,12 +85,17 @@
     chartBaseKey: "",
     chartGeometry: null,
     selectedLapPoint: null,
+    hoveredLapPoint: null,
+    hoveredTimelineAtUs: null,
+    chartTooltipAnchor: null,
     pitBase: null,
     pitBaseKey: "",
     pitVisual: null,
     pitVisualKey: "",
     pitGeometry: null,
     pitLastPlayheadX: null,
+    hoveredPit: null,
+    pitTooltipAnchor: null,
     lapBase: null,
     lapBaseKey: "",
     lapGeometry: null,
@@ -320,9 +327,12 @@
     element.dataset.axisLabel = axis.sourceAvailable ? "Время табло" : "Время записи";
     element.dataset.lapLabel = lapTicks.length ? "Пройдено кругов" : "";
     element.classList.toggle("has-lap-axis", lapTicks.length > 0);
+    var captureLapScope = archiveLapCountScope(historicalSnapshot(state.atUs)) === "capture_tracker";
     element.title = axis.sourceAvailable ?
-      "Верхняя шкала: время Time Service из потока табло. Нижняя: каждый круг BALCHUG Racing, подпись через пять кругов." :
-      "Верхняя шкала: время получения записи. Нижняя: каждый круг BALCHUG Racing, подпись через пять кругов.";
+      "Верхняя шкала: время Time Service из потока табло. Нижняя: " +
+        (captureLapScope ? "зафиксированные круги с начала сохранённой записи" : "круги источника") + ", подпись через пять кругов." :
+      "Верхняя шкала: время получения записи. Нижняя: " +
+        (captureLapScope ? "зафиксированные круги с начала сохранённой записи" : "круги источника") + ", подпись через пять кругов.";
     element.style.setProperty("--axis-left", Math.round(geometry.left) + "px");
     element.style.setProperty("--axis-right", Math.round(geometry.right) + "px");
     element.replaceChildren();
@@ -343,7 +353,7 @@
         var marker = document.createElement("span");
         marker.className = "ta-stream-lap-tick" + (tick.major ? " major" : "");
         marker.style.left = (tick.ratio * 100) + "%";
-        marker.title = "Круг #" + tick.lapNumber;
+        marker.title = (captureLapScope ? "Зафиксированный круг #" : "Круг #") + tick.lapNumber;
         if (tick.label) {
           var label = document.createElement("b");
           label.textContent = tick.label;
@@ -804,12 +814,17 @@
     state.chartBaseKey = "";
     state.chartGeometry = null;
     state.selectedLapPoint = null;
+    state.hoveredLapPoint = null;
+    state.hoveredTimelineAtUs = null;
+    state.chartTooltipAnchor = null;
     state.pitBase = null;
     state.pitBaseKey = "";
     state.pitVisual = null;
     state.pitVisualKey = "";
     state.pitGeometry = null;
     state.pitLastPlayheadX = null;
+    state.hoveredPit = null;
+    state.pitTooltipAnchor = null;
     state.lapBase = null;
     state.lapBaseKey = "";
     state.lapGeometry = null;
@@ -835,6 +850,8 @@
     elements.pitAxis.hidden = true;
     elements.lapAxis.hidden = true;
     elements.lapReadout.hidden = true;
+    hideArchiveTooltip(elements.chartTooltip);
+    hideArchiveTooltip(elements.pitTooltip);
     renderComparisonLoading();
     controlsDisabled(true);
     setEmpty("Загрузка телеметрической сессии…");
@@ -933,6 +950,10 @@
       if (typeof effectiveAtUs !== "number" || !response.snapshot) return;
       cacheExactSnapshot(response.snapshot, effectiveAtUs);
       renderConfirmedSnapshot();
+      // Exact archive snapshots retain detailed class source facts that are
+      // deliberately omitted from the bounded manifest. Refresh the tooltip
+      // so an inspected point can use the most precise stored gap context.
+      if (state.chartGeometry) updateRawLapTooltip(state.chartGeometry);
     }).catch(function (error) {
       if (error && error.name === "AbortError") return;
     }).then(function () {
@@ -1097,6 +1118,18 @@
     var flag = asObject(measured.track_flag);
     var flagValue = flag.flag || session.track_flag;
     var normalizedFlag = valueOrDash(flagValue);
+    var lapCountScope = archiveLapCountScope(snapshot);
+    var visibleLaps = firstDefined(session.completed_laps, oursState.laps);
+    var visibleTyreAge = firstDefined(session.tyre_age_laps, oursState.tyre_age_laps);
+    var currentStint = numericValue(session.stint_number);
+    var lapsValue = visibleLaps;
+    if (lapCountScope === "capture_tracker" && numericValue(visibleLaps) !== null) {
+      lapsValue = formatLapCount(numericValue(visibleLaps)) + " с начала записи";
+    }
+    var tyresValue = formatLapCount(visibleTyreAge);
+    if (lapCountScope === "capture_tracker" && currentStint === 1 && numericValue(visibleTyreAge) !== null) {
+      tyresValue = "не менее " + tyresValue;
+    }
     var flagChanged = state.flagValue !== null && state.flagValue !== normalizedFlag;
     elements.flag.className = "ta-flag " + flagClass(flagValue);
     elements.flag.querySelector("strong").textContent = flagLabel(flagValue);
@@ -1106,20 +1139,20 @@
 
     var values = [
       { id: "pos", label: "POS", value: session.position_overall !== null && session.position_overall !== undefined ? "P" + session.position_overall : oursState.position_overall !== null && oursState.position_overall !== undefined ? "P" + oursState.position_overall : "—" },
-      { id: "class_leader_gap", label: "До лидера класса", value: formatGap(session.gap_to_class_leader_ms) },
-      { id: "laps", label: "Круги", value: firstDefined(session.completed_laps, oursState.laps) },
+      { id: "class_leader_gap", label: "До лидера класса", value: formatArchiveRelationDistance(effectiveAtUs, snapshot, "class_leader") },
+      { id: "laps", label: lapCountScope === "capture_tracker" ? "Круги в записи" : "Круги", value: lapsValue },
       { id: "state", label: "Состояние", value: firstDefined(session.current_state, oursState.state_kind, oursState.state) },
-      { id: "last", label: "Последний круг", value: formatLap(firstDefined(session.last_lap_ms, oursState.last_lap_ms)) },
+      { id: "last", label: "Последний по табло", value: formatLap(firstDefined(session.last_lap_ms, oursState.last_lap_ms)) },
       { id: "last_to_best", label: "К лучшему кругу", value: formatGap(
         numericValue(firstDefined(session.last_lap_ms, oursState.last_lap_ms)) !== null &&
         numericValue(firstDefined(session.best_lap_ms, oursState.best_lap_ms)) !== null ?
           numericValue(firstDefined(session.last_lap_ms, oursState.last_lap_ms)) - numericValue(firstDefined(session.best_lap_ms, oursState.best_lap_ms)) : null
       ) },
-      { id: "ahead", label: "До соперника впереди", value: formatGap(session.gap_to_ahead_ms) },
-      { id: "behind", label: "До соперника сзади", value: formatGap(session.gap_to_behind_ms) },
-      { id: "tyres", label: "Возраст шин", value: formatLapCount(firstDefined(session.tyre_age_laps, oursState.tyre_age_laps)) },
-      { id: "pits", label: "Пит-стопы", value: firstDefined(session.pits_completed, oursState.provider_pit_count) },
-      { id: "best", label: "Лучший круг", value: formatLap(firstDefined(session.best_lap_ms, oursState.best_lap_ms)) },
+      { id: "ahead", label: "До соперника впереди", value: formatArchiveRelationDistance(effectiveAtUs, snapshot, "class_ahead") },
+      { id: "behind", label: "До соперника сзади", value: formatBehindDistance(effectiveAtUs, snapshot) },
+      { id: "tyres", label: "Возраст шин", value: tyresValue },
+      { id: "pits", label: lapCountScope === "capture_tracker" ? "Питы в записи" : "Пит-стопы", value: firstDefined(session.pits_completed, oursState.provider_pit_count) },
+      { id: "best", label: "Лучший по табло", value: formatLap(firstDefined(session.best_lap_ms, oursState.best_lap_ms)) },
       { id: "driver", label: "Пилот", value: firstDefined(oursState.driver_name, ours.current_driver_name, session.ours_identity && session.ours_identity.driver_name) }
     ];
     var nextValues = Object.create(null);
@@ -1280,6 +1313,7 @@
     var usableWidth = Math.max(1, width - left - right);
     var total = Math.max(1, range.last_at_us - range.first_at_us);
     var xAt = function (atUs) { return left + (atUs - range.first_at_us) / total * usableWidth; };
+    var hitAreas = [];
     drawTimelineFlags(context, xAt, width, height, range, left, right);
     if (!visual.pits.length) {
       context.fillStyle = "#6E7E98";
@@ -1308,6 +1342,15 @@
         var x = xAt(start);
         var endX = xAt(Math.max(start, Math.min(range.last_at_us, end)));
         var barWidth = Math.max(3, endX - x);
+        hitAreas.push({
+          participant: participant,
+          pit: pit,
+          x: x,
+          y: top + 7,
+          width: barWidth,
+          height: 15,
+          atUs: start
+        });
         context.fillStyle = isOurs ? "#F0143D" : (selected ? "#007B91" : "#526276");
         context.globalAlpha = pit.completed ? 0.88 : 0.48;
         context.fillRect(x, top + 7, barWidth, 15);
@@ -1325,12 +1368,54 @@
         }
       });
     });
-    return { left: left, right: right, range: range, width: width };
+    return { left: left, right: right, range: range, width: width, height: height, hitAreas: hitAreas };
   }
 
   function pitParticipantLabel(participant) {
     var number = participant.start_number ? "#" + participant.start_number + " " : "";
     return number + String(participant.team_name || "Машина");
+  }
+
+  function findPitHit(geometry, x, y) {
+    if (!geometry) return null;
+    var areas = geometry.hitAreas || [];
+    for (var index = areas.length - 1; index >= 0; index -= 1) {
+      var area = areas[index];
+      if (x >= area.x - 4 && x <= area.x + area.width + 4 && y >= area.y - 5 && y <= area.y + area.height + 5) return area;
+    }
+    return null;
+  }
+
+  function pitTooltipAnchor(hit) {
+    return hit ? { x: hit.x + Math.min(hit.width / 2, 14), y: hit.y + hit.height / 2 } : null;
+  }
+
+  function renderPitTooltip(hit, geometry) {
+    var tooltip = elements.pitTooltip;
+    if (!tooltip || !hit || !geometry) {
+      hideArchiveTooltip(tooltip);
+      return;
+    }
+    var participant = hit.participant || {};
+    var pit = hit.pit || {};
+    var clock = timelineClockAt(hit.atUs);
+    var color = participant.is_ours ? "#F0143D" : competitorColor(participant.participant_id);
+    var crew = (participant.start_number ? "#" + participant.start_number + " · " : "") + String(participant.team_name || "Машина");
+    var completed = pit.completed && numericValue(pit.pit_lane_ms) !== null;
+    tooltip.style.setProperty("--ta-tooltip-accent", color);
+    tooltip.replaceChildren();
+    appendTooltipText(tooltip, "ta-tooltip-kicker", clock.source ? "Время табло" : "Время записи");
+    appendTooltipText(tooltip, "ta-tooltip-time", formatAbsolute(clock.atUs));
+    appendTooltipText(tooltip, "ta-tooltip-primary", completed ? formatLap(pit.pit_lane_ms) : "Пит-стоп не завершён");
+    appendTooltipText(tooltip, "ta-tooltip-detail", "Пит-стоп #" + valueOrDash(pit.stop_number) + " · " + crew);
+    var context = pit.carried_into_range ? "Начался до сохранённого интервала" :
+      (completed ? "Полное время в пит-лейне" : "Въезд в пит-лейн");
+    appendTooltipText(tooltip, "ta-tooltip-context", context);
+    positionArchiveTooltip(tooltip, elements.pitChart, state.pitTooltipAnchor || pitTooltipAnchor(hit));
+  }
+
+  function updatePitTooltip(geometry) {
+    renderPitTooltip(state.hoveredPit, geometry);
   }
 
   function renderPitSummary(visual) {
@@ -1361,6 +1446,9 @@
       elements.pitMeta.textContent = "";
       elements.pitDescription.textContent = "";
       elements.pitAxis.hidden = true;
+      state.hoveredPit = null;
+      state.pitTooltipAnchor = null;
+      hideArchiveTooltip(elements.pitTooltip);
       state.pitBase = null;
       state.pitBaseKey = "";
       return;
@@ -1382,6 +1470,7 @@
     }
     var geometry = state.pitGeometry;
     renderTimelineAxis(elements.pitAxis, geometry, data.lap_series && (data.lap_series.ours_raw || data.lap_series.ours));
+    updatePitTooltip(geometry);
     var total = Math.max(1, geometry.range.last_at_us - geometry.range.first_at_us);
     var playhead = geometry.left + (state.atUs - geometry.range.first_at_us) / total * Math.max(1, surface.width - geometry.left - geometry.right);
     var playheadPixel = Math.round(playhead);
@@ -1530,6 +1619,237 @@
     return (geometry.allPoints || []).find(function (candidate) { return rawPointKey(candidate) === key; }) || null;
   }
 
+  function findNearestRawLapPoint(geometry, x, y, maximumDistance) {
+    if (!geometry || !geometry.domain) return null;
+    var nearest = null;
+    (geometry.allPoints || []).forEach(function (point) {
+      var pointX = geometry.xAt(point.atUs);
+      var pointY = rawPointY(geometry, point);
+      if (pointY === null) return;
+      var distance = Math.hypot(pointX - x, pointY - y);
+      if (distance > maximumDistance) return;
+      // BALCHUG is drawn last, so it remains the intentional tie-breaker
+      // when two recorded facts occupy the same visible coordinate.
+      if (!nearest || distance < nearest.distance ||
+          (distance === nearest.distance && point.isOurs && !nearest.point.isOurs)) {
+        nearest = { point: point, distance: distance };
+      }
+    });
+    return nearest;
+  }
+
+  function hideArchiveTooltip(element) {
+    if (!element) return;
+    element.hidden = true;
+  }
+
+  function appendTooltipText(parent, className, text) {
+    var node = document.createElement("span");
+    node.className = className;
+    node.textContent = text;
+    parent.appendChild(node);
+    return node;
+  }
+
+  function positionArchiveTooltip(element, canvas, anchor) {
+    if (!element || !canvas || !anchor) return;
+    var parent = element.parentElement;
+    if (!parent) return;
+    var parentRect = parent.getBoundingClientRect();
+    var canvasRect = canvas.getBoundingClientRect();
+    element.hidden = false;
+    element.style.left = "8px";
+    element.style.top = "8px";
+    var width = element.offsetWidth;
+    var height = element.offsetHeight;
+    var pointLeft = canvasRect.left - parentRect.left + anchor.x;
+    var pointTop = canvasRect.top - parentRect.top + anchor.y;
+    var left = pointLeft + 14;
+    if (left + width > parentRect.width - 8) left = pointLeft - width - 14;
+    left = Math.max(8, Math.min(parentRect.width - width - 8, left));
+    var top = pointTop - height - 12;
+    if (top < 8) top = pointTop + 14;
+    top = Math.max(8, Math.min(parentRect.height - height - 8, top));
+    element.style.left = Math.round(left + parent.scrollLeft) + "px";
+    element.style.top = Math.round(top + parent.scrollTop) + "px";
+  }
+
+  function historicalSnapshot(atUs) {
+    var exact = exactSnapshotAt(atUs);
+    var frame = keyframeAt(atUs);
+    // The manifest may have advanced farther than a cached exact seek. Keep
+    // tooltips on the newest durable state at or before the cursor.
+    if (exact && (!frame || exact.effectiveAtUs >= frame.observed_at_us)) return asObject(exact.payload);
+    return asObject(frame && frame.snapshot);
+  }
+
+  function archiveLapCountScope(snapshot) {
+    var payload = asObject(snapshot);
+    var derived = asObject(payload.archive_intervals);
+    if (derived.lap_count_scope === "source_grid" || derived.lap_count_scope === "capture_tracker") {
+      return derived.lap_count_scope;
+    }
+    var measured = asObject(payload.measured);
+    var ours = asObject(measured.ours);
+    var sourceLaps = numericValue(asObject(ours.state).laps);
+    return sourceLaps === null ? "capture_tracker" : "source_grid";
+  }
+
+  function archiveLapCaption(lapNumber, atUs) {
+    var scope = archiveLapCountScope(historicalSnapshot(atUs || state.atUs));
+    return (scope === "capture_tracker" ? "Зафиксированный круг #" : "Круг #") + valueOrDash(lapNumber);
+  }
+
+  function archiveSourceTime(entry, field) {
+    var item = asObject(entry);
+    var computed = asObject(item.computed);
+    var measured = asObject(item.measured);
+    var measuredState = asObject(measured.state);
+    var measuredValue = numericValue(measuredState[field + "_ms"]);
+    var measuredKind = measuredState[field + "_kind"];
+    if (measuredValue !== null && measuredKind === "TIME") return measuredValue;
+    return numericValue(computed["source_" + field + "_ms"]);
+  }
+
+  function archiveExplicitLaps(entry) {
+    var state = asObject(asObject(entry).measured).state;
+    var laps = numericValue(asObject(state).laps);
+    return laps !== null && laps >= 0 ? laps : null;
+  }
+
+  function archiveSourceRelationGap(snapshot, relation) {
+    var payload = asObject(snapshot);
+    var session = asObject(asObject(payload.computed).session);
+    var targetId = session[relation + "_id"];
+    var oursId = session.ours_participant_id;
+    var participants = Array.isArray(payload.class_participants) ? payload.class_participants : [];
+    if (!targetId || !oursId || !participants.length) return null;
+    var ours = null;
+    var target = null;
+    participants.forEach(function (entry) {
+      var item = asObject(entry);
+      var computed = asObject(item.computed);
+      var measured = asObject(item.measured);
+      var id = computed.participant_id || measured.participant_id;
+      if (id === oursId) ours = item;
+      if (id === targetId) target = item;
+    });
+    if (!ours || !target) return null;
+    if (oursId === targetId) return 0;
+    var oursLaps = archiveExplicitLaps(ours);
+    var targetLaps = archiveExplicitLaps(target);
+    if (oursLaps !== null && targetLaps !== null && oursLaps !== targetLaps) return null;
+    var oursComputed = asObject(ours.computed);
+    var targetComputed = asObject(target.computed);
+    var oursGap = archiveSourceTime(ours, "gap");
+    var targetGap = archiveSourceTime(target, "gap");
+    if (oursGap !== null && targetGap !== null) return Math.abs(oursGap - targetGap);
+    var oursPos = numericValue(oursComputed.position_overall);
+    var targetPos = numericValue(targetComputed.position_overall);
+    if (oursPos === 1 && targetGap !== null) return targetGap;
+    if (targetPos === 1 && oursGap !== null) return oursGap;
+    // DIFF is source-provided only for absolute neighbours.  It is safe only
+    // in that exact relationship and is never synthesized from lap times.
+    if (oursPos !== null && targetPos === oursPos - 1) return archiveSourceTime(ours, "diff");
+    if (oursPos !== null && targetPos === oursPos + 1) return archiveSourceTime(target, "diff");
+    return null;
+  }
+
+  function archiveIntervalKeys(relation) {
+    if (relation === "class_leader") return { gap: "gap_to_class_leader_ms", lap: "lap_delta_to_class_leader" };
+    if (relation === "class_ahead") return { gap: "gap_to_ahead_ms", lap: "lap_delta_to_ahead" };
+    return { gap: "gap_to_behind_ms", lap: "lap_delta_to_behind" };
+  }
+
+  function formatArchiveRelationDistance(atUs, snapshot, relation) {
+    var payload = snapshot || historicalSnapshot(atUs);
+    var session = asObject(asObject(payload.computed).session);
+    var keys = archiveIntervalKeys(relation);
+    var archiveIntervals = payload.archive_intervals;
+    var hasArchiveIntervals = archiveIntervals && typeof archiveIntervals === "object" && !Array.isArray(archiveIntervals);
+    if (hasArchiveIntervals) {
+      var derivedGap = numericValue(archiveIntervals[keys.gap]);
+      return derivedGap === null ? "—" : formatGap(derivedGap);
+    }
+    var gap = archiveSourceRelationGap(payload, relation);
+    if (gap === null) gap = numericValue(session[keys.gap]);
+    if (gap !== null) return formatGap(gap);
+    return "—";
+  }
+
+  function formatBehindDistance(atUs, snapshot) {
+    return formatArchiveRelationDistance(atUs, snapshot, "class_behind");
+  }
+
+  function rawLapTooltipAnchor(point, geometry) {
+    return point && geometry ? { x: geometry.xAt(point.atUs), y: rawPointY(geometry, point) } : null;
+  }
+
+  function chartTimeAt(geometry, x) {
+    if (!geometry || !geometry.range) return null;
+    var usableWidth = Math.max(1, geometry.width - geometry.left - geometry.right);
+    var ratio = Math.max(0, Math.min(1, (x - geometry.left) / usableWidth));
+    return Math.round(geometry.range.first_at_us + ratio * (geometry.range.last_at_us - geometry.range.first_at_us));
+  }
+
+  function renderRawLapTooltip(point, geometry) {
+    var tooltip = elements.chartTooltip;
+    if (!tooltip || !point || !geometry) {
+      hideArchiveTooltip(tooltip);
+      return;
+    }
+    var clock = timelineClockAt(point.atUs);
+    var color = point.isOurs ? "#F0143D" : competitorColor(point.participantId);
+    var team = point.isOurs ? "BALCHUG Racing" : (point.teamName || "Соперник");
+    var crew = (point.startNumber ? "#" + point.startNumber + " · " : "") + team;
+    var gapText = formatBehindDistance(point.atUs);
+    tooltip.style.setProperty("--ta-tooltip-accent", color);
+    tooltip.replaceChildren();
+    appendTooltipText(tooltip, "ta-tooltip-kicker", clock.source ? "Время табло" : "Время записи");
+    appendTooltipText(tooltip, "ta-tooltip-time", formatAbsolute(clock.atUs));
+    appendTooltipText(tooltip, "ta-tooltip-primary", point.value === null ? "Время не передано" : formatLap(point.value));
+    appendTooltipText(tooltip, "ta-tooltip-detail", archiveLapCaption(point.lapNumber, point.atUs) + " · " + crew);
+    appendTooltipText(tooltip, "ta-tooltip-context", rawLapStatus(point));
+    var gap = appendTooltipText(tooltip, "ta-tooltip-gap", "До соперника сзади BALCHUG Racing");
+    var gapValue = document.createElement("b");
+    gapValue.textContent = gapText;
+    gap.appendChild(gapValue);
+    var anchor = state.chartTooltipAnchor || rawLapTooltipAnchor(point, geometry);
+    positionArchiveTooltip(tooltip, elements.chart, anchor);
+  }
+
+  function renderTimelineTooltip(atUs, geometry) {
+    var tooltip = elements.chartTooltip;
+    if (!tooltip || atUs === null || !geometry) {
+      hideArchiveTooltip(tooltip);
+      return;
+    }
+    var clock = timelineClockAt(atUs);
+    var snapshot = historicalSnapshot(atUs);
+    var ownPoint = latestLapPoint(geometry.own, atUs);
+    var lapLabel = ownPoint && ownPoint.lapNumber !== null
+      ? archiveLapCaption(ownPoint.lapNumber, ownPoint.atUs)
+      : "Зафиксированный круг не передан";
+    tooltip.style.setProperty("--ta-tooltip-accent", "#1B365D");
+    tooltip.replaceChildren();
+    appendTooltipText(tooltip, "ta-tooltip-kicker", clock.source ? "Срез · время табло" : "Срез · время записи");
+    appendTooltipText(tooltip, "ta-tooltip-time", formatAbsolute(clock.atUs));
+    appendTooltipText(tooltip, "ta-tooltip-primary", formatBehindDistance(atUs));
+    appendTooltipText(tooltip, "ta-tooltip-detail", "До соперника сзади BALCHUG Racing · " + lapLabel);
+    appendTooltipText(tooltip, "ta-tooltip-context", "Наведите на точку, чтобы увидеть точное время круга");
+    positionArchiveTooltip(tooltip, elements.chart, state.chartTooltipAnchor || { x: geometry.xAt(atUs), y: geometry.top + 8 });
+  }
+
+  function updateRawLapTooltip(geometry) {
+    var point = rawPointFromGeometry(geometry, state.hoveredLapPoint) ||
+      (state.hoveredTimelineAtUs === null ? rawPointFromGeometry(geometry, state.selectedLapPoint) : null);
+    if (point) {
+      renderRawLapTooltip(point, geometry);
+      return;
+    }
+    renderTimelineTooltip(state.hoveredTimelineAtUs, geometry);
+  }
+
   function lapMomentLabel(point) {
     if (!point) return "";
     var moment = timelineClockAt(point.atUs);
@@ -1559,7 +1879,7 @@
     var competitor = selected && !selected.isOurs ? selected : latestLapPoint(competitorPoints, state.atUs);
     function pointValue(point) {
       if (!point) return "Нет круга";
-      return "Круг #" + valueOrDash(point.lapNumber) + " · " + (point.value === null ? "время не передано" : formatLap(point.value));
+      return archiveLapCaption(point.lapNumber, point.atUs) + " · " + (point.value === null ? "время не передано" : formatLap(point.value));
     }
     function pointDetail(point) {
       return point ? lapMomentLabel(point) + " · " + rawLapStatus(point) : "до курсора";
@@ -2062,16 +2382,6 @@
     context.fillStyle = "#fff";
     context.lineWidth = 2.2;
     context.beginPath(); context.arc(x, y, 5, 0, Math.PI * 2); context.fill(); context.stroke();
-    var prefix = (point.startNumber ? "#" + point.startNumber + " " : "") + "круг #" + valueOrDash(point.lapNumber) + " ";
-    var label = prefix + (point.value === null ? "без времени" : formatLap(point.value));
-    context.font = "10px Arial";
-    var labelWidth = Math.ceil(context.measureText(label).width) + 8;
-    var labelX = Math.max(geometry.left, Math.min(geometry.width - geometry.right - labelWidth, x + 8));
-    var labelY = Math.max(13, Math.min(geometry.height - 7, y - 8));
-    context.fillStyle = "rgba(5,8,13,.88)";
-    context.fillRect(labelX - 3, labelY - 10, labelWidth, 14);
-    context.fillStyle = "#fff";
-    context.fillText(label, labelX + 1, labelY);
     context.restore();
   }
 
@@ -2128,9 +2438,13 @@
     context.setLineDash([]);
     if (comparisonData && geometry) {
       renderLapReadout(comparisonData, geometry);
-      drawSelectedRawPoint(context, rawPointFromGeometry(geometry, state.selectedLapPoint), geometry);
+      var activePoint = rawPointFromGeometry(geometry, state.hoveredLapPoint) ||
+        (state.hoveredTimelineAtUs === null ? rawPointFromGeometry(geometry, state.selectedLapPoint) : null);
+      drawSelectedRawPoint(context, activePoint, geometry);
+      updateRawLapTooltip(geometry);
     } else {
       elements.lapReadout.hidden = true;
+      hideArchiveTooltip(elements.chartTooltip);
     }
     var chartRangeText = formatElapsed((state.atUs - range.first_at_us) / 1000000) + " / " + formatElapsed((range.last_at_us - range.first_at_us) / 1000000);
     if (chartRangeText !== state.chartRangeText) {
@@ -2170,7 +2484,7 @@
         id: "lap:" + lap.completed_at_us + ":" + lap.lap_number + ":" + index,
         kind: "lap",
         atUs: lap.completed_at_us,
-        title: "Круг " + lap.lap_number,
+        title: archiveLapCaption(lap.lap_number, lap.completed_at_us),
         detail: formatLap(lap.duration_ms)
       });
     });
@@ -2317,6 +2631,12 @@
   function closeTimingModal() {
     if (!state.modalOpen) return;
     stopPlayback();
+    state.hoveredLapPoint = null;
+    state.chartTooltipAnchor = null;
+    state.hoveredPit = null;
+    state.pitTooltipAnchor = null;
+    hideArchiveTooltip(elements.chartTooltip);
+    hideArchiveTooltip(elements.pitTooltip);
     state.modalOpen = false;
     elements.modal.classList.remove("open");
     elements.modal.setAttribute("aria-hidden", "true");
@@ -2367,31 +2687,74 @@
     stopPlayback(); setAt(state.manifest.range.first_at_us + seconds * 1000000, true);
   });
   elements.time.addEventListener("keydown", function (event) { if (event.key === "Enter") elements.time.blur(); });
+  elements.chart.addEventListener("pointermove", function (event) {
+    var geometry = state.chartGeometry;
+    if (!state.manifest || !geometry || !geometry.domain) return;
+    var rect = elements.chart.getBoundingClientRect();
+    var x = event.clientX - rect.left;
+    var y = event.clientY - rect.top;
+    var nearest = findNearestRawLapPoint(geometry, x, y, 20);
+    var previousKey = rawPointKey(state.hoveredLapPoint);
+    state.hoveredLapPoint = nearest ? nearest.point : null;
+    state.hoveredTimelineAtUs = nearest ? null : chartTimeAt(geometry, x);
+    state.chartTooltipAnchor = { x: x, y: y };
+    if (previousKey !== rawPointKey(state.hoveredLapPoint)) drawChart();
+    else updateRawLapTooltip(geometry);
+  });
+  elements.chart.addEventListener("pointerleave", function () {
+    if (!state.chartGeometry) return;
+    state.hoveredLapPoint = null;
+    state.hoveredTimelineAtUs = null;
+    state.chartTooltipAnchor = null;
+    drawChart();
+  });
   elements.chart.addEventListener("click", function (event) {
     if (!state.manifest) return;
     var rect = elements.chart.getBoundingClientRect();
     var geometry = state.chartGeometry;
     var x = event.clientX - rect.left;
     var y = event.clientY - rect.top;
-    var nearest = null;
-    if (geometry && geometry.domain) {
-      (geometry.allPoints || []).forEach(function (point) {
-        var pointX = geometry.xAt(point.atUs);
-        var pointY = rawPointY(geometry, point);
-        if (pointY === null) return;
-        var distance = Math.hypot(pointX - x, pointY - y);
-        if (distance <= 18 && (!nearest || distance < nearest.distance)) nearest = { point: point, distance: distance };
-      });
-    }
+    var nearest = findNearestRawLapPoint(geometry, x, y, 20);
     stopPlayback();
     if (nearest) {
       state.selectedLapPoint = nearest.point;
+      state.hoveredLapPoint = nearest.point;
+      state.hoveredTimelineAtUs = null;
+      state.chartTooltipAnchor = { x: x, y: y };
       setAt(nearest.point.atUs, true);
       return;
     }
     state.selectedLapPoint = null;
-    var ratio = Math.max(0, Math.min(1, (x - 42) / Math.max(1, rect.width - 52)));
-    setAt(state.manifest.range.first_at_us + ratio * (state.manifest.range.last_at_us - state.manifest.range.first_at_us), true);
+    state.hoveredLapPoint = null;
+    state.hoveredTimelineAtUs = chartTimeAt(geometry, x);
+    state.chartTooltipAnchor = { x: x, y: y };
+    setAt(state.hoveredTimelineAtUs, true);
+  });
+  elements.pitChart.addEventListener("pointermove", function (event) {
+    var geometry = state.pitGeometry;
+    if (!geometry) return;
+    var rect = elements.pitChart.getBoundingClientRect();
+    var hit = findPitHit(geometry, event.clientX - rect.left, event.clientY - rect.top);
+    state.hoveredPit = hit;
+    state.pitTooltipAnchor = hit ? { x: event.clientX - rect.left, y: event.clientY - rect.top } : null;
+    updatePitTooltip(geometry);
+  });
+  elements.pitChart.addEventListener("pointerleave", function () {
+    state.hoveredPit = null;
+    state.pitTooltipAnchor = null;
+    hideArchiveTooltip(elements.pitTooltip);
+  });
+  elements.pitChart.addEventListener("click", function (event) {
+    var geometry = state.pitGeometry;
+    if (!geometry) return;
+    var rect = elements.pitChart.getBoundingClientRect();
+    var hit = findPitHit(geometry, event.clientX - rect.left, event.clientY - rect.top);
+    if (!hit) return;
+    stopPlayback();
+    state.hoveredPit = hit;
+    state.pitTooltipAnchor = { x: event.clientX - rect.left, y: event.clientY - rect.top };
+    setAt(hit.atUs, true);
+    updatePitTooltip(geometry);
   });
   elements.lapChart.addEventListener("click", function (event) {
     if (!state.manifest || !state.lapGeometry) return;
