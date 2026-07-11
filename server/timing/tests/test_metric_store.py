@@ -739,11 +739,11 @@ class MetricStoreTests(unittest.TestCase):
             [raw_ids[0], raw_ids[1]],
         )
 
-    def test_no_laps_stint_age_counts_confirmed_last_cells_once(self):
+    def test_no_laps_stint_age_uses_tracker_count_and_ignores_confirmed_last_cells(self):
         raw_ids = self._seed_no_laps_last_history()
-        # This fixture's final r_c is otherwise an ambiguous equal value. Make
-        # it an already-classified direct source event to isolate the metric
-        # store contract: it must count the ledger fact, not the tracker row.
+        # Make another LAST cell timing-eligible. Even a confirmed duration is
+        # not a physical lap boundary and must not change the Tracker-derived
+        # tyre age stored on the stint.
         self.connection.execute(
             """
             UPDATE result_last_cell_ledger
@@ -764,8 +764,8 @@ class MetricStoreTests(unittest.TestCase):
 
         ours = load_heat_metric_input(self.connection, self.source_heat_id).our_participant
         active = ours.active_tire_stint
-        self.assertEqual(active.lap_count_basis, "CAPTURE_LAST")
-        self.assertEqual(active.completed_laps, 1)
+        self.assertEqual(active.lap_count_basis, "TRACKER")
+        self.assertEqual(active.completed_laps, 7)
 
     def test_overlapping_non_green_flag_rejects_raw_last_clean_classification(self):
         self.assertFalse(

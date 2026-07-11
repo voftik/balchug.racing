@@ -659,16 +659,6 @@ def _slow_lap_events(
 def _stint_age_duration_points_from_samples(
     samples: Sequence[LapSample], stint: TireStintInput
 ) -> tuple[tuple[int, int], ...]:
-    if stint.lap_count_basis == "CAPTURE_LAST":
-        # The source layout has no official LAPS column. `capture_sequence`
-        # comes from the confirmed LAST-cell ledger, so enumerate the whole
-        # stint stream before filtering clean samples: a caution or pit lap
-        # still ages the tyres even though it cannot inform pace.
-        return tuple(
-            (age, lap.duration_ms)
-            for age, lap in enumerate(samples, start=1)
-            if is_clean_lap(lap) and lap.duration_ms is not None
-        )
     if stint.started_lap is None:
         return ()
     result: list[tuple[int, int]] = []

@@ -237,9 +237,8 @@ class TireStintInput:
     completed_laps: int
     source_message_id: int | None
     source_key: str
-    # ``CAPTURE_LAST`` counts confirmed source LAST facts inside this stint
-    # when the current table has no official LAPS column. It is intentionally
-    # local to the capture and is never promoted to an official total.
+    # ``SOURCE_GRID`` uses the provider LAPS counter. ``TRACKER`` uses only
+    # physical finish boundaries. LAST observations never age a tyre stint.
     lap_count_basis: str = "SOURCE_GRID"
 
 
@@ -1650,50 +1649,19 @@ def load_heat_metric_input(
         stints_by_participant: dict[str, list[TireStintInput]] = defaultdict(list)
         for row in stint_rows:
             participant_id = row["participant_id"]
-            started_at_us = int(row["started_at_us"])
             ended_at_us = _int(row["ended_at_us"])
-            capture_events = raw_laps_by_participant.get(participant_id, ())
-            capture_lap_count = sum(
-                1
-                for lap in capture_events
-                if lap.capture_at_us is not None
-                and lap.capture_at_us >= started_at_us
-                and (ended_at_us is None or lap.capture_at_us < ended_at_us)
-            )
-            capture_basis = not source_grid_laps.get(participant_id, False) and bool(capture_events)
-            checkpoint_values = checkpoint.values_by_participant.get(participant_id) if checkpoint_usable and checkpoint else None
-            boundary_participant = checkpoint_participants.get(participant_id)
-            same_active_checkpoint = (
-                ended_at_us is None
-                and isinstance(boundary_participant, Mapping)
-                and isinstance(boundary_participant.get("active_stint"), list)
-                and boundary_participant["active_stint"][:2] == [int(row["stint_number"]), started_at_us]
-            )
-            if capture_basis and same_active_checkpoint and checkpoint_values is not None and checkpoint is not None:
-                previous_age = checkpoint_values.get("tyre_age_laps")
-                new_capture_count = sum(
-                    1
-                    for lap in capture_events
-                    if lap.source_frame_id is not None
-                    and lap.source_frame_id > checkpoint.source_frame_id
-                    and lap.capture_at_us is not None
-                    and lap.capture_at_us >= started_at_us
-                )
-                capture_lap_count = (previous_age if type(previous_age) is int else 0) + new_capture_count
             stints_by_participant[row["participant_id"]].append(
                 TireStintInput(
                     stint_number=int(row["stint_number"]),
-                    started_at_us=started_at_us,
+                    started_at_us=int(row["started_at_us"]),
                     ended_at_us=ended_at_us,
                     started_lap=_int(row["started_lap"]),
                     ended_lap=_int(row["ended_lap"]),
-                    completed_laps=capture_lap_count if capture_basis else int(row["completed_laps"]),
+                    completed_laps=int(row["completed_laps"]),
                     source_message_id=_int(row["source_message_id"]),
                     source_key=row["source_key"],
                     lap_count_basis=(
-                        "CAPTURE_LAST"
-                        if capture_basis
-                        else "SOURCE_GRID"
+                        "SOURCE_GRID"
                         if source_grid_laps.get(participant_id, False)
                         else "TRACKER"
                     ),

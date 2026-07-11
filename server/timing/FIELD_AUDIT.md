@@ -77,8 +77,8 @@ until their per-column semantics are decoded; they are not universally integers.
 timestamps. Every canonical `LAST` cell is written to the immutable
 `result_last_cell_ledger` with one of four statuses:
 
-- `CONFIRMED_LAP`: the only status admitted to pace, archive capture counters,
-  tactical alerts and capture-local tyre age;
+- `CONFIRMED_LAP`: the only status admitted to pace and lap-time tactical
+  alerts; it never increments a lap count or tyre age;
 - `REFRESH_REPEAT`: an unchanged value in a dense aggregate row block, not a
   new lap;
 - `UNCONFIRMED`: incomplete or ambiguous evidence, retained for audit only;
@@ -100,7 +100,8 @@ count. A capture that starts after green is explicitly partial: it exposes only
 an observed lower bound and never promotes its local ordinal to an official
 total. `LAST` supplies duration, `SECT 1/2/3` supply sector duration, and Tracker
 supplies exact raw provider start/end timestamps. None is substituted for
-another.
+another. In particular, neither a changed nor a confirmed `LAST` value advances
+the stint age; without a Tracker boundary that age remains unchanged.
 
 ### Canonical Tracker chronology
 
