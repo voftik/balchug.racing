@@ -294,8 +294,7 @@
     });
     entries.sort(function (left, right) { return left.atUs - right.atUs || left.lapNumber - right.lapNumber; });
     return entries.map(function (entry, index) {
-      var isEndpoint = index === 0 || index === entries.length - 1;
-      var major = isEndpoint || entry.lapNumber % 5 === 0;
+      var major = index === 0 || entry.lapNumber % 5 === 0;
       return {
         ratio: (entry.atUs - range.first_at_us) / Math.max(1, range.last_at_us - range.first_at_us),
         lapNumber: entry.lapNumber,
