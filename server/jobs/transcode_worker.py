@@ -22,6 +22,27 @@ VF = ("[0:v]split=2[v1][v2];"
       "[v2]scale=w=854:h=480:force_original_aspect_ratio=decrease:force_divisible_by=2[v2o]")
 
 
+class LiveBroadcastStarted(RuntimeError):
+    """A VOD encode was preempted so the live broadcast keeps priority."""
+
+
+def run_ffmpeg(cmd):
+    """Run one VOD encode, yielding its CPU as soon as a live stream appears."""
+    process = subprocess.Popen(cmd)
+    while process.poll() is None:
+        if live_active():
+            process.terminate()
+            try:
+                process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            raise LiveBroadcastStarted("live broadcast started; VOD encode deferred")
+        time.sleep(5)
+    if process.returncode:
+        raise subprocess.CalledProcessError(process.returncode, cmd)
+
+
 def transcode(video_key):
     item_id = C.make_id(video_key)
     s3 = C.s3()
@@ -58,7 +79,7 @@ def transcode(video_key):
             "-var_stream_map", "v:0,a:0 v:1,a:1",
             os.path.join(out, "v%v", "index.m3u8"),
         ]
-        subprocess.run(cmd, check=True)
+        run_ffmpeg(cmd)
 
         prefix = f"hls_vod/{item_id}"
         for root, _, files in os.walk(out):

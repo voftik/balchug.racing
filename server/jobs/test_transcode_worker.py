@@ -60,7 +60,7 @@ class TranscodeWorkerTests(unittest.TestCase):
                 mock.patch.object(self.worker.C, "s3", return_value=FakeS3()), \
                 mock.patch.object(self.worker.C, "db", return_value=FakeConnection()), \
                 mock.patch.object(self.worker.tempfile, "mkdtemp", return_value=temp_root), \
-                mock.patch.object(self.worker.subprocess, "run", side_effect=RuntimeError("broken input")) as run:
+                mock.patch.object(self.worker, "run_ffmpeg", side_effect=RuntimeError("broken input")) as run:
             with self.assertRaisesRegex(RuntimeError, "broken input"):
                 self.worker.transcode("stream_records/2026-07-11/live_140000/source.mp4")
 
@@ -68,6 +68,29 @@ class TranscodeWorkerTests(unittest.TestCase):
         self.assertIn("+genpts+discardcorrupt", command)
         self.assertIn("ignore_err", command)
         self.assertFalse(pathlib.Path(temp_root).exists())
+
+    def test_live_broadcast_preempts_vod_encode_and_keeps_error_visible(self):
+        class FakeProcess:
+            returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                self.terminated = True
+
+            def wait(self, timeout=None):
+                self.returncode = -15
+                return self.returncode
+
+        process = FakeProcess()
+        with mock.patch.object(self.worker.subprocess, "Popen", return_value=process), \
+                mock.patch.object(self.worker, "live_active", return_value=True), \
+                mock.patch.object(self.worker.time, "sleep"):
+            with self.assertRaisesRegex(self.worker.LiveBroadcastStarted, "deferred"):
+                self.worker.run_ffmpeg(["ffmpeg", "-i", "source"])
+
+        self.assertTrue(process.terminated)
 
 
 if __name__ == "__main__":
