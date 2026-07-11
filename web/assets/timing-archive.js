@@ -1971,6 +1971,33 @@
     context.restore();
   }
 
+  function drawRawLapSeries(context, points, geometry, color, isOurs) {
+    var previous = null;
+    context.save();
+    context.strokeStyle = color;
+    context.lineWidth = isOurs ? 2.25 : 1.65;
+    (points || []).forEach(function (point) {
+      if (point.value === null) {
+        previous = null;
+        return;
+      }
+      var followsPreviousLap = previous && previous.lapNumber !== null && point.lapNumber !== null &&
+        point.lapNumber === previous.lapNumber + 1;
+      if (previous && followsPreviousLap) {
+        var isRaceLine = previous.isClean && point.isClean;
+        context.setLineDash(isRaceLine ? [] : [5, 4]);
+        context.beginPath();
+        context.moveTo(geometry.xAt(previous.atUs), rawPointY(geometry, previous));
+        context.lineTo(geometry.xAt(point.atUs), rawPointY(geometry, point));
+        context.stroke();
+      }
+      previous = point;
+    });
+    context.setLineDash([]);
+    context.restore();
+    (points || []).forEach(function (point) { drawRawPoint(context, point, geometry, color); });
+  }
+
   function drawRawLapChartBase(context, data, width, height) {
     var range = state.manifest.range;
     var left = 42;
@@ -2020,20 +2047,14 @@
     context.fillText(formatLap(domain.max), width - right - 48, bottom);
     context.font = "8.5px Arial";
     context.fillText("x", 4, untimedY + 3);
-    context.fillStyle = "#6E7E98";
-    competitors.forEach(function (series) {
-      series.points.forEach(function (point) { drawRawPoint(context, point, {
-        left: left, right: right, width: width, top: top, bottom: bottom, untimedY: untimedY, xAt: xAt, yAt: yAt, domain: domain
-      }, series.color); });
-    });
-    own.forEach(function (point) { drawRawPoint(context, point, {
-      left: left, right: right, width: width, top: top, bottom: bottom, untimedY: untimedY, xAt: xAt, yAt: yAt, domain: domain
-    }, "#F0143D"); });
-    return {
+    var geometry = {
       left: left, right: right, range: range, width: width, height: height, top: top, bottom: bottom,
       untimedY: untimedY, xAt: xAt, yAt: yAt, domain: domain, own: own, competitors: competitors, allPoints: allPoints,
       pointY: function (point) { return rawPointY(this, point); }
     };
+    competitors.forEach(function (series) { drawRawLapSeries(context, series.points, geometry, series.color, false); });
+    drawRawLapSeries(context, own, geometry, "#F0143D", true);
+    return geometry;
   }
 
   function drawSelectedRawPoint(context, point, geometry) {
