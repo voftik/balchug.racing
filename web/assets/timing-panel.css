@@ -584,6 +584,42 @@ body.admin .boris-btn::after { content: " · вкл"; }
   white-space: nowrap;
 }
 
+.sector-comparison > .chart-legend {
+  padding: 0 12px 10px;
+}
+
+.sector-chart-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  border-top: 1px solid var(--line);
+  border-left: 1px solid var(--line);
+}
+
+.sector-chart-block {
+  min-width: 0;
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+  background: #fff;
+}
+
+.sector-chart-block[hidden] { display: none; }
+
+.sector-chart-block h4 {
+  min-height: 38px;
+  margin: 0;
+  padding: 11px 12px 8px;
+  color: var(--navy);
+  font-family: var(--display);
+  font-size: 12px;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.timing-chart.sector-chart {
+  height: 260px;
+  border-bottom: 0;
+}
+
 .uplot {
   font-family: var(--body);
 }
@@ -1252,6 +1288,7 @@ body.admin .boris-btn::after { content: " · вкл"; }
 @media (max-width: 1100px) {
   .decision-strip { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .metric-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .sector-chart-grid { grid-template-columns: minmax(0, 1fr); }
   .decision-item:nth-child(4n) { border-right: 0; }
   .decision-item:nth-child(-n+4) { border-bottom: 1px solid var(--line); }
 }
@@ -1284,6 +1321,7 @@ body.admin .boris-btn::after { content: " · вкл"; }
   .competitor-trigger { min-height: 44px; }
   .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .timing-chart { height: 280px; }
+  .timing-chart.sector-chart { height: 260px; }
   .competitor-popover { right: 8px; width: calc(100% - 16px); }
   .stint-timeline-axis-row,
   .stint-timeline-row { grid-template-columns: minmax(102px, 122px) minmax(0, 1fr); }

@@ -1643,6 +1643,18 @@ class TimingReadModelTests(unittest.TestCase):
             linked_lap_id="lap-12",
         )
         self._add_last_cell_ledger(sparse_cell, classification="CONFIRMED_LAP")
+        self.connection.execute(
+            """
+            UPDATE result_last_cell_ledger
+            SET sectors_json = ?, sectors_source_cell_observation_ids_json = ?
+            WHERE source_cell_observation_id = ?
+            """,
+            (
+                json.dumps({"sector_1": "34800000", "sector_2": None, "sector_3": "36500000"}),
+                json.dumps({"sector_1": 101, "sector_2": 102, "sector_3": 103}),
+                confirmed_cell,
+            ),
+        )
         self.connection.commit()
 
         dashboard = self.model.dashboard_history(
@@ -1654,10 +1666,20 @@ class TimingReadModelTests(unittest.TestCase):
         self.assertEqual([item["duration_ms"] for item in dashboard["lap_series"]["ours"]["points"]], [107_200, 106_900])
         self.assertEqual([item["capture_lap_index"] for item in dashboard["lap_series"]["ours"]["points"]], [1, 2])
         self.assertEqual([item["lap_number"] for item in dashboard["lap_series"]["ours"]["points"]], [12, None])
+        self.assertEqual(
+            dashboard["lap_series"]["ours"]["points"][0]["sectors"],
+            {
+                "sector_1": {"duration_ms": 34_800, "source_cell_observation_id": 101},
+                "sector_2": None,
+                "sector_3": {"duration_ms": 36_500, "source_cell_observation_id": 103},
+            },
+        )
+        self.assertIsNone(dashboard["lap_series"]["ours"]["points"][1]["sectors"])
         self.assertEqual(dashboard["participants"][0]["team_name"], "BALCHUG Racing")
         self.assertEqual(dashboard["pit_stops"][0]["pit_lane_ms"], 30_000)
         self.assertFalse(dashboard["lap_series"]["ours"]["truncated"])
         self.assertIn("time_axes", dashboard)
+        self.assertIn("missing sector values remain null", dashboard["semantics"]["lap_series_sectors"])
 
     def test_dashboard_interval_history_keeps_explicit_breaks_between_valid_segments(self):
         self.connection.execute(

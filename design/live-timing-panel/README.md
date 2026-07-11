@@ -102,6 +102,13 @@ no custom chart engine. Charts use Canvas, `spanGaps: false`, exact points plus
 readable lines, a shared cursor sync key, and at most BALCHUG plus three
 competitors. The tooltip shows lap, exact value and full team identity.
 
+When at least one immutable source-linked sector value exists, Pace adds three
+separate synchronized charts for `SECT 1`, `SECT 2` and `SECT 3`. They use the
+same scoreboard-time and BALCHUG-lap axes as the lap chart. Every line is one
+car's real per-lap sector duration; a missing sector remains an explicit null
+break and is never copied from another lap or reconstructed from Tracker time.
+The entire sector block stays absent until source sector data is available.
+
 ![Exact point tooltip](screenshots/chart-tooltip-1440x900.png)
 
 The API keeps each visible history at no more than 720 points. A local
@@ -109,12 +116,12 @@ The API keeps each visible history at no more than 720 points. A local
 
 | Measurement | Result |
 | --- | ---: |
-| 100 Overview -> Pace switches, p50 | 15.7 ms |
-| p95 | 17.3 ms |
-| maximum | 29.5 ms |
-| heap after idle GC | 4.6 MB |
-| retained chart roots/canvases | 1 / 1 |
-| canvas nonblank check | 32,598 opaque; 31,159 colored pixels |
+| 100 Overview -> Pace switches with four synchronized charts, p50 | 8.3 ms |
+| p95 | 10.3 ms |
+| maximum | 10.5 ms |
+| post-GC heap growth across those 100 switches | 0.08 MB |
+| retained chart roots/canvases | 4 / 4 |
+| four-viewport canvas nonblank check | 159,590-533,559 colored pixels |
 | 50 Overview -> Pace -> Pits cycles, p95 after timeline | 10.1 ms |
 | heap after timeline interaction sample | 5.9 MB |
 | 50 four-tab cycles on live-format 24 h fixture, p95 including four animation frames | 80.5 ms |
@@ -208,7 +215,7 @@ follow-up request.
 | ahead/behind | session metric IDs and `gap_to_ahead_ms/gap_to_behind_ms` |
 | comparison rows | participant metrics filtered to our class |
 | alerts/events | session `alerts`, stream flag/pit/lap/alert events |
-| charts | bounded `dashboard/history` lap, interval, flag, pit and source-time axes |
+| charts | bounded `dashboard/history` lap, source-linked sectors, interval, flag, pit and source-time axes |
 | stint timeline | `dashboard/history.pit_stops`, `flags`, participant `stint_summary/tyre_age_laps` |
 
 Lifecycle calls use the existing contract: create draft, then start; stop is an
