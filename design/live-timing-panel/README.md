@@ -115,9 +115,26 @@ The API keeps each visible history at no more than 720 points. A local
 | heap after idle GC | 4.6 MB |
 | retained chart roots/canvases | 1 / 1 |
 | canvas nonblank check | 32,598 opaque; 31,159 colored pixels |
+| 50 Overview -> Pace -> Pits cycles, p95 after timeline | 10.1 ms |
+| heap after timeline interaction sample | 5.9 MB |
 
 The implementation phase in #19 adds source-backed lap, interval, flag and pit
 markers without changing these layout or selection contracts.
+
+### Stint and pit timeline
+
+The Pits tab uses the same bounded dashboard-history range for BALCHUG and the
+selected competitors. Each row reconstructs on-track stints around confirmed
+pit-in/pit-out intervals; a completed stop starts the next tyre stint. The
+background shows source flag periods and the right-hand marker is the newest
+stored timing slice. A focusable segment tooltip exposes scoreboard time,
+stint/stop number, tyre age where calculated, entry/exit laps and measured
+pit-lane time. An open stop stays open to the latest slice and is never given a
+fabricated duration.
+
+This display is derived entirely from `dashboard/history.pit_stops`, `flags`
+and deterministic participant metrics. Changing the comparison selection only
+changes the displayed rows and never writes a tactical input.
 
 ## Responsive matrix
 
@@ -160,7 +177,8 @@ markers without changing these layout or selection contracts.
 | ahead/behind | session metric IDs and `gap_to_ahead_ms/gap_to_behind_ms` |
 | comparison rows | participant metrics filtered to our class |
 | alerts/events | session `alerts`, stream flag/pit/lap/alert events |
-| charts | bounded `metrics/history`, `laps`, `pit-stops` endpoints |
+| charts | bounded `dashboard/history` lap, interval, flag, pit and source-time axes |
+| stint timeline | `dashboard/history.pit_stops`, `flags`, participant `stint_summary/tyre_age_laps` |
 
 Lifecycle calls use the existing contract: create draft, then start; stop is an
 explicit separate action. Each write carries `Authorization: Bearer` and a
