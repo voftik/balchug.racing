@@ -472,6 +472,7 @@ class PitStop:
     exited_lap: int | None = None
     pit_lane_ms: int | None = None
     completed: bool | None = None
+    pit_lane_duration_source_kind: str | None = None
 
 
 def is_completed_pit_stop(stop: PitStop) -> bool:

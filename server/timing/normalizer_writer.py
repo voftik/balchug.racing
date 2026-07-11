@@ -27,6 +27,7 @@ from .normalization import (
     ConnectionClockCalibrator,
     CautionPeriod,
     FlagState,
+    OPEN_ENDED_TS_TIME,
     ResultState,
     StatisticsUpdate,
     canonical_flag,
@@ -68,6 +69,41 @@ class FrameMessage:
     @property
     def payload(self) -> Any:
         return self.args[0] if len(self.args) == 1 else list(self.args)
+
+
+@dataclass(frozen=True)
+class ResultCellFact:
+    """One unambiguous result-grid cell tied to its durable source event."""
+
+    id: int
+    value_text: str | None
+    source_message_id: int
+    source_key: str
+
+
+@dataclass(frozen=True)
+class PendingPitEvent:
+    """A source STATE/PIT event applied after every handle in one frame."""
+
+    context: FrameMessage
+    participant_id: str
+    state_event: ResultState | None
+    state_cell: ResultCellFact | None
+    pit_count_event: int | None
+    pit_count_cell: ResultCellFact | None
+    lap_number: int | None
+    pit_time_event: ResultCellFact | None
+    previous: sqlite3.Row | None
+
+
+@dataclass(frozen=True)
+class DriverStintValue:
+    """Typed but intentionally non-strategic interpretation of STINT."""
+
+    raw: str | None
+    kind: str
+    provider_ts_time: int | None
+    duration_ms: int | None
 
 
 @contextmanager
@@ -128,9 +164,38 @@ def _number(value: Any) -> float | None:
 
 def _duration_us_to_ms(value: Any) -> int | None:
     source_us = parse_ts_time(value)
-    if source_us is None or is_open_ended_ts_time(value):
+    if source_us is None or not 1_000_000 <= source_us < OPEN_ENDED_TS_TIME:
         return None
     return source_us // 1_000
+
+
+def _parse_driver_stint(value: Any) -> DriverStintValue:
+    """Parse Time Service STINT grammar without assigning race semantics.
+
+    ``S`` and ``P`` carry Time Service instants; ``L`` carries a duration.
+    They are stored for audit and future analysis only, never used by tactical
+    calculations in this normalizer.
+    """
+
+    raw = _text(value)
+    if raw is None:
+        return DriverStintValue(raw=None, kind="UNKNOWN", provider_ts_time=None, duration_ms=None)
+    prefix = raw[:1].upper()
+    payload = raw[1:].strip()
+    if prefix in {"S", "P"}:
+        provider_ts_time = parse_ts_time(payload)
+        if provider_ts_time is not None and provider_ts_time not in {0, OPEN_ENDED_TS_TIME}:
+            return DriverStintValue(
+                raw=raw,
+                kind="START_TS" if prefix == "S" else "POINT_TS",
+                provider_ts_time=provider_ts_time,
+                duration_ms=None,
+            )
+    if prefix == "L":
+        duration_ms = _duration_us_to_ms(payload)
+        if duration_ms is not None:
+            return DriverStintValue(raw=raw, kind="DURATION", provider_ts_time=None, duration_ms=duration_ms)
+    return DriverStintValue(raw=raw, kind="UNKNOWN", provider_ts_time=None, duration_ms=None)
 
 
 def _event_ts_time(value: Any) -> int | None:
@@ -232,6 +297,7 @@ class TimingNormalizer:
         self._layout_id: int | None = None
         self._provider_heat_start_ts: int | None = None
         self._finish_sector_ids: set[int] = set()
+        self._pending_pit_events: list[PendingPitEvent] = []
         self._primed = False
         self._metric_runner = TimingMetricRunner()
 
@@ -254,10 +320,24 @@ class TimingNormalizer:
         contexts = self._frame_messages(connection, frame)
         if not contexts:
             return
-        with _write_transaction(connection):
-            self._ensure_heat(connection, contexts[0].received_at_us)
-            for context in contexts:
-                self._apply_message(connection, context, write=True)
+        self._pending_pit_events = []
+        try:
+            with _write_transaction(connection):
+                self._ensure_heat(connection, contexts[0].received_at_us)
+                for context in contexts:
+                    self._apply_message(connection, context, write=True)
+                # A finish-loop passing tells us when a car crossed the line, but
+                # never how long its lap took. Pair it with a single LAST cell in
+                # the same provider frame only after every handle in that frame
+                # has been materialized, so r_c/t_p ordering cannot alter facts.
+                self._reconcile_frame_tracker_lap_states(connection, frame.id)
+                self._reconcile_tracker_lap_sources(connection, frame.id)
+                # A t_p and an outbound STATE can be ordered either way in a
+                # SignalR frame. Apply source pit boundaries only after tracker
+                # chronology is complete, so tyre/stint ledgers are invariant.
+                self._reconcile_frame_pit_events(connection)
+        finally:
+            self._pending_pit_events = []
         # Derived tactical state is deliberately downstream of the committed
         # normalized facts. A retry reuses the same frame time/source key and
         # is idempotent in metric_current and metric_samples.
@@ -665,6 +745,55 @@ class TimingNormalizer:
         for row_index in sorted(changed_rows):
             self._write_row_state(connection, context, row_index, layout_id)
 
+    def _row_event_cells(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        participant_id: str,
+        source_message_id: int,
+    ) -> dict[str, ResultCellFact]:
+        """Return only unambiguous timing cells changed by this source message.
+
+        The materialized ResultGrid is deliberately not used as event evidence:
+        it retains a prior sparse value until the provider sends a replacement.
+        A duplicate canonical cell in one source message is ambiguous and is
+        therefore omitted instead of guessed.
+        """
+
+        rows = connection.execute(
+            """
+            SELECT definition.canonical_key,observation.id,observation.value_text,
+                   observation.source_message_id,observation.source_key
+            FROM participant_result_cell_observations AS observation
+            JOIN result_column_definitions AS definition
+              ON definition.layout_version_id = observation.layout_version_id
+             AND definition.column_index = observation.column_index
+            WHERE observation.source_heat_id = ?
+              AND observation.participant_id = ?
+              AND observation.source_message_id = ?
+              AND definition.canonical_key IN ('state','pit_stops','pit_time','driver_stint','laps')
+            ORDER BY definition.canonical_key,observation.id
+            """,
+            (self.heat_id, participant_id, source_message_id),
+        ).fetchall()
+        candidates: dict[str, list[sqlite3.Row]] = {}
+        for row in rows:
+            key = row["canonical_key"]
+            if isinstance(key, str):
+                candidates.setdefault(key, []).append(row)
+        result: dict[str, ResultCellFact] = {}
+        for key, values in candidates.items():
+            if len(values) != 1:
+                continue
+            value = values[0]
+            result[key] = ResultCellFact(
+                id=int(value["id"]),
+                value_text=value["value_text"],
+                source_message_id=int(value["source_message_id"]),
+                source_key=value["source_key"],
+            )
+        return result
+
     def _participant_for_row(self, connection: sqlite3.Connection, context: FrameMessage, row_index: int) -> str | None:
         row = self.grid.row_values(row_index)
         start_number = _text(row.get("start_number"))
@@ -966,25 +1095,59 @@ class TimingNormalizer:
         if participant_id is None:
             return
         row = self.grid.row_values(row_index)
-        state = parse_result_state(row.get("state")) if "state" in row else ResultState(raw=None, kind="UNKNOWN")
-        pit_count_raw = _text(row.get("pit_stops"))
-        pit_count = _integer(row.get("pit_stops"), minimum=0)
+        current_state = (
+            parse_result_state(row.get("state")) if "state" in row else ResultState(raw=None, kind="UNKNOWN")
+        )
+        current_pit_count_raw = _text(row.get("pit_stops"))
+        current_pit_count = _integer(row.get("pit_stops"), minimum=0)
+        current_pit_time_raw = _text(row.get("pit_time"))
         old = connection.execute(
             """
-            SELECT state_kind,provider_pit_count,laps
-            FROM participant_state_current
+            SELECT * FROM participant_state_current
             WHERE source_heat_id = ? AND participant_id = ?
             """,
             (self.heat_id, participant_id),
         ).fetchone()
+        event_cells = self._row_event_cells(
+            connection,
+            participant_id=participant_id,
+            source_message_id=context.id,
+        )
+        state_cell = event_cells.get("state")
+        pit_count_cell = event_cells.get("pit_stops")
+        pit_time_cell = event_cells.get("pit_time")
+        driver_stint_cell = event_cells.get("driver_stint")
+        lap_cell = event_cells.get("laps")
+        event_state = parse_result_state(state_cell.value_text) if state_cell is not None else None
+        event_pit_count = _integer(pit_count_cell.value_text, minimum=0) if pit_count_cell is not None else None
+        event_driver_stint = _parse_driver_stint(driver_stint_cell.value_text) if driver_stint_cell is not None else None
+        current_driver_stint = _parse_driver_stint(row.get("driver_stint"))
+        # A reconnect r_i repeats every visible cell. Treat an unchanged
+        # L-PIT value as display state, not a new duration fact for an exit.
+        # A repeated value in an explicit r_c is still a fresh source event:
+        # two real pit stops can legitimately have the same duration.
+        pit_time_event = (
+            pit_time_cell
+            if pit_time_cell is not None
+            and (
+                context.handle == "r_c"
+                or old is None
+                or pit_time_cell.value_text != old["pit_time_raw"]
+            )
+            else None
+        )
         clock = self._clock(context.connection_id)
-        timer_at_us = clock.to_utc_us(state.timer_target_ts_time)
+        timer_at_us = clock.to_utc_us(current_state.timer_target_ts_time)
         calibration_id = self._latest_calibration_id(connection, context.connection_id)
         sectors = {
             key: row[key]
             for key in sorted(row)
             if key.startswith("sector_")
         }
+        state_source = state_cell if state_cell is not None else None
+        pit_count_source = pit_count_cell if pit_count_cell is not None else None
+        pit_time_source = pit_time_cell if pit_time_cell is not None else None
+        driver_stint_source = driver_stint_cell if driver_stint_cell is not None else None
         state_event_key = f"{context.source_key}:state:{row_index}"
         observed = _insert_ignore(
             connection,
@@ -994,14 +1157,33 @@ class TimingNormalizer:
                 "participant_id": participant_id,
                 "layout_version_id": layout_id,
                 "provider_row_index": row_index,
-                "state_raw": _text(state.raw),
-                "state_kind": state.kind,
-                "state_timer_target_raw": state.timer_target_raw,
-                "state_timer_target_provider_us": state.timer_target_ts_time,
-                "state_timer_target_at_us": timer_at_us,
-                "state_timer_calibration_id": calibration_id,
-                "provider_pit_count_raw": pit_count_raw,
-                "provider_pit_count": pit_count,
+                "state_raw": state_cell.value_text if state_cell is not None else None,
+                "state_kind": event_state.kind if event_state is not None else "UNKNOWN",
+                "state_timer_target_raw": event_state.timer_target_raw if event_state is not None else None,
+                "state_timer_target_provider_us": event_state.timer_target_ts_time if event_state is not None else None,
+                "state_timer_target_at_us": clock.to_utc_us(event_state.timer_target_ts_time)
+                if event_state is not None
+                else None,
+                "state_timer_calibration_id": calibration_id if event_state is not None else None,
+                "provider_pit_count_raw": pit_count_cell.value_text if pit_count_cell is not None else None,
+                "provider_pit_count": event_pit_count,
+                "state_cell_observation_id": state_cell.id if state_cell is not None else None,
+                "provider_pit_count_cell_observation_id": pit_count_cell.id if pit_count_cell is not None else None,
+                "pit_time_raw": pit_time_cell.value_text if pit_time_cell is not None else None,
+                "pit_time_cell_observation_id": pit_time_cell.id if pit_time_cell is not None else None,
+                "driver_stint_raw": driver_stint_cell.value_text if driver_stint_cell is not None else None,
+                "driver_stint_kind": event_driver_stint.kind if event_driver_stint is not None else None,
+                "driver_stint_provider_ts_time": event_driver_stint.provider_ts_time
+                if event_driver_stint is not None
+                else None,
+                "driver_stint_at_us": clock.to_utc_us(event_driver_stint.provider_ts_time)
+                if event_driver_stint is not None and event_driver_stint.provider_ts_time is not None
+                else None,
+                "driver_stint_calibration_id": calibration_id
+                if event_driver_stint is not None and event_driver_stint.provider_ts_time is not None
+                else None,
+                "driver_stint_duration_ms": event_driver_stint.duration_ms if event_driver_stint is not None else None,
+                "driver_stint_cell_observation_id": driver_stint_cell.id if driver_stint_cell is not None else None,
                 "source_message_id": context.id,
                 "source_key": context.source_key,
                 "source_event_key": state_event_key,
@@ -1019,11 +1201,11 @@ class TimingNormalizer:
                 "position_class": _integer(row.get("position_class"), minimum=0),
                 "marker": _text(row.get("marker")),
                 "laps": _integer(row.get("laps"), minimum=0),
-                "state": state.kind,
-                "state_raw": _text(state.raw),
-                "state_kind": state.kind,
+                "state": current_state.kind,
+                "state_raw": _text(current_state.raw),
+                "state_kind": current_state.kind,
                 "current_driver_name": _text(row.get("current_driver")),
-                "current_driver_stint_raw": _text(row.get("driver_stint")),
+                "current_driver_stint_raw": current_driver_stint.raw,
                 "last_lap_ms": _duration_us_to_ms(row.get("last_lap")),
                 "last_lap_number": None,
                 "best_lap_ms": _duration_us_to_ms(row.get("best_lap")),
@@ -1039,27 +1221,92 @@ class TimingNormalizer:
                 "diff_kind": "TIME" if _gap_ms(row.get("diff")) is not None else None,
                 "sector_json": _json(sectors),
                 "speed_kph": _number(row.get("speed")),
-                "pit_time_raw": _text(row.get("pit_time")),
+                "pit_time_raw": current_pit_time_raw,
                 "source_message_id": context.id,
                 "source_key": context.source_key,
                 "updated_at_us": context.received_at_us,
-                "state_timer_target_raw": state.timer_target_raw,
-                "state_timer_target_provider_us": state.timer_target_ts_time,
-                "state_timer_target_at_us": timer_at_us,
-                "state_timer_calibration_id": calibration_id,
-                "state_timer_source_message_id": context.id,
-                "state_timer_source_key": context.source_key,
-                "state_timer_observed_at_us": context.received_at_us,
-                "provider_pit_count": pit_count,
-                "provider_pit_count_raw": pit_count_raw,
-                "provider_pit_count_source_message_id": context.id,
-                "provider_pit_count_source_key": context.source_key,
-                "provider_pit_count_observed_at_us": context.received_at_us,
+                "state_timer_target_raw": current_state.timer_target_raw
+                if state_source is not None
+                else (old["state_timer_target_raw"] if old is not None else None),
+                "state_timer_target_provider_us": current_state.timer_target_ts_time
+                if state_source is not None
+                else (old["state_timer_target_provider_us"] if old is not None else None),
+                "state_timer_target_at_us": timer_at_us
+                if state_source is not None
+                else (old["state_timer_target_at_us"] if old is not None else None),
+                "state_timer_calibration_id": calibration_id
+                if state_source is not None
+                else (old["state_timer_calibration_id"] if old is not None else None),
+                "state_timer_source_message_id": context.id
+                if state_source is not None
+                else (old["state_timer_source_message_id"] if old is not None else None),
+                "state_timer_source_key": context.source_key
+                if state_source is not None
+                else (old["state_timer_source_key"] if old is not None else None),
+                "state_timer_observed_at_us": context.received_at_us
+                if state_source is not None
+                else (old["state_timer_observed_at_us"] if old is not None else None),
+                "state_source_cell_observation_id": state_source.id
+                if state_source is not None
+                else (old["state_source_cell_observation_id"] if old is not None else None),
+                "provider_pit_count": current_pit_count,
+                "provider_pit_count_raw": current_pit_count_raw,
+                "provider_pit_count_source_message_id": context.id
+                if pit_count_source is not None
+                else (old["provider_pit_count_source_message_id"] if old is not None else None),
+                "provider_pit_count_source_key": context.source_key
+                if pit_count_source is not None
+                else (old["provider_pit_count_source_key"] if old is not None else None),
+                "provider_pit_count_observed_at_us": context.received_at_us
+                if pit_count_source is not None
+                else (old["provider_pit_count_observed_at_us"] if old is not None else None),
+                "provider_pit_count_source_cell_observation_id": pit_count_source.id
+                if pit_count_source is not None
+                else (old["provider_pit_count_source_cell_observation_id"] if old is not None else None),
+                "pit_time_source_cell_observation_id": pit_time_source.id
+                if pit_time_source is not None
+                else (old["pit_time_source_cell_observation_id"] if old is not None else None),
+                "pit_time_source_message_id": context.id
+                if pit_time_source is not None
+                else (old["pit_time_source_message_id"] if old is not None else None),
+                "pit_time_source_key": context.source_key
+                if pit_time_source is not None
+                else (old["pit_time_source_key"] if old is not None else None),
+                "pit_time_observed_at_us": context.received_at_us
+                if pit_time_source is not None
+                else (old["pit_time_observed_at_us"] if old is not None else None),
+                "driver_stint_kind": current_driver_stint.kind
+                if driver_stint_source is not None
+                else (old["driver_stint_kind"] if old is not None else None),
+                "driver_stint_provider_ts_time": current_driver_stint.provider_ts_time
+                if driver_stint_source is not None
+                else (old["driver_stint_provider_ts_time"] if old is not None else None),
+                "driver_stint_at_us": clock.to_utc_us(current_driver_stint.provider_ts_time)
+                if driver_stint_source is not None and current_driver_stint.provider_ts_time is not None
+                else (old["driver_stint_at_us"] if old is not None else None),
+                "driver_stint_calibration_id": calibration_id
+                if driver_stint_source is not None and current_driver_stint.provider_ts_time is not None
+                else (old["driver_stint_calibration_id"] if old is not None else None),
+                "driver_stint_duration_ms": current_driver_stint.duration_ms
+                if driver_stint_source is not None
+                else (old["driver_stint_duration_ms"] if old is not None else None),
+                "driver_stint_source_cell_observation_id": driver_stint_source.id
+                if driver_stint_source is not None
+                else (old["driver_stint_source_cell_observation_id"] if old is not None else None),
+                "driver_stint_source_message_id": context.id
+                if driver_stint_source is not None
+                else (old["driver_stint_source_message_id"] if old is not None else None),
+                "driver_stint_source_key": context.source_key
+                if driver_stint_source is not None
+                else (old["driver_stint_source_key"] if old is not None else None),
+                "driver_stint_observed_at_us": context.received_at_us
+                if driver_stint_source is not None
+                else (old["driver_stint_observed_at_us"] if old is not None else None),
             },
             conflict_columns=("source_heat_id", "participant_id"),
         )
         if observed:
-            source_laps = _integer(row.get("laps"), minimum=0)
+            source_laps = _integer(lap_cell.value_text, minimum=0) if lap_cell is not None else None
             if (
                 old is not None
                 and old["laps"] is not None
@@ -1073,18 +1320,24 @@ class TimingNormalizer:
                     previous_lap=int(old["laps"]),
                     current_lap=source_laps,
                     last_lap_ms=_duration_us_to_ms(row.get("last_lap")),
-                    state_kind=state.kind,
-                    sectors=sectors,
+                    state_kind=current_state.kind,
                 )
-            self._reconcile_pit_and_tire_stint(
-                connection,
-                context,
-                participant_id,
-                state,
-                pit_count,
-                _integer(row.get("laps"), minimum=0),
-                _text(row.get("pit_time")),
-                old,
+            # Keep an active stint available to same-frame tracker passings,
+            # but defer pit boundary mutations until every frame handle has
+            # supplied its chronology.
+            self._ensure_tire_stint(connection, context, participant_id, _integer(row.get("laps"), minimum=0))
+            self._pending_pit_events.append(
+                PendingPitEvent(
+                    context=context,
+                    participant_id=participant_id,
+                    state_event=event_state,
+                    state_cell=state_cell,
+                    pit_count_event=event_pit_count,
+                    pit_count_cell=pit_count_cell,
+                    lap_number=_integer(row.get("laps"), minimum=0),
+                    pit_time_event=pit_time_event,
+                    previous=old,
+                )
             )
 
     def _complete_laps_from_grid(
@@ -1097,16 +1350,24 @@ class TimingNormalizer:
         current_lap: int,
         last_lap_ms: int | None,
         state_kind: str,
-        sectors: Mapping[str, Any],
     ) -> None:
         """Create source-numbered lap rows for an explicit LAPS increase.
 
         If the provider skips numbers, the intermediate rows are retained with
         unknown duration/completion time rather than inventing individual laps.
         """
+        last_cell = self._result_cell_observation(
+            connection,
+            participant_id=participant_id,
+            source_message_id=context.id,
+            canonical_key="last_lap",
+        )
+        source_sectors = self._result_sectors_for_lap(connection, participant_id=participant_id, last_cell=last_cell)
         for lap_number in range(previous_lap + 1, current_lap + 1):
             is_latest = lap_number == current_lap
             completed_at_us = context.received_at_us if is_latest else None
+            has_source_duration = is_latest and last_lap_ms is not None and last_cell is not None
+            has_source_sectors = is_latest and bool(source_sectors)
             _insert_ignore(
                 connection,
                 "laps",
@@ -1121,8 +1382,10 @@ class TimingNormalizer:
                     "participant_id": participant_id,
                     "lap_number": lap_number,
                     "completed_at_us": completed_at_us,
-                    "duration_ms": last_lap_ms if is_latest else None,
-                    "sectors_json": _json(sectors) if is_latest and sectors else None,
+                    "duration_ms": last_lap_ms if has_source_duration else None,
+                    "sectors_json": _json({key: value[0] for key, value in source_sectors.items()})
+                    if has_source_sectors
+                    else None,
                     "flag": self._current_flag_kind(connection),
                     "is_in_lap": int(is_latest and state_kind == "IN_PIT"),
                     "is_out_lap": int(is_latest and state_kind == "OUT_LAP"),
@@ -1134,7 +1397,305 @@ class TimingNormalizer:
                     "source_message_id": context.id,
                     "source_key": context.source_key,
                     "created_at_us": now_us(),
+                    "completion_passing_observation_id": None,
+                    "duration_source_cell_observation_id": int(last_cell["id"]) if has_source_duration else None,
+                    "duration_source_message_id": context.id if has_source_duration else None,
+                    "duration_source_key": context.source_key if has_source_duration else None,
+                    "duration_source_kind": "RESULT_GRID_LAST" if has_source_duration else None,
+                    "sectors_source_cell_observation_ids_json": _json(
+                        {key: value[1] for key, value in source_sectors.items()}
+                    )
+                    if has_source_sectors
+                    else None,
                 },
+            )
+
+    def _result_cell_observation(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        participant_id: str,
+        source_message_id: int,
+        canonical_key: str,
+    ) -> sqlite3.Row | None:
+        """Return one exact result-cell observation, otherwise fail closed."""
+
+        rows = connection.execute(
+            """
+            SELECT observation.id,observation.value_text,observation.source_message_id,observation.source_key,
+                   observation.source_change_ordinal,message.frame_id,message.ordinal AS message_ordinal
+            FROM participant_result_cell_observations AS observation
+            JOIN result_column_definitions AS definition
+              ON definition.layout_version_id = observation.layout_version_id
+             AND definition.column_index = observation.column_index
+            JOIN feed_messages AS message ON message.id = observation.source_message_id
+            WHERE observation.source_heat_id = ?
+              AND observation.participant_id = ?
+              AND observation.source_message_id = ?
+              AND definition.canonical_key = ?
+            ORDER BY observation.id
+            LIMIT 2
+            """,
+            (self.heat_id, participant_id, source_message_id, canonical_key),
+        ).fetchall()
+        return rows[0] if len(rows) == 1 else None
+
+    def _result_sectors_for_lap(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        participant_id: str,
+        last_cell: sqlite3.Row | None,
+    ) -> dict[str, tuple[str | None, int]]:
+        """Attach sectors observed since the preceding source LAST boundary.
+
+        Sector cells often update independently from LAST. A value is usable
+        only when it was observed after the prior LAST message and no later
+        than this LAST message in source order. A result message is atomic:
+        every sector in the current LAST message belongs to this boundary,
+        even when the provider serializes it after the LAST cell. Without a
+        preceding LAST, only sectors in the current message are provable.
+        """
+
+        if last_cell is None:
+            return {}
+        previous = connection.execute(
+            """
+            SELECT observation.id,observation.source_change_ordinal,
+                   message.frame_id,message.ordinal AS message_ordinal
+            FROM participant_result_cell_observations AS observation
+            JOIN result_column_definitions AS definition
+              ON definition.layout_version_id = observation.layout_version_id
+             AND definition.column_index = observation.column_index
+            JOIN feed_messages AS message ON message.id = observation.source_message_id
+            WHERE observation.source_heat_id = ?
+              AND observation.participant_id = ?
+              AND definition.canonical_key = 'last_lap'
+              AND (
+                   message.frame_id < ?
+                   OR (message.frame_id = ? AND message.ordinal < ?)
+              )
+            ORDER BY message.frame_id DESC,message.ordinal DESC,observation.source_change_ordinal DESC
+            LIMIT 1
+            """,
+            (
+                self.heat_id,
+                participant_id,
+                int(last_cell["frame_id"]),
+                int(last_cell["frame_id"]),
+                int(last_cell["message_ordinal"]),
+            ),
+        ).fetchone()
+        if previous is None:
+            rows = connection.execute(
+                """
+                SELECT definition.canonical_key,observation.id,observation.value_text,
+                       message.frame_id,message.ordinal AS message_ordinal,observation.source_change_ordinal
+                FROM participant_result_cell_observations AS observation
+                JOIN result_column_definitions AS definition
+                  ON definition.layout_version_id = observation.layout_version_id
+                 AND definition.column_index = observation.column_index
+                JOIN feed_messages AS message ON message.id = observation.source_message_id
+                WHERE observation.source_heat_id = ?
+                  AND observation.participant_id = ?
+                  AND observation.source_message_id = ?
+                  AND definition.canonical_key GLOB 'sector_[0-9]*'
+                ORDER BY definition.canonical_key,observation.source_change_ordinal
+                """,
+                (self.heat_id, participant_id, int(last_cell["source_message_id"])),
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                """
+                SELECT definition.canonical_key,observation.id,observation.value_text,
+                       message.frame_id,message.ordinal AS message_ordinal,observation.source_change_ordinal
+                FROM participant_result_cell_observations AS observation
+                JOIN result_column_definitions AS definition
+                  ON definition.layout_version_id = observation.layout_version_id
+                 AND definition.column_index = observation.column_index
+                JOIN feed_messages AS message ON message.id = observation.source_message_id
+                WHERE observation.source_heat_id = ?
+                  AND observation.participant_id = ?
+                  AND definition.canonical_key GLOB 'sector_[0-9]*'
+                  AND (
+                       message.frame_id > ?
+                       OR (message.frame_id = ? AND message.ordinal > ?)
+                  )
+                  AND (
+                       message.frame_id < ?
+                       OR (message.frame_id = ? AND message.ordinal <= ?)
+                  )
+                ORDER BY definition.canonical_key,message.frame_id,message.ordinal,observation.source_change_ordinal
+                """,
+                (
+                    self.heat_id,
+                    participant_id,
+                    int(previous["frame_id"]),
+                    int(previous["frame_id"]),
+                    int(previous["message_ordinal"]),
+                    int(last_cell["frame_id"]),
+                    int(last_cell["frame_id"]),
+                    int(last_cell["message_ordinal"]),
+                ),
+            ).fetchall()
+        sectors: dict[str, tuple[str | None, int]] = {}
+        for row in rows:
+            key = row["canonical_key"]
+            value = row["value_text"]
+            if isinstance(key, str):
+                # An unavailable source sector is deliberately represented as
+                # null. It is not filled from tracker data or an older lap.
+                sectors[key] = (value if _duration_us_to_ms(value) is not None else None, int(row["id"]))
+        return sectors
+
+    def _reconcile_frame_tracker_lap_states(self, connection: sqlite3.Connection, frame_id: int) -> None:
+        """Make same-frame tracker lap state independent of handle ordering."""
+
+        laps = connection.execute(
+            """
+            SELECT lap.id,lap.participant_id
+            FROM laps AS lap
+            JOIN tracker_passing_observations AS passing
+              ON passing.id = lap.completion_passing_observation_id
+            JOIN feed_messages AS message ON message.id = passing.source_message_id
+            WHERE lap.source_heat_id = ? AND message.frame_id = ?
+            """,
+            (self.heat_id, frame_id),
+        ).fetchall()
+        for lap in laps:
+            state = connection.execute(
+                """
+                SELECT state_kind FROM participant_state_current
+                WHERE source_heat_id = ? AND participant_id = ?
+                """,
+                (self.heat_id, lap["participant_id"]),
+            ).fetchone()
+            state_kind = state["state_kind"] if state is not None else None
+            if state_kind == "IN_PIT":
+                connection.execute(
+                    """
+                    UPDATE laps
+                    SET is_in_lap = 1,is_out_lap = 0,crosses_pit = 1,is_clean = 0
+                    WHERE id = ?
+                    """,
+                    (lap["id"],),
+                )
+            elif state_kind == "OUT_LAP":
+                connection.execute(
+                    """
+                    UPDATE laps
+                    SET is_in_lap = 0,is_out_lap = 1,crosses_pit = 0,is_clean = 0
+                    WHERE id = ?
+                    """,
+                    (lap["id"],),
+                )
+
+    def _reconcile_tracker_lap_sources(self, connection: sqlite3.Connection, frame_id: int) -> None:
+        """Attach same-frame source LAST facts to no-LAPS tracker boundaries.
+
+        A result-grid message and tracker passing can arrive in either order in
+        one SignalR frame. The pair is valid only when the participant has one
+        new finish boundary and one LAST-cell observation in that frame. This
+        intentionally leaves duration/sector values NULL for any ambiguous or
+        delayed source update instead of deriving them from tracker timestamps.
+        """
+
+        candidates = connection.execute(
+            """
+            SELECT lap.id,lap.participant_id,lap.is_clean,lap.crosses_pit
+            FROM laps AS lap
+            JOIN tracker_passing_observations AS passing
+              ON passing.id = lap.completion_passing_observation_id
+            JOIN feed_messages AS message ON message.id = passing.source_message_id
+            WHERE lap.source_heat_id = ?
+              AND message.frame_id = ?
+              AND lap.duration_ms IS NULL
+              AND lap.duration_source_cell_observation_id IS NULL
+            ORDER BY lap.participant_id,lap.id
+            """,
+            (self.heat_id, frame_id),
+        ).fetchall()
+        if not candidates:
+            return
+        laps_by_participant: dict[str, list[sqlite3.Row]] = {}
+        for lap in candidates:
+            laps_by_participant.setdefault(lap["participant_id"], []).append(lap)
+
+        last_rows = connection.execute(
+            """
+            SELECT observation.id,observation.participant_id,observation.value_text,
+                   observation.source_message_id,observation.source_key,
+                   observation.source_change_ordinal,message.frame_id,message.ordinal AS message_ordinal
+            FROM participant_result_cell_observations AS observation
+            JOIN result_column_definitions AS definition
+              ON definition.layout_version_id = observation.layout_version_id
+             AND definition.column_index = observation.column_index
+            JOIN feed_messages AS message ON message.id = observation.source_message_id
+            WHERE observation.source_heat_id = ?
+              AND message.frame_id = ?
+              AND definition.canonical_key = 'last_lap'
+            ORDER BY observation.participant_id,observation.id
+            """,
+            (self.heat_id, frame_id),
+        ).fetchall()
+        last_by_participant: dict[str, list[sqlite3.Row]] = {}
+        for last in last_rows:
+            participant_id = last["participant_id"]
+            if participant_id is not None:
+                last_by_participant.setdefault(participant_id, []).append(last)
+
+        for participant_id, laps in laps_by_participant.items():
+            lasts = last_by_participant.get(participant_id, [])
+            if len(laps) != 1 or len(lasts) != 1:
+                continue
+            lap = laps[0]
+            last = lasts[0]
+            duration_ms = _duration_us_to_ms(last["value_text"])
+            if duration_ms is None:
+                continue
+            source_message_id = int(last["source_message_id"])
+            source_sectors = self._result_sectors_for_lap(
+                connection,
+                participant_id=participant_id,
+                last_cell=last,
+            )
+            state = connection.execute(
+                """
+                SELECT state_kind FROM participant_state_current
+                WHERE source_heat_id = ? AND participant_id = ?
+                """,
+                (self.heat_id, participant_id),
+            ).fetchone()
+            state_kind = state["state_kind"] if state is not None else None
+            is_in_lap = int(state_kind == "IN_PIT")
+            is_out_lap = int(state_kind == "OUT_LAP")
+            crosses_pit = int(bool(lap["crosses_pit"]) or state_kind == "IN_PIT")
+            is_clean = 0 if state_kind in {"IN_PIT", "OUT_LAP"} else int(lap["is_clean"])
+            connection.execute(
+                """
+                UPDATE laps
+                SET duration_ms = ?, sectors_json = ?,
+                    duration_source_cell_observation_id = ?,
+                    duration_source_message_id = ?, duration_source_key = ?, duration_source_kind = 'RESULT_GRID_LAST',
+                    sectors_source_cell_observation_ids_json = ?,
+                    is_in_lap = ?, is_out_lap = ?, crosses_pit = ?, is_clean = ?
+                WHERE id = ?
+                  AND duration_ms IS NULL
+                  AND duration_source_cell_observation_id IS NULL
+                """,
+                (
+                    duration_ms,
+                    _json({key: value[0] for key, value in source_sectors.items()}) if source_sectors else None,
+                    int(last["id"]),
+                    source_message_id,
+                    last["source_key"],
+                    _json({key: value[1] for key, value in source_sectors.items()}) if source_sectors else None,
+                    is_in_lap,
+                    is_out_lap,
+                    crosses_pit,
+                    is_clean,
+                    lap["id"],
+                ),
             )
 
     def _write_immediate_flag(self, connection: sqlite3.Connection, context: FrameMessage, flag: FlagState) -> None:
@@ -1235,35 +1796,87 @@ class TimingNormalizer:
         return context.received_at_us
 
     @staticmethod
+    def _pit_entry_time_source(fact: ResultCellFact | None) -> ResultCellFact | None:
+        """Return a valid source L-PIT S<TsTime> cell, never a cached L value."""
+
+        if fact is None or fact.value_text is None or fact.value_text[:1].upper() != "S":
+            return None
+        # `0` and Int64.MaxValue are provider sentinels, not pit-entry
+        # instants. Treating either as a calibrated timestamp would place an
+        # observed pit in 2000 or far beyond the session and contaminate the
+        # timeline and mandatory-stop ledger.
+        return fact if _event_ts_time(fact.value_text[1:]) is not None else None
+
+    @staticmethod
     def _pit_duration_ms(pit_time_raw: str | None) -> int | None:
         if not pit_time_raw or pit_time_raw[:1].upper() != "L":
             return None
         return _duration_us_to_ms(pit_time_raw[1:])
+
+    def _reconcile_frame_pit_events(self, connection: sqlite3.Connection) -> None:
+        """Apply queued source pit transitions after a frame's tracker facts."""
+
+        entry_sources_by_participant: dict[str, list[ResultCellFact]] = {}
+        for event in self._pending_pit_events:
+            source = self._pit_entry_time_source(event.pit_time_event)
+            if source is not None:
+                entry_sources_by_participant.setdefault(event.participant_id, []).append(source)
+        for event in self._pending_pit_events:
+            pit_time_event = event.pit_time_event
+            is_entry = (
+                event.state_event is not None
+                and event.state_event.kind == "IN_PIT"
+                and event.previous is not None
+                and event.previous["state_kind"] != "IN_PIT"
+            )
+            candidates = entry_sources_by_participant.get(event.participant_id, [])
+            if is_entry and len(candidates) == 1:
+                # Time Service can send L-PIT=S<TsTime> in a separate r_c
+                # handle from STATE=IN_PIT. The frame is the causal boundary.
+                pit_time_event = candidates[0]
+            self._reconcile_pit_and_tire_stint(
+                connection,
+                event.context,
+                event.participant_id,
+                event.state_event,
+                event.state_cell,
+                event.pit_count_event,
+                event.pit_count_cell,
+                event.lap_number,
+                pit_time_event,
+                event.previous,
+            )
 
     def _reconcile_pit_and_tire_stint(
         self,
         connection: sqlite3.Connection,
         context: FrameMessage,
         participant_id: str,
-        state: ResultState,
-        pit_count: int | None,
+        state_event: ResultState | None,
+        state_cell: ResultCellFact | None,
+        pit_count_event: int | None,
+        pit_count_cell: ResultCellFact | None,
         lap_number: int | None,
-        pit_time_raw: str | None,
+        pit_time_event: ResultCellFact | None,
         previous: sqlite3.Row | None,
     ) -> None:
-        """Create pit/tyre facts only from observed state/count transitions.
+        """Create pit/tyre facts only from causally current source cells.
 
         A completed pit closes the current tyre stint and opens a new one. No
-        manual tyre input or compound override exists in this data path.
+        manual tyre input or compound override exists in this data path. In
+        particular, a previously materialized L-PIT display value is never
+        reused as the duration of a later State/PIT transition.
         """
         previous_state = previous["state_kind"] if previous is not None else None
         previous_count = previous["provider_pit_count"] if previous is not None else None
-        now_in_pit = state.kind == "IN_PIT"
+        effective_lap_number = self._effective_lap_number(connection, participant_id, lap_number)
+        current_state = state_event.kind if state_event is not None else previous_state
+        now_in_pit = current_state == "IN_PIT"
         was_in_pit = previous_state == "IN_PIT"
         count_increased = (
-            pit_count is not None
+            pit_count_event is not None
             and previous_count is not None
-            and pit_count > previous_count
+            and pit_count_event > previous_count
         )
         opened = connection.execute(
             """
@@ -1279,24 +1892,38 @@ class TimingNormalizer:
         # The first source row is a baseline, not an observed transition. A
         # capture may begin while a crew is already in pit lane, with a pit
         # count inherited from time before the recording window.
-        entered_from_state_transition = previous is not None and was_in_pit is False and now_in_pit
-        if entered_from_state_transition or (count_increased and opened is None):
+        entered_from_state_transition = (
+            state_event is not None and previous is not None and was_in_pit is False and now_in_pit
+        )
+        if entered_from_state_transition:
             max_stop = int(
                 connection.execute(
-                    "SELECT COALESCE(MAX(stop_number), 0) FROM pit_stops WHERE source_heat_id = ? AND participant_id = ?",
-                    (self.heat_id, participant_id),
+                "SELECT COALESCE(MAX(stop_number), 0) FROM pit_stops WHERE source_heat_id = ? AND participant_id = ?",
+                (self.heat_id, participant_id),
                 ).fetchone()[0]
             )
-            stop_number = pit_count if pit_count is not None and pit_count > 0 else max_stop + 1
+            source_stop_number = (
+                pit_count_event
+                if pit_count_event is not None and pit_count_event > 0
+                else (int(previous_count) if previous_count is not None and previous_count > 0 else None)
+            )
+            stop_number = source_stop_number if source_stop_number is not None else max_stop + 1
             if stop_number <= max_stop:
                 stop_number = max_stop + 1
-            entered_at_us = self._pit_entered_at_us(pit_time_raw, context)
+            entry_time_source = self._pit_entry_time_source(pit_time_event)
+            entered_at_us = self._pit_entered_at_us(
+                entry_time_source.value_text if entry_time_source is not None else None,
+                context,
+            )
             cursor = connection.execute(
                 """
                 INSERT OR IGNORE INTO pit_stops(
                   id,source_heat_id,participant_id,stop_number,entered_at_us,entered_lap,
-                  completed,entered_source_message_id,entered_source_key,created_at_us,updated_at_us
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                  completed,entered_source_message_id,entered_source_key,
+                  entered_state_cell_observation_id,entered_pit_count_cell_observation_id,
+                  entered_at_source_cell_observation_id,entered_at_source_message_id,
+                  entered_at_source_key,entered_at_source_kind,created_at_us,updated_at_us
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     str(uuid.uuid5(uuid.NAMESPACE_URL, f"balchug-racing:pit:{self.heat_id}:{participant_id}:{stop_number}")),
@@ -1304,10 +1931,16 @@ class TimingNormalizer:
                     participant_id,
                     stop_number,
                     entered_at_us,
-                    lap_number,
+                    effective_lap_number,
                     0,
                     context.id,
                     context.source_key,
+                    state_cell.id if entered_from_state_transition and state_cell is not None else None,
+                    pit_count_cell.id if count_increased and pit_count_cell is not None else None,
+                    entry_time_source.id if entry_time_source is not None else None,
+                    entry_time_source.source_message_id if entry_time_source is not None else None,
+                    entry_time_source.source_key if entry_time_source is not None else None,
+                    "RESULT_L_PIT_S" if entry_time_source is not None else None,
                     now_us(),
                     now_us(),
                 ),
@@ -1321,35 +1954,47 @@ class TimingNormalizer:
                     """,
                     (self.heat_id, participant_id, stop_number),
                 ).fetchone()
-        # A count-based pit can be opened on a delayed grid update.  On the
-        # next non-pit state it must close just like a state-transition pit;
-        # otherwise an inherited record would falsely span the whole heat.
-        exits_pit = (was_in_pit or had_opened_pit) and not now_in_pit
+        # A counter-only update is raw source evidence, not a pit boundary.
+        # An open stop can close only after an explicit outbound STATE cell.
+        exits_pit = (
+            state_event is not None
+            and state_event.kind in {"ON_TRACK", "OUT_LAP"}
+            and (was_in_pit or had_opened_pit)
+        )
         if exits_pit and opened is not None:
-            duration_ms = self._pit_duration_ms(pit_time_raw)
-            if duration_ms is None:
-                duration_ms = max(0, (context.received_at_us - int(opened["entered_at_us"])) // 1_000)
+            duration_ms = self._pit_duration_ms(pit_time_event.value_text if pit_time_event is not None else None)
+            duration_source = pit_time_event if duration_ms is not None else None
             cursor = connection.execute(
                 """
                 UPDATE pit_stops
                 SET exited_at_us = ?, exited_lap = ?, pit_lane_ms = ?, completed = 1,
-                    exited_source_message_id = ?, exited_source_key = ?, updated_at_us = ?
+                    exited_source_message_id = ?, exited_source_key = ?,
+                    exited_state_cell_observation_id = ?, exited_pit_count_cell_observation_id = ?,
+                    pit_lane_duration_source_cell_observation_id = ?,
+                    pit_lane_duration_source_message_id = ?, pit_lane_duration_source_key = ?,
+                    pit_lane_duration_source_kind = ?, updated_at_us = ?
                 WHERE id = ? AND completed = 0
                 """,
                 (
                     context.received_at_us,
-                    lap_number,
+                    effective_lap_number,
                     duration_ms,
                     context.id,
                     context.source_key,
+                    state_cell.id if state_cell is not None else None,
+                    pit_count_cell.id if pit_count_cell is not None else None,
+                    duration_source.id if duration_source is not None else None,
+                    duration_source.source_message_id if duration_source is not None else None,
+                    duration_source.source_key if duration_source is not None else None,
+                    "RESULT_L_PIT" if duration_source is not None else None,
                     now_us(),
                     opened["id"],
                 ),
             )
             pit_facts_changed = bool(cursor.rowcount) or pit_facts_changed
-            self._complete_tire_stint(connection, context, participant_id, lap_number)
+            self._complete_tire_stint(connection, context, participant_id, effective_lap_number)
         else:
-            self._ensure_tire_stint(connection, context, participant_id, lap_number)
+            self._ensure_tire_stint(connection, context, participant_id, effective_lap_number)
         if pit_facts_changed:
             self._invalidate_clean_laps_for_pit(connection, participant_id)
 
@@ -1576,6 +2221,18 @@ class TimingNormalizer:
                     "created_at_us": now_us(),
                 },
             )
+            passing_observation_id: int | None = None
+            if is_new_observation:
+                observation = connection.execute(
+                    """
+                    SELECT id FROM tracker_passing_observations
+                    WHERE source_heat_id = ? AND event_fingerprint = ?
+                    """,
+                    (self.heat_id, event_fingerprint),
+                ).fetchone()
+                if observation is None:
+                    raise NormalizerError("Tracker passing observation was not persisted")
+                passing_observation_id = int(observation["id"])
             if passing.transponder_id is None or passing.is_in_pit is None:
                 continue
             _insert_ignore(
@@ -1611,7 +2268,6 @@ class TimingNormalizer:
                 allow_lap_completion
                 and is_new_observation
                 and participant_id is not None
-                and not passing.is_in_pit
                 and passing.sector_id in self._finish_sector_ids
             ):
                 self._complete_lap_from_tracker(
@@ -1620,6 +2276,7 @@ class TimingNormalizer:
                     participant_id,
                     event_fingerprint,
                     passed_at_us,
+                    passing_observation_id,
                 )
 
     def _complete_lap_from_tracker(
@@ -1629,6 +2286,7 @@ class TimingNormalizer:
         participant_id: str,
         event_fingerprint: str,
         completed_at_us: int | None,
+        completion_passing_observation_id: int | None,
     ) -> None:
         """Count a lap only when the active layout has no explicit LAPS value."""
         state = connection.execute(
@@ -1650,11 +2308,6 @@ class TimingNormalizer:
         ).fetchone()
         lap_number = int(previous["lap_number"]) + 1 if previous is not None else 1
         source_completed_at_us = completed_at_us if completed_at_us is not None else context.received_at_us
-        duration_ms = (
-            max(0, (source_completed_at_us - int(previous["completed_at_us"])) // 1_000)
-            if previous is not None and previous["completed_at_us"] is not None
-            else None
-        )
         inserted = _insert_ignore(
             connection,
             "laps",
@@ -1664,7 +2317,10 @@ class TimingNormalizer:
                 "participant_id": participant_id,
                 "lap_number": lap_number,
                 "completed_at_us": source_completed_at_us,
-                "duration_ms": duration_ms,
+                # The tracker is a finish-line clock only. It must never
+                # manufacture a lap duration; _reconcile_tracker_lap_sources
+                # can attach a same-frame result-grid LAST value later.
+                "duration_ms": None,
                 "sectors_json": None,
                 "flag": self._current_flag_kind(connection),
                 "is_in_lap": int(state["state_kind"] == "IN_PIT"),
@@ -1676,6 +2332,12 @@ class TimingNormalizer:
                 "source_message_id": context.id,
                 "source_key": context.source_key,
                 "created_at_us": now_us(),
+                "completion_passing_observation_id": completion_passing_observation_id,
+                "duration_source_cell_observation_id": None,
+                "duration_source_message_id": None,
+                "duration_source_key": None,
+                "duration_source_kind": None,
+                "sectors_source_cell_observation_ids_json": None,
             },
         )
         if inserted:

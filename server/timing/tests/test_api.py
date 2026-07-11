@@ -328,7 +328,7 @@ class TimingApiTests(unittest.IsolatedAsyncioTestCase):
         laps = await self.client.get(f"/sessions/{session_id}/laps?participant_id=ours&limit=1")
         pits = await self.client.get(f"/sessions/{session_id}/pit-stops?participant_id=ours&limit=1")
         self.assertEqual(laps.json()["items"][0]["lap_number"], 8)
-        self.assertEqual(pits.json()["items"][0]["pit_lane_ms"], 30_000)
+        self.assertIsNone(pits.json()["items"][0]["pit_lane_ms"])
 
         connection = connect(self.database)
         try:

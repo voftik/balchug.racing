@@ -54,6 +54,7 @@ ARCHIVE_COMPARISON_LAP_BUCKET_US = 60 * US_PER_SECOND
 # label its x-axis with the clock actually shown on the timing dashboard.
 ARCHIVE_SOURCE_CLOCK_MAX_INTERPOLATION_US = 90 * US_PER_SECOND
 MAX_ARCHIVE_SOURCE_CLOCK_ANCHORS = 4_000
+PIT_LANE_DURATION_SOURCE_KIND = "RESULT_L_PIT"
 
 SCOPE_KINDS = frozenset(("participant", "class", "session"))
 FreshnessStatus = Literal["LIVE", "STALE", "OFFLINE"]
@@ -366,6 +367,26 @@ def _class_key(value: str | None) -> str | None:
         return None
     normalized = " ".join(value.casefold().split())
     return normalized or None
+
+
+def _has_measured_pit_lane_duration(row: sqlite3.Row) -> bool:
+    """Return whether the row has an explicit, usable Time Service L-PIT fact."""
+
+    return (
+        row["pit_lane_duration_source_kind"] == PIT_LANE_DURATION_SOURCE_KIND
+        and row["pit_lane_ms"] is not None
+    )
+
+
+def _published_pit_lane_ms(row: sqlite3.Row) -> int | None:
+    """Expose a pit duration only when its L-PIT source is explicit.
+
+    Older captures persisted an inferred boundary delta in ``pit_lane_ms``.
+    Those rows remain useful pit in/out chronology, but must not reach an
+    engineer-facing payload as a Time Service measured duration.
+    """
+
+    return row["pit_lane_ms"] if _has_measured_pit_lane_duration(row) else None
 
 
 def _json_object(value: Any, *, context: str) -> dict[str, Any]:
@@ -1825,7 +1846,7 @@ def _archive_comparison_pit_stops(
     rows = connection.execute(
         f"""
         SELECT f.participant_id,p.start_number,p.team_name,f.stop_number,f.entered_at_us,f.exited_at_us,
-               f.entered_lap,f.exited_lap,f.pit_lane_ms,f.completed
+               f.entered_lap,f.exited_lap,f.pit_lane_ms,f.pit_lane_duration_source_kind,f.completed
         FROM pit_stops f
         JOIN participants p ON p.id = f.participant_id
         WHERE f.source_heat_id = ? AND f.participant_id IN ({placeholders})
@@ -1853,7 +1874,7 @@ def _archive_comparison_pit_stops(
                 "carried_into_range": entered_at_us < first_at_us,
                 "entered_lap": row["entered_lap"],
                 "exited_lap": row["exited_lap"],
-                "pit_lane_ms": row["pit_lane_ms"],
+                "pit_lane_ms": _published_pit_lane_ms(row),
                 "completed": bool(row["completed"]),
             }
         )
@@ -2317,7 +2338,7 @@ def read_archive_comparison(
                     "unaggregated raw lap facts for BALCHUG Racing; includes non-clean laps and duration_ms=null "
                     "rows without averaging or decimation"
                 ),
-                "pit_stops": "confirmed pit in/out facts clipped only for timeline display; pit_lane_ms remains the measured full duration",
+                "pit_stops": "confirmed pit in/out facts clipped only for timeline display; pit_lane_ms is populated only from an explicit Time Service L-PIT source",
                 "missing_values": "null values are not interpolated or converted to zero",
             },
         }
@@ -2357,7 +2378,8 @@ def _archive_markers(
     ).fetchall()
     pit_rows = connection.execute(
         """
-        SELECT f.entered_at_us,f.exited_at_us,f.entered_lap,f.exited_lap,f.pit_lane_ms,f.completed,
+        SELECT f.entered_at_us,f.exited_at_us,f.entered_lap,f.exited_lap,f.pit_lane_ms,
+               f.pit_lane_duration_source_kind,f.completed,
                f.stop_number,p.id AS participant_id,p.start_number,p.team_name
         FROM pit_stops f
         JOIN participants p ON p.id = f.participant_id
@@ -2411,7 +2433,7 @@ def _archive_markers(
                 "exited_at_us": row["exited_at_us"],
                 "entered_lap": row["entered_lap"],
                 "exited_lap": row["exited_lap"],
-                "pit_lane_ms": row["pit_lane_ms"],
+                "pit_lane_ms": _published_pit_lane_ms(row),
                 "completed": bool(row["completed"]),
             }
             for row in pit_rows
@@ -2804,7 +2826,8 @@ def read_pit_stops(
             f"""
             SELECT f.id,f.participant_id,p.start_number,p.team_name,p.class_name,
                    f.stop_number,f.entered_at_us,f.exited_at_us,f.entered_lap,f.exited_lap,
-                   f.pit_lane_ms,f.completed,f.entered_source_message_id,f.entered_source_key,
+                   f.pit_lane_ms,f.pit_lane_duration_source_kind,f.completed,
+                   f.entered_source_message_id,f.entered_source_key,
                    f.exited_source_message_id,f.exited_source_key,f.updated_at_us
             FROM pit_stops f
             JOIN participants p ON p.id = f.participant_id
@@ -2826,7 +2849,7 @@ def read_pit_stops(
                 "exited_at_us": row["exited_at_us"],
                 "entered_lap": row["entered_lap"],
                 "exited_lap": row["exited_lap"],
-                "pit_lane_ms": row["pit_lane_ms"],
+                "pit_lane_ms": _published_pit_lane_ms(row),
                 "completed": bool(row["completed"]),
                 "entered_source": {
                     "message_id": row["entered_source_message_id"],
@@ -2839,7 +2862,7 @@ def read_pit_stops(
                 if row["exited_source_key"] is not None
                 else None,
                 "updated_at_us": row["updated_at_us"],
-                "provenance": "measured",
+                "provenance": "measured" if _has_measured_pit_lane_duration(row) else "observed_boundaries",
             }
             for row in reversed(rows)
         ]

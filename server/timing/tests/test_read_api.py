@@ -131,8 +131,8 @@ class TimingReadModelTests(unittest.TestCase):
             """
             INSERT INTO pit_stops(
               id,source_heat_id,participant_id,stop_number,entered_at_us,exited_at_us,entered_lap,
-              exited_lap,pit_lane_ms,completed,entered_source_key,exited_source_key,created_at_us,updated_at_us
-            ) VALUES ('pit-1',?,'ours',1,5000000,5030000,5,5,30000,1,'pit:in','pit:out',?,?)
+              exited_lap,pit_lane_ms,pit_lane_duration_source_kind,completed,entered_source_key,exited_source_key,created_at_us,updated_at_us
+            ) VALUES ('pit-1',?,'ours',1,5000000,5030000,5,5,30000,'RESULT_L_PIT',1,'pit:in','pit:out',?,?)
             """,
             (self.heat_id, timestamp, timestamp),
         )
@@ -279,8 +279,55 @@ class TimingReadModelTests(unittest.TestCase):
 
         self.assertEqual([item["lap_number"] for item in laps["items"]], [12])
         self.assertEqual(pits["items"][0]["pit_lane_ms"], 30_000)
+        self.assertEqual(pits["items"][0]["provenance"], "measured")
         with self.assertRaises(ScopeNotFoundError):
             self.model.laps("session-1", participant_id="not-a-crew")
+
+    def test_unproven_pit_duration_is_null_in_every_public_archive_surface(self):
+        self.connection.execute(
+            "UPDATE pit_stops SET pit_lane_duration_source_kind = NULL WHERE id = 'pit-1'"
+        )
+        self.connection.execute("UPDATE analysis_sessions SET lifecycle = 'stopped' WHERE id = 'session-1'")
+
+        def payload(observed_at_us):
+            return {
+                "schema_version": "timing-archive.v1",
+                "observed_at_us": observed_at_us,
+                "computed": {"session": {"ours_participant_id": "ours"}},
+                "class_participants": [
+                    {
+                        "measured": {
+                            "participant_id": "ours",
+                            "start_number": "21",
+                            "team_name": "BALCHUG Racing",
+                            "car_name": "Ligier JS53 evo2",
+                            "class_name": "CN PRO",
+                            "is_ours": True,
+                            "state": {"state_kind": "ON_TRACK"},
+                        },
+                        "computed": {
+                            "participant_id": "ours",
+                            "is_ours": True,
+                            "current_state": "ON_TRACK",
+                            "pace_5_ms": 107_200,
+                        },
+                    }
+                ],
+            }
+
+        self._add_playback_snapshot(2_000_000, payload(2_000_000))
+        self._add_playback_snapshot(7_000_000, payload(7_000_000))
+        self.connection.commit()
+
+        fact = self.model.pit_stops("session-1", participant_id="ours", limit=1)
+        manifest = self.model.archive_manifest("session-1")
+        comparison = self.model.archive_comparison("session-1")
+
+        self.assertTrue(comparison["comparison"]["available"])
+        self.assertIsNone(fact["items"][0]["pit_lane_ms"])
+        self.assertEqual(fact["items"][0]["provenance"], "observed_boundaries")
+        self.assertIsNone(manifest["markers"]["pits"][0]["pit_lane_ms"])
+        self.assertIsNone(comparison["pit_stops"][0]["pit_lane_ms"])
 
     def test_archive_manifest_and_seek_use_only_durable_playback_keyframes(self):
         self.connection.execute("UPDATE analysis_sessions SET lifecycle = 'stopped' WHERE id = 'session-1'")

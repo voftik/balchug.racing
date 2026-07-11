@@ -25,6 +25,7 @@ from .metric_store import (
     PitStopInput,
     TireStintInput,
 )
+from .normalization import OPEN_ENDED_TS_TIME
 from .metrics import (
     GREEN_FLAG,
     GAP_DIRECTION_LABEL_RU,
@@ -371,6 +372,7 @@ def _pit_stop(value: PitStopInput) -> PitStop:
         entered_lap=value.entered_lap,
         exited_lap=value.exited_lap,
         pit_lane_ms=value.pit_lane_ms,
+        pit_lane_duration_source_kind=value.pit_lane_duration_source_kind,
         completed=value.completed,
     )
 
@@ -383,7 +385,15 @@ def _pit_history(participant: ParticipantMetricInput) -> tuple[dict[str, int | N
     history: list[dict[str, int | None]] = []
     for stop in _completed_pits(participant):
         assert stop.entered_at_us is not None and stop.exited_at_us is not None
-        duration_ms = max(0, (stop.exited_at_us - stop.entered_at_us) // 1_000)
+        # The observed pit-in/pit-out times are chronology only. Time Service
+        # exposes the measured lane duration independently in L-PIT; deriving
+        # it from observation timestamps turns stale/cached cells into a false
+        # tactical fact.
+        duration_ms = (
+            stop.pit_lane_ms
+            if stop.pit_lane_ms is not None and stop.pit_lane_duration_source_kind == "RESULT_L_PIT"
+            else None
+        )
         history.append(
             {
                 "stop_number": stop.stop_number,
@@ -768,9 +778,10 @@ def _sector_duration_ms(value: Any) -> int | None:
     else:
         return None
     # Time Service result-grid timing fields are microseconds. A lower value
-    # could be an unrelated layout marker, so it stays unavailable rather than
-    # being guessed as a sector duration.
-    return raw // 1_000 if raw >= 1_000_000 else None
+    # could be an unrelated layout marker, while Int64.MaxValue explicitly
+    # means an open/unavailable timing field. Both stay unavailable rather
+    # than becoming a false sector duration.
+    return raw // 1_000 if 1_000_000 <= raw < OPEN_ENDED_TS_TIME else None
 
 
 def _sector_map(raw_json: str | None) -> dict[str, int]:
@@ -793,11 +804,14 @@ def _sector_map(raw_json: str | None) -> dict[str, int]:
 
 
 def _participant_sector_values(participant: ParticipantMetricInput) -> dict[str, Any]:
-    state = participant.state
-    last = _sector_map(state.last_sectors_json if state is not None else None)
+    # Result-grid sector cells arrive sparsely throughout a lap. Until LAST
+    # closes that lap they can be a mix of the previous and current lap, so
+    # they must not improve a personal/class sector benchmark. The normalizer
+    # admits a sectors_json only after it has linked each value to the source
+    # LAST boundary and its exact result-cell observation.
     all_maps = [_sector_map(lap.sectors_json) for lap in participant.laps]
-    if last:
-        all_maps.append(last)
+    confirmed = [values for values in all_maps if values]
+    last = confirmed[-1] if confirmed else {}
     keys = sorted({key for values in all_maps for key in values})
     personal = {
         key: min(values[key] for values in all_maps if key in values)

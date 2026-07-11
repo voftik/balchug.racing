@@ -39,6 +39,57 @@ class ResultGridTests(unittest.TestCase):
         grid.remove_rows([[3], [-1], ["not-a-row"]])
         self.assertEqual(grid.rows, {})
 
+    def test_layout_swap_clears_rows_and_ignores_deltas_until_next_snapshot(self):
+        grid = ResultGrid()
+        grid.apply_snapshot(
+            {
+                "l": {"h": [{"n": "NR"}, {"n": "POS"}, {"n": "PIC"}]},
+                "r": [[0, 0, "21"], [0, 1, "3"], [0, 2, "1"]],
+            }
+        )
+        self.assertEqual(
+            grid.row_values(0),
+            {"start_number": "21", "position_overall": "3", "position_class": "1"},
+        )
+
+        # A new layout moves PIC before POS. Sparse values observed before r_i
+        # cannot safely be assigned to the new headers.
+        grid.set_layout({"h": [{"n": "NR"}, {"n": "PIC"}, {"n": "POS"}]})
+        grid.apply_changes([[0, 1, "1"], [0, 2, "3"]])
+
+        self.assertTrue(grid.schema_pending)
+        self.assertFalse(grid.schema_ready)
+        self.assertEqual(grid.rows, {})
+        self.assertEqual(grid.all_rows(), {})
+
+        grid.apply_snapshot({"r": [[0, 0, "21"], [0, 1, "1"], [0, 2, "3"]]})
+        self.assertTrue(grid.schema_ready)
+        self.assertEqual(
+            grid.row_values(0),
+            {"start_number": "21", "position_class": "1", "position_overall": "3"},
+        )
+
+    def test_duplicate_canonical_headers_are_fail_closed(self):
+        grid = ResultGrid()
+        grid.apply_snapshot(
+            {
+                "l": {"h": [{"n": "POS"}, {"n": "Position"}, {"n": "NR"}]},
+                "r": [[0, 0, "3"], [0, 1, "4"], [0, 2, "21"]],
+            }
+        )
+
+        self.assertFalse(grid.schema_pending)
+        self.assertFalse(grid.schema_ready)
+        self.assertEqual(grid.schema_conflicts, {"position_overall": (0, 1)})
+        self.assertEqual(grid.rows, {})
+        self.assertEqual(grid.row_values(0), {})
+        self.assertEqual(grid.all_rows(), {})
+        self.assertEqual(grid.snapshot()["schema_conflicts"], {"position_overall": [0, 1]})
+
+        # Subsequent sparse deltas cannot revive an ambiguous schema.
+        grid.apply_changes([[0, 2, "21"]])
+        self.assertEqual(grid.rows, {})
+
 
 if __name__ == "__main__":
     unittest.main()

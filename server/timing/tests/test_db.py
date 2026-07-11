@@ -65,7 +65,7 @@ class TimingDatabaseTests(unittest.TestCase):
     def test_migration_is_repeatable_and_enables_wal(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "timing.db"
-            self.assertEqual(migrate(path), ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008"])
+            self.assertEqual(migrate(path), ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010"])
             self.assertEqual(migrate(path), [])
             connection = connect(path)
             try:
@@ -178,6 +178,14 @@ class TimingDatabaseTests(unittest.TestCase):
                         "state_timer_observed_at_us",
                         "provider_pit_count",
                         "provider_pit_count_raw",
+                        "state_source_cell_observation_id",
+                        "provider_pit_count_source_cell_observation_id",
+                        "pit_time_source_cell_observation_id",
+                        "pit_time_source_message_id",
+                        "driver_stint_kind",
+                        "driver_stint_provider_ts_time",
+                        "driver_stint_duration_ms",
+                        "driver_stint_source_cell_observation_id",
                     }.issubset(state_columns)
                 )
                 passing_columns = {row[1] for row in connection.execute("PRAGMA table_info(tracker_passings)")}
@@ -190,6 +198,28 @@ class TimingDatabaseTests(unittest.TestCase):
                         "event_fingerprint",
                         "observed_at_us",
                     }.issubset(passing_columns)
+                )
+                lap_columns = {row[1] for row in connection.execute("PRAGMA table_info(laps)")}
+                self.assertTrue(
+                    {
+                        "completion_passing_observation_id",
+                        "duration_source_cell_observation_id",
+                        "duration_source_message_id",
+                        "duration_source_key",
+                        "duration_source_kind",
+                        "sectors_source_cell_observation_ids_json",
+                    }.issubset(lap_columns)
+                )
+                pit_columns = {row[1] for row in connection.execute("PRAGMA table_info(pit_stops)")}
+                self.assertTrue(
+                    {
+                        "entered_state_cell_observation_id",
+                        "entered_pit_count_cell_observation_id",
+                        "entered_at_source_cell_observation_id",
+                        "exited_state_cell_observation_id",
+                        "pit_lane_duration_source_cell_observation_id",
+                        "pit_lane_duration_source_kind",
+                    }.issubset(pit_columns)
                 )
                 flag_columns = {row[1] for row in connection.execute("PRAGMA table_info(track_flag_periods)")}
                 self.assertTrue(
@@ -354,7 +384,7 @@ class TimingDatabaseTests(unittest.TestCase):
             finally:
                 connection.close()
 
-            self.assertEqual(migrate(path), ["0003", "0004", "0005", "0006", "0007", "0008"])
+            self.assertEqual(migrate(path), ["0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010"])
             connection = connect(path)
             try:
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM participants").fetchone()[0], 1)

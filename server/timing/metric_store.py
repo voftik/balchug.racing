@@ -168,6 +168,7 @@ class PitStopInput:
     entered_source_key: str
     exited_source_message_id: int | None
     exited_source_key: str | None
+    pit_lane_duration_source_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -612,7 +613,7 @@ def load_heat_metric_input(connection: sqlite3.Connection, source_heat_id: int) 
         for row in connection.execute(
             """
             SELECT participant_id,stop_number,entered_at_us,exited_at_us,entered_lap,exited_lap,
-                   pit_lane_ms,completed,entered_source_message_id,entered_source_key,
+                   pit_lane_ms,pit_lane_duration_source_kind,completed,entered_source_message_id,entered_source_key,
                    exited_source_message_id,exited_source_key
             FROM pit_stops
             WHERE source_heat_id = ?
@@ -628,6 +629,7 @@ def load_heat_metric_input(connection: sqlite3.Connection, source_heat_id: int) 
                     entered_lap=_int(row["entered_lap"]),
                     exited_lap=_int(row["exited_lap"]),
                     pit_lane_ms=_int(row["pit_lane_ms"]),
+                    pit_lane_duration_source_kind=row["pit_lane_duration_source_kind"],
                     completed=bool(row["completed"]),
                     entered_source_message_id=_int(row["entered_source_message_id"]),
                     entered_source_key=row["entered_source_key"],

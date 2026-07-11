@@ -110,6 +110,7 @@ def participant(
             entered_lap=5,
             exited_lap=5,
             pit_lane_ms=30,
+            pit_lane_duration_source_kind="RESULT_L_PIT",
             completed=True,
             entered_source_message_id=1,
             entered_source_key="frame:pit-in",
@@ -279,6 +280,31 @@ def candidate(result, scope_kind, scope_key):
     )
 
 
+def with_ours_pit_stop(heat, stop):
+    """Keep the immutable participant list and its class scope coherent."""
+
+    ours = heat.our_participant
+    assert ours is not None
+    updated_ours = replace(ours, pit_stops=(stop,))
+    participants = tuple(
+        updated_ours if participant.id == updated_ours.id else participant
+        for participant in heat.participants
+    )
+    scopes = tuple(
+        replace(
+            scope,
+            participants=tuple(
+                updated_ours if participant.id == updated_ours.id else participant
+                for participant in scope.participants
+            ),
+        )
+        if scope.key == updated_ours.class_key
+        else scope
+        for scope in heat.class_scopes
+    )
+    return replace(heat, participants=participants, class_scopes=scopes)
+
+
 class MetricEngineTests(unittest.TestCase):
     def test_finish_flag_makes_the_tactical_channel_offline(self):
         heat = heat_input(flag="GREEN")
@@ -348,6 +374,55 @@ class MetricEngineTests(unittest.TestCase):
     def test_live_frame_without_preceding_state_tick_is_live(self):
         result = evaluate_heat_metrics(heat_input(with_tick=False))
         self.assertEqual(candidate_values(result, "session", "session-1")["channel_status"], CHANNEL_LIVE)
+
+    def test_pit_history_uses_confirmed_l_pit_not_observed_boundary_delta(self):
+        heat = heat_input()
+        assert heat.our_participant is not None
+        # 31 seconds elapsed between observed pit boundaries, but the result
+        # grid's L-PIT source fact reports the measured 30-second lane time.
+        stop = replace(
+            heat.our_participant.pit_stops[0],
+            exited_at_us=34_000_000,
+            pit_lane_ms=30_000,
+            pit_lane_duration_source_kind="RESULT_L_PIT",
+        )
+
+        session = candidate_values(
+            evaluate_heat_metrics(with_ours_pit_stop(heat, stop)),
+            "session",
+            "session-1",
+        )
+
+        self.assertEqual(session["pit_history"][0]["pit_lane_duration_ms"], 30_000)
+        self.assertEqual(session["total_pit_lane_time_ms"], 30_000)
+        self.assertEqual(session["median_pit_lane_time_ms"], 30_000.0)
+
+    def test_unproven_pit_duration_does_not_produce_time_totals_or_alerts(self):
+        heat = heat_input()
+        assert heat.our_participant is not None
+        # A numeric field without an exact L-PIT source is deliberately not a
+        # pit-duration fact, even when the observed boundaries differ by 31s.
+        stop = replace(
+            heat.our_participant.pit_stops[0],
+            exited_at_us=34_000_000,
+            pit_lane_ms=30_000,
+            pit_lane_duration_source_kind=None,
+        )
+
+        result = evaluate_heat_metrics(with_ours_pit_stop(heat, stop))
+        session = candidate_values(result, "session", "session-1")
+        class_values = candidate_values(result, "class", "cn pro")
+        participant_values = candidate_values(result, "participant", "ours")
+
+        self.assertIsNone(session["pit_history"][0]["pit_lane_duration_ms"])
+        self.assertIsNone(session["total_pit_lane_time_ms"])
+        self.assertIsNone(session["median_pit_lane_time_ms"])
+        self.assertIsNone(participant_values["total_pit_lane_time_ms"])
+        self.assertIsNone(class_values["median_pit_lane_time_ms"])
+        self.assertIsNone(session["pit_lane_anomaly"])
+        self.assertFalse(
+            any(alert["key"] in {"mandatory_pits_infeasible", "ours_pit_too_long"} for alert in session["alerts"])
+        )
 
     def test_non_pic_and_lapped_targets_do_not_invent_tactical_order_or_time_gap(self):
         no_pic = heat_input(ours_pic=None)
@@ -728,6 +803,8 @@ class MetricEngineTests(unittest.TestCase):
             replace(leader.laps[0], sectors_json='{"sector_1":"33000000","sector_2":"38000000"}'),
             replace(leader.laps[1], sectors_json='{"sector_1":"34000000","sector_2":"37000000"}'),
         ) + leader.laps[2:]
+        # Sparse current-grid sectors are not a completed lap and must not
+        # change a benchmark before a source LAST boundary confirms them.
         changed_ours = replace(
             ours,
             state=replace(ours.state, last_sectors_json='{"sector_1":"34000000","sector_2":"36500000"}'),
@@ -737,13 +814,39 @@ class MetricEngineTests(unittest.TestCase):
         scope = replace(base.class_scopes[0], participants=(changed_leader, changed_ours, follower))
         heat = replace(base, participants=(changed_leader, changed_ours, follower), class_scopes=(scope,))
         session = candidate_values(evaluate_heat_metrics(heat), "session", "session-1")
-        self.assertEqual(session["last_sector_ms"], {"sector_1": 34_000, "sector_2": 36_500})
+        self.assertEqual(session["last_sector_ms"], {"sector_1": 34_000, "sector_2": 37_000})
         self.assertEqual(session["personal_best_sector_ms"], {"sector_1": 34_000, "sector_2": 36_000})
         self.assertEqual(session["class_best_sector_ms"], {"sector_1": 33_000, "sector_2": 36_000})
         self.assertEqual(session["ideal_lap_ms"], 70_000)
         self.assertEqual(session["potential_to_best_ms"], 37_100)
         self.assertEqual(session["sector_delta_to_competitor_ms"]["leader"], {"sector_1": 1_000, "sector_2": -1_000})
         self.assertEqual(session["largest_sector_loss"]["leader"], {"sector_index": "sector_1", "delta_ms": 1_000, "competitor_id": "leader"})
+
+    def test_sector_metrics_reject_time_service_open_value(self):
+        base = heat_input()
+        leader, ours, follower = base.participants
+        changed_ours = replace(
+            ours,
+            state=replace(
+                ours.state,
+                last_sectors_json='{"sector_1":"9223372036854775807"}',
+            ),
+        )
+        scope = replace(
+            base.class_scopes[0],
+            participants=(leader, changed_ours, follower),
+        )
+        heat = replace(
+            base,
+            participants=(leader, changed_ours, follower),
+            class_scopes=(scope,),
+        )
+
+        session = candidate_values(evaluate_heat_metrics(heat), "session", "session-1")
+
+        self.assertIsNone(session["last_sector_ms"])
+        self.assertIsNone(session["personal_best_sector_ms"])
+        self.assertIsNone(session["class_best_sector_ms"])
 
 
 if __name__ == "__main__":

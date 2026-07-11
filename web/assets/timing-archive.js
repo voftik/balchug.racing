@@ -1401,15 +1401,20 @@
     var clock = timelineClockAt(hit.atUs);
     var color = participant.is_ours ? "#F0143D" : competitorColor(participant.participant_id);
     var crew = (participant.start_number ? "#" + participant.start_number + " · " : "") + String(participant.team_name || "Машина");
-    var completed = pit.completed && numericValue(pit.pit_lane_ms) !== null;
+    var completed = pit.completed === true;
+    var duration = numericValue(pit.pit_lane_ms);
     tooltip.style.setProperty("--ta-tooltip-accent", color);
     tooltip.replaceChildren();
     appendTooltipText(tooltip, "ta-tooltip-kicker", clock.source ? "Время табло" : "Время записи");
     appendTooltipText(tooltip, "ta-tooltip-time", formatAbsolute(clock.atUs));
-    appendTooltipText(tooltip, "ta-tooltip-primary", completed ? formatLap(pit.pit_lane_ms) : "Пит-стоп не завершён");
+    appendTooltipText(
+      tooltip,
+      "ta-tooltip-primary",
+      !completed ? "Пит-стоп не завершён" : (duration === null ? "Время табло недоступно" : formatLap(duration))
+    );
     appendTooltipText(tooltip, "ta-tooltip-detail", "Пит-стоп #" + valueOrDash(pit.stop_number) + " · " + crew);
     var context = pit.carried_into_range ? "Начался до сохранённого интервала" :
-      (completed ? "Полное время в пит-лейне" : "Въезд в пит-лейн");
+      (!completed ? "Въезд в пит-лейн" : (duration === null ? "Границы пит-стопа подтверждены" : "Полное время в пит-лейне"));
     appendTooltipText(tooltip, "ta-tooltip-context", context);
     positionArchiveTooltip(tooltip, elements.pitChart, state.pitTooltipAnchor || pitTooltipAnchor(hit));
   }
@@ -1433,7 +1438,10 @@
         var moment = entered === null ? null : timelineClockAt(entered);
         var time = moment === null ? "" : " в " + formatAbsolute(moment.atUs);
         var duration = numericValue(pit.pit_lane_ms);
-        return "пит-стоп #" + pit.stop_number + time + (duration === null ? ", незавершён" : ", " + formatLap(duration));
+        return "пит-стоп #" + pit.stop_number + time + (
+          duration !== null ? ", " + formatLap(duration) :
+            (pit.completed ? ", время табло недоступно" : ", незавершён")
+        );
       }).join(", ");
     }).join(". ");
     elements.pitDescription.textContent = "Хронология пит-стопов. " + description;
@@ -2475,7 +2483,9 @@
         kind: "pit",
         atUs: pit.entered_at_us,
         title: "Пит-стоп #" + pit.stop_number,
-        detail: pit.completed && typeof pit.pit_lane_ms === "number" ? formatLap(pit.pit_lane_ms) : "Въезд в пит-лейн"
+        detail: pit.completed ? (
+          typeof pit.pit_lane_ms === "number" ? formatLap(pit.pit_lane_ms) : "Время табло недоступно"
+        ) : "Въезд в пит-лейн"
       });
     });
     (state.manifest.markers.laps || []).forEach(function (lap, index) {

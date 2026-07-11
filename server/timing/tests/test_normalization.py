@@ -76,6 +76,29 @@ class ResultTableNormalizationTests(unittest.TestCase):
         self.assertIsNone(columns[11].key)
         self.assertEqual(columns[11].source_parameter, "x")
 
+    def test_sector_times_uses_live_header_parameter_as_its_sector_index(self):
+        """The production table emits `SectorTimes` with ordinal in `p`."""
+
+        columns = result_columns(
+            {
+                "l": {
+                    "h": [
+                        {"n": "lastRoundTime"},
+                        {"n": "SectorTimes", "p": "1"},
+                        {"n": "SectorTimes", "p": 2},
+                        {"n": "SectorTimes", "p": "3"},
+                        {"n": "SectorTimes", "p": "0"},
+                    ]
+                }
+            }
+        )
+
+        self.assertEqual(columns[0].key, "last_lap")
+        self.assertEqual(columns[1].key, "sector_1")
+        self.assertEqual(columns[2].key, "sector_2")
+        self.assertEqual(columns[3].key, "sector_3")
+        self.assertIsNone(columns[4].key)
+
     def test_state_keeps_timer_and_literals_distinct(self):
         on_track = parse_result_state("E837026446926000")
         self.assertEqual(on_track.kind, "ON_TRACK")

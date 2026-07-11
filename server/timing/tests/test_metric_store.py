@@ -110,8 +110,8 @@ class MetricStoreTests(unittest.TestCase):
             """
             INSERT INTO pit_stops(
               id,source_heat_id,participant_id,stop_number,entered_at_us,exited_at_us,entered_lap,
-              exited_lap,pit_lane_ms,completed,entered_source_key,exited_source_key,created_at_us,updated_at_us
-            ) VALUES ('pit-1',?,'ours',1,5000000,5030000,5,5,30000,1,'frame:5','frame:5-out',?,?)
+              exited_lap,pit_lane_ms,pit_lane_duration_source_kind,completed,entered_source_key,exited_source_key,created_at_us,updated_at_us
+            ) VALUES ('pit-1',?,'ours',1,5000000,5030000,5,5,30000,'RESULT_L_PIT',1,'frame:5','frame:5-out',?,?)
             """,
             (heat_id, timestamp, timestamp),
         )
@@ -260,6 +260,7 @@ class MetricStoreTests(unittest.TestCase):
         self.assertEqual(ours.id, "ours")
         self.assertEqual([lap.lap_number for lap in ours.laps], [11, 12])
         self.assertEqual(ours.pit_stops[0].pit_lane_ms, 30_000)
+        self.assertEqual(ours.pit_stops[0].pit_lane_duration_source_kind, "RESULT_L_PIT")
         self.assertEqual(ours.active_tire_stint.stint_number, 2)
         self.assertEqual(ours.active_tire_stint.completed_laps, 7)
 

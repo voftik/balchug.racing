@@ -7,7 +7,7 @@ from pathlib import Path
 from timing.db import connect, migrate
 from timing.ingest_store import RawIngestStore
 from timing.lifecycle import create_session, start_session
-from timing.normalization import TIME_SERVICE_EPOCH_UNIX_US
+from timing.normalization import OPEN_ENDED_TS_TIME, TIME_SERVICE_EPOCH_UNIX_US
 from timing.normalizer_writer import TimingNormalizer
 from timing.protocol import Bootstrap
 
@@ -470,12 +470,472 @@ class TimingNormalizerWriterTests(unittest.TestCase):
             [["r_c", [[0, 1, "SOutLap"], [0, 4, "6"], [0, 6, "L30000000"]]]],
             received_at_us=received + 31_000_000,
         )
-        pit = self.connection.execute("SELECT stop_number,completed,pit_lane_ms,entered_lap,exited_lap FROM pit_stops").fetchone()
-        self.assertEqual(tuple(pit), (1, 1, 30000, 5, 6))
+        pit = self.connection.execute(
+            """
+            SELECT stop_number,completed,pit_lane_ms,entered_lap,exited_lap,
+                   entered_state_cell_observation_id,entered_pit_count_cell_observation_id,
+                   exited_state_cell_observation_id,pit_lane_duration_source_cell_observation_id,
+                   pit_lane_duration_source_kind
+            FROM pit_stops
+            """
+        ).fetchone()
+        self.assertEqual(tuple(pit[:5]), (1, 1, 30000, 5, 6))
+        self.assertIsNotNone(pit["entered_state_cell_observation_id"])
+        self.assertIsNotNone(pit["entered_pit_count_cell_observation_id"])
+        self.assertIsNotNone(pit["exited_state_cell_observation_id"])
+        self.assertIsNotNone(pit["pit_lane_duration_source_cell_observation_id"])
+        self.assertEqual(pit["pit_lane_duration_source_kind"], "RESULT_L_PIT")
         stints = self.connection.execute(
             "SELECT stint_number,started_lap,ended_lap,completed_laps FROM tire_stints ORDER BY stint_number"
         ).fetchall()
         self.assertEqual([tuple(stint) for stint in stints], [(1, 5, 6, 1), (2, 6, None, 0)])
+
+    def test_stale_l_pit_cannot_supply_duration_to_a_later_pit_count_or_state_event(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 21_000_000
+        stale_duration = "L1590000000"
+        self.apply(
+            [
+                ["s_i", 21_000_000],
+                [
+                    "r_i",
+                    {
+                        "l": {
+                            "h": [
+                                {"n": "NR"},
+                                {"n": "STATE"},
+                                {"n": "TEAM"},
+                                {"n": "CLS"},
+                                {"n": "LAPS"},
+                                {"n": "PIT"},
+                                {"n": "L-PIT"},
+                            ]
+                        },
+                        "r": [
+                            [0, 0, "21"],
+                            [0, 1, "E21000000"],
+                            [0, 2, "BALCHUG Racing"],
+                            [0, 3, "CN PRO"],
+                            [0, 4, "10"],
+                            [0, 5, "0"],
+                            [0, 6, stale_duration],
+                        ],
+                    },
+                ],
+            ],
+            received_at_us=received,
+        )
+        # STATE and PIT create a verified entry, but the old L-PIT cell was
+        # not resent with that event.
+        self.apply(
+            [["r_c", [[0, 1, "SIn Pit"], [0, 5, "1"]]]],
+            received_at_us=received + 1_000_000,
+        )
+        # STATE closes the observed pit in a later source message; no L-PIT
+        # accompanies it, so duration remains unknown rather than 26.5 min.
+        self.apply([["r_c", [[0, 1, "SOutLap"]]]], received_at_us=received + 2_000_000)
+
+        pit = self.connection.execute(
+            """
+            SELECT completed,pit_lane_ms,entered_pit_count_cell_observation_id,
+                   exited_state_cell_observation_id,pit_lane_duration_source_cell_observation_id
+            FROM pit_stops
+            """
+        ).fetchone()
+        self.assertEqual(pit["completed"], 1)
+        self.assertIsNone(pit["pit_lane_ms"])
+        self.assertIsNotNone(pit["entered_pit_count_cell_observation_id"])
+        self.assertIsNotNone(pit["exited_state_cell_observation_id"])
+        self.assertIsNone(pit["pit_lane_duration_source_cell_observation_id"])
+
+    def test_same_frame_l_pit_start_timestamp_binds_to_in_pit_state_across_r_c_messages(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 21_250_000
+        entered_provider_time = 21_251_000
+        self.apply(
+            [
+                ["s_i", 21_250_000],
+                [
+                    "r_i",
+                    {
+                        "l": {"h": [{"n": "NR"}, {"n": "STATE"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "LAPS"}, {"n": "PIT"}, {"n": "L-PIT"}]},
+                        "r": [[0, 0, "21"], [0, 1, "E21250000"], [0, 2, "BALCHUG Racing"], [0, 3, "CN PRO"], [0, 4, "10"], [0, 5, "0"], [0, 6, "L0"]],
+                    },
+                ],
+            ],
+            received_at_us=received,
+        )
+        self.apply(
+            [
+                ["r_c", [[0, 6, f"S{entered_provider_time}"]]],
+                ["r_c", [[0, 1, "SIn Pit"], [0, 5, "1"]]],
+            ],
+            received_at_us=received + 1_000_000,
+        )
+
+        pit = self.connection.execute(
+            """
+            SELECT entered_at_us,entered_at_source_cell_observation_id,
+                   entered_at_source_message_id,entered_at_source_kind
+            FROM pit_stops
+            """
+        ).fetchone()
+        self.assertEqual(pit["entered_at_us"], TIME_SERVICE_EPOCH_UNIX_US + entered_provider_time)
+        self.assertIsNotNone(pit["entered_at_source_cell_observation_id"])
+        self.assertIsNotNone(pit["entered_at_source_message_id"])
+        self.assertEqual(pit["entered_at_source_kind"], "RESULT_L_PIT_S")
+
+    def test_l_pit_entry_sentinels_use_observed_boundary_without_source_provenance(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 21_375_000
+        self.apply(
+            [
+                ["s_i", 21_375_000],
+                [
+                    "r_i",
+                    {
+                        "l": {"h": [{"n": "NR"}, {"n": "STATE"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "L-PIT"}]},
+                        "r": [
+                            [0, 0, "21"], [0, 1, "E21375000"], [0, 2, "BALCHUG Racing"], [0, 3, "CN PRO"], [0, 4, "L0"],
+                            [1, 0, "22"], [1, 1, "E21375000"], [1, 2, "Benchmark Racing"], [1, 3, "CN PRO"], [1, 4, "L0"],
+                        ],
+                    },
+                ],
+            ],
+            received_at_us=received,
+        )
+        observed_entry_at_us = received + 1_000_000
+        self.apply(
+            [
+                [
+                    "r_c",
+                    [
+                        [0, 4, "S0"], [0, 1, "SIn Pit"],
+                        [1, 4, f"S{OPEN_ENDED_TS_TIME}"], [1, 1, "SIn Pit"],
+                    ],
+                ]
+            ],
+            received_at_us=observed_entry_at_us,
+        )
+
+        pits = self.connection.execute(
+            """
+            SELECT p.start_number,f.entered_at_us,f.entered_at_source_cell_observation_id,f.entered_at_source_kind
+            FROM pit_stops AS f JOIN participants AS p ON p.id = f.participant_id
+            ORDER BY p.start_number
+            """
+        ).fetchall()
+        self.assertEqual(
+            [tuple(pit) for pit in pits],
+            [("21", observed_entry_at_us, None, None), ("22", observed_entry_at_us, None, None)],
+        )
+
+    def test_reconnect_snapshot_cannot_reuse_unchanged_l_pit_as_a_pit_duration(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 21_500_000
+        headers = [
+            {"n": "NR"},
+            {"n": "STATE"},
+            {"n": "TEAM"},
+            {"n": "CLS"},
+            {"n": "LAPS"},
+            {"n": "PIT"},
+            {"n": "L-PIT"},
+        ]
+        stale_duration = "L1590000000"
+        self.apply(
+            [
+                ["s_i", 21_500_000],
+                [
+                    "r_i",
+                    {
+                        "l": {"h": headers},
+                        "r": [
+                            [0, 0, "21"], [0, 1, "E21500000"], [0, 2, "BALCHUG Racing"], [0, 3, "CN PRO"],
+                            [0, 4, "10"], [0, 5, "0"], [0, 6, stale_duration],
+                        ],
+                    },
+                ],
+            ],
+            received_at_us=received,
+        )
+        self.apply(
+            [["r_c", [[0, 1, "SIn Pit"], [0, 5, "1"]]]],
+            received_at_us=received + 1_000_000,
+        )
+        # A reconnect r_i repeats the stale L-PIT display while exposing the
+        # state change. It closes the pit but cannot provide its duration.
+        self.apply(
+            [
+                [
+                    "r_i",
+                    {
+                        "l": {"h": headers},
+                        "r": [
+                            [0, 0, "21"], [0, 1, "SOutLap"], [0, 2, "BALCHUG Racing"], [0, 3, "CN PRO"],
+                            [0, 4, "10"], [0, 5, "1"], [0, 6, stale_duration],
+                        ],
+                    },
+                ]
+            ],
+            received_at_us=received + 2_000_000,
+        )
+
+        pit = self.connection.execute(
+            """
+            SELECT completed,pit_lane_ms,pit_lane_duration_source_cell_observation_id
+            FROM pit_stops
+            """
+        ).fetchone()
+        self.assertEqual(tuple(pit), (1, None, None))
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM pit_stops").fetchone()[0], 1)
+
+    def test_unknown_state_cannot_close_an_open_pit_or_roll_a_tire_stint(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 21_750_000
+        self.apply(
+            [
+                ["s_i", 21_750_000],
+                [
+                    "r_i",
+                    {
+                        "l": {"h": [{"n": "NR"}, {"n": "STATE"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "LAPS"}, {"n": "PIT"}]},
+                        "r": [[0, 0, "21"], [0, 1, "E21750000"], [0, 2, "BALCHUG Racing"], [0, 3, "CN PRO"], [0, 4, "10"], [0, 5, "0"]],
+                    },
+                ],
+            ],
+            received_at_us=received,
+        )
+        self.apply(
+            [["r_c", [[0, 1, "SIn Pit"], [0, 5, "1"]]]],
+            received_at_us=received + 1_000_000,
+        )
+        self.apply([["r_c", [[0, 1, "SGarage Hold"]]]], received_at_us=received + 2_000_000)
+
+        pit = self.connection.execute("SELECT completed,exited_at_us FROM pit_stops").fetchone()
+        self.assertEqual(tuple(pit), (0, None))
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM tire_stints").fetchone()[0], 1)
+
+    def test_pit_counter_only_update_cannot_create_a_completed_or_mandatory_stop(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 21_900_000
+        self.apply(
+            [
+                ["s_i", 21_900_000],
+                [
+                    "r_i",
+                    {
+                        "l": {"h": [{"n": "NR"}, {"n": "STATE"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "LAPS"}, {"n": "PIT"}]},
+                        "r": [[0, 0, "21"], [0, 1, "E21900000"], [0, 2, "BALCHUG Racing"], [0, 3, "CN PRO"], [0, 4, "10"], [0, 5, "0"]],
+                    },
+                ],
+            ],
+            received_at_us=received,
+        )
+        self.apply([["r_c", [[0, 5, "1"]]]], received_at_us=received + 1_000_000)
+        self.apply([["r_c", [[0, 1, "E21902000"]]]], received_at_us=received + 2_000_000)
+
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM pit_stops").fetchone()[0], 0)
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM tire_stints").fetchone()[0], 1)
+        pit_count = self.connection.execute(
+            "SELECT provider_pit_count,provider_pit_count_source_cell_observation_id FROM participant_state_current"
+        ).fetchone()
+        self.assertEqual(pit_count["provider_pit_count"], 1)
+        self.assertIsNotNone(pit_count["provider_pit_count_source_cell_observation_id"])
+
+    def test_split_message_l_pit_never_backfills_a_pit_duration(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 22_050_000
+        self.apply(
+            [
+                ["s_i", 22_050_000],
+                [
+                    "r_i",
+                    {
+                        "l": {
+                            "h": [
+                                {"n": "NR"}, {"n": "STATE"}, {"n": "TEAM"}, {"n": "CLS"},
+                                {"n": "LAPS"}, {"n": "PIT"}, {"n": "L-PIT"},
+                            ]
+                        },
+                        "r": [
+                            [0, 0, "21"], [0, 1, "E22050000"], [0, 2, "BALCHUG Racing"], [0, 3, "CN PRO"],
+                            [0, 4, "10"], [0, 5, "0"], [0, 6, "L0"],
+                        ],
+                    },
+                ],
+            ],
+            received_at_us=received,
+        )
+        self.apply([["r_c", [[0, 1, "SIn Pit"], [0, 5, "1"]]]], received_at_us=received + 1_000_000)
+        # L-PIT before the outbound state is source data, but it is not
+        # causally bound to the exit event and therefore cannot fill duration.
+        self.apply([["r_c", [[0, 6, "L30000000"]]]], received_at_us=received + 2_000_000)
+        self.apply([["r_c", [[0, 1, "SOutLap"]]]], received_at_us=received + 3_000_000)
+        self.apply([["r_c", [[0, 1, "SIn Pit"], [0, 5, "2"]]]], received_at_us=received + 4_000_000)
+        self.apply([["r_c", [[0, 1, "SOutLap"]]]], received_at_us=received + 5_000_000)
+        # Nor can an L-PIT sent after a completed outbound boundary backfill it.
+        self.apply([["r_c", [[0, 6, "L31000000"]]]], received_at_us=received + 6_000_000)
+
+        pits = self.connection.execute(
+            "SELECT stop_number,pit_lane_ms,pit_lane_duration_source_cell_observation_id FROM pit_stops ORDER BY stop_number"
+        ).fetchall()
+        self.assertEqual([tuple(pit) for pit in pits], [(1, None, None), (2, None, None)])
+
+    def test_same_frame_tracker_and_outbound_state_order_keeps_identical_pit_and_stint_ledgers(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 22_200_000
+        self.apply(
+            [
+                ["s_i", 22_200_000],
+                ["t_i", {"l": [[0, False, 0], [500, False, 1]], "d": []}],
+                [
+                    "r_i",
+                    {
+                        "l": {"h": [{"n": "NR"}, {"n": "STATE"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "PIT"}]},
+                        "r": [
+                            [0, 0, "21"], [0, 1, "E22200000"], [0, 2, "BALCHUG Racing"], [0, 3, "CN PRO"], [0, 4, "0"],
+                            [1, 0, "22"], [1, 1, "E22200000"], [1, 2, "Benchmark Racing"], [1, 3, "CN PRO"], [1, 4, "0"],
+                        ],
+                    },
+                ],
+            ],
+            received_at_us=received,
+        )
+        self.apply(
+            [["r_c", [[0, 1, "SIn Pit"], [0, 4, "1"], [1, 1, "SIn Pit"], [1, 4, "1"]]]],
+            received_at_us=received + 1_000_000,
+        )
+        # #21 receives t_p before its outbound r_c; #22 receives it after.
+        # The final facts must depend on source evidence, not handle order.
+        self.apply(
+            [
+                ["t_p", [[42, "21", 0, 500, 0, 47000, False, 22_202_000]]],
+                ["r_c", [[0, 1, "SOutLap"]]],
+                ["r_c", [[1, 1, "SOutLap"]]],
+                ["t_p", [[43, "22", 0, 500, 0, 47000, False, 22_202_000]]],
+            ],
+            received_at_us=received + 2_000_000,
+        )
+
+        pits = self.connection.execute(
+            """
+            SELECT p.start_number,f.completed,f.exited_lap,f.pit_lane_ms
+            FROM pit_stops AS f JOIN participants AS p ON p.id = f.participant_id
+            ORDER BY p.start_number
+            """
+        ).fetchall()
+        self.assertEqual([tuple(pit) for pit in pits], [("21", 1, 1, None), ("22", 1, 1, None)])
+        stints = self.connection.execute(
+            """
+            SELECT p.start_number,t.stint_number,t.started_lap,t.ended_lap,t.completed_laps
+            FROM tire_stints AS t JOIN participants AS p ON p.id = t.participant_id
+            ORDER BY p.start_number,t.stint_number
+            """
+        ).fetchall()
+        self.assertEqual(
+            [tuple(stint) for stint in stints],
+            [("21", 1, None, 1, 1), ("21", 2, 1, None, 0), ("22", 1, None, 1, 1), ("22", 2, 1, None, 0)],
+        )
+        laps = self.connection.execute(
+            """
+            SELECT p.start_number,l.is_in_lap,l.is_out_lap,l.is_clean
+            FROM laps AS l JOIN participants AS p ON p.id = l.participant_id
+            ORDER BY p.start_number
+            """
+        ).fetchall()
+        self.assertEqual([tuple(lap) for lap in laps], [("21", 0, 1, 0), ("22", 0, 1, 0)])
+
+    def test_equal_l_pit_durations_in_distinct_r_c_exit_events_remain_source_facts(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 22_350_000
+        self.apply(
+            [
+                ["s_i", 22_350_000],
+                [
+                    "r_i",
+                    {
+                        "l": {"h": [{"n": "NR"}, {"n": "STATE"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "LAPS"}, {"n": "PIT"}, {"n": "L-PIT"}]},
+                        "r": [[0, 0, "21"], [0, 1, "E22350000"], [0, 2, "BALCHUG Racing"], [0, 3, "CN PRO"], [0, 4, "10"], [0, 5, "0"], [0, 6, "L0"]],
+                    },
+                ],
+            ],
+            received_at_us=received,
+        )
+        self.apply([["r_c", [[0, 1, "SIn Pit"], [0, 5, "1"]]]], received_at_us=received + 1_000_000)
+        self.apply(
+            [["r_c", [[0, 1, "SOutLap"], [0, 6, "L30000000"]]]],
+            received_at_us=received + 2_000_000,
+        )
+        self.apply([["r_c", [[0, 1, "SIn Pit"], [0, 5, "2"]]]], received_at_us=received + 3_000_000)
+        self.apply(
+            [["r_c", [[0, 1, "SOutLap"], [0, 6, "L30000000"]]]],
+            received_at_us=received + 4_000_000,
+        )
+
+        pits = self.connection.execute(
+            """
+            SELECT stop_number,pit_lane_ms,pit_lane_duration_source_cell_observation_id
+            FROM pit_stops ORDER BY stop_number
+            """
+        ).fetchall()
+        self.assertEqual([(pit["stop_number"], pit["pit_lane_ms"]) for pit in pits], [(1, 30000), (2, 30000)])
+        self.assertNotEqual(
+            pits[0]["pit_lane_duration_source_cell_observation_id"],
+            pits[1]["pit_lane_duration_source_cell_observation_id"],
+        )
+
+    def test_driver_stint_s_p_l_and_unknown_forms_are_typed_with_source_provenance_only(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 22_500_000
+        self.apply(
+            [
+                ["s_i", 22_500_000],
+                [
+                    "r_i",
+                    {
+                        "l": {"h": [{"n": "NR"}, {"n": "STATE"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "STINT"}]},
+                        "r": [[0, 0, "21"], [0, 1, "E22500000"], [0, 2, "BALCHUG Racing"], [0, 3, "CN PRO"], [0, 4, "S22500100"]],
+                    },
+                ],
+            ],
+            received_at_us=received,
+        )
+        self.apply([["r_c", [[0, 4, "P22500200"]]]], received_at_us=received + 100_000)
+        self.apply([["r_c", [[0, 4, "L30000000"]]]], received_at_us=received + 200_000)
+        self.apply([["r_c", [[0, 4, "S0"]]]], received_at_us=received + 250_000)
+        self.apply([["r_c", [[0, 4, "Xopaque"]]]], received_at_us=received + 300_000)
+
+        observations = self.connection.execute(
+            """
+            SELECT driver_stint_raw,driver_stint_kind,driver_stint_provider_ts_time,
+                   driver_stint_duration_ms,driver_stint_cell_observation_id
+            FROM participant_state_observations
+            WHERE driver_stint_raw IS NOT NULL
+            ORDER BY id
+            """
+        ).fetchall()
+        self.assertEqual(
+            [
+                (
+                    row["driver_stint_raw"],
+                    row["driver_stint_kind"],
+                    row["driver_stint_provider_ts_time"],
+                    row["driver_stint_duration_ms"],
+                )
+                for row in observations
+            ],
+            [
+                ("S22500100", "START_TS", 22_500_100, None),
+                ("P22500200", "POINT_TS", 22_500_200, None),
+                ("L30000000", "DURATION", None, 30_000),
+                ("S0", "UNKNOWN", None, None),
+                ("Xopaque", "UNKNOWN", None, None),
+            ],
+        )
+        self.assertTrue(all(row["driver_stint_cell_observation_id"] is not None for row in observations))
+        current = self.connection.execute(
+            """
+            SELECT current_driver_stint_raw,driver_stint_kind,driver_stint_duration_ms,
+                   driver_stint_source_cell_observation_id
+            FROM participant_state_current
+            """
+        ).fetchone()
+        self.assertEqual(
+            (current["current_driver_stint_raw"], current["driver_stint_kind"], current["driver_stint_duration_ms"]),
+            ("Xopaque", "UNKNOWN", None),
+        )
+        self.assertIsNotNone(current["driver_stint_source_cell_observation_id"])
 
     def test_completed_pit_interval_rejects_the_next_lap_as_clean(self):
         received = TIME_SERVICE_EPOCH_UNIX_US + 22_000_000
@@ -564,6 +1024,166 @@ class TimingNormalizerWriterTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual([tuple(stint) for stint in stints], [(1, None, 1, 1), (2, 1, None, 1)])
 
+    def test_no_laps_tracker_boundary_uses_same_frame_last_and_sector_cells(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 55_000_000
+        self.apply(
+            [
+                ["s_i", 55_000_000],
+                ["t_i", {"l": [[0, False, 0], [500, False, 1]], "d": []}],
+                [
+                    "r_i",
+                    {
+                        "l": {
+                            "h": [
+                                {"n": "NR"},
+                                {"n": "TEAM"},
+                                {"n": "CLS"},
+                                {"n": "STATE"},
+                                {"n": "LAST"},
+                                {"n": "SectorTimes", "p": "1"},
+                                {"n": "SectorTimes", "p": "2"},
+                                {"n": "SectorTimes", "p": "3"},
+                            ]
+                        },
+                        "r": [
+                            [0, 0, "21"],
+                            [0, 1, "BALCHUG Racing"],
+                            [0, 2, "CN PRO"],
+                            [0, 3, "E55000000"],
+                            [0, 4, "108000000"],
+                            [0, 5, "35000000"],
+                            [0, 6, "36000000"],
+                            [0, 7, "37000000"],
+                        ],
+                    },
+                ],
+            ],
+            received_at_us=received,
+        )
+        # The production feed emits S1/S2 in earlier result messages, then
+        # sends LAST followed by S3 in the same r_c as the finish passing.
+        self.apply(
+            [["r_c", [[0, 5, "34500000"], [0, 6, "35500000"]]]],
+            received_at_us=received + 50_000,
+        )
+        self.apply(
+            [
+                ["r_c", [[0, 4, "107491000"], [0, 7, "34552000"]]],
+                ["t_p", [[42, "21", 0, 500, 0, 47000, False, 55_110_000]]],
+            ],
+            received_at_us=received + 110_000,
+        )
+        # A following tracker passing without a new LAST cell must not become
+        # a synthetic 110 ms "lap".
+        self.apply(
+            [["t_p", [[42, "21", 0, 500, 0, 47000, False, 55_220_000]]]],
+            received_at_us=received + 220_000,
+        )
+
+        laps = self.connection.execute(
+            """
+            SELECT lap_number,completed_at_us,duration_ms,sectors_json,
+                   completion_passing_observation_id,duration_source_cell_observation_id,
+                   duration_source_message_id,source_message_id,duration_source_kind,
+                   sectors_source_cell_observation_ids_json
+            FROM laps ORDER BY lap_number
+            """
+        ).fetchall()
+        first, second = laps
+        self.assertEqual(first["duration_ms"], 107491)
+        self.assertEqual(
+            json.loads(first["sectors_json"]),
+            {"sector_1": "34500000", "sector_2": "35500000", "sector_3": "34552000"},
+        )
+        self.assertIsNotNone(first["completion_passing_observation_id"])
+        self.assertIsNotNone(first["duration_source_cell_observation_id"])
+        self.assertNotEqual(first["source_message_id"], first["duration_source_message_id"])
+        self.assertEqual(first["duration_source_kind"], "RESULT_GRID_LAST")
+        sector_sources = json.loads(first["sectors_source_cell_observation_ids_json"])
+        self.assertEqual(set(sector_sources), {"sector_1", "sector_2", "sector_3"})
+        source_sectors = self.connection.execute(
+            "SELECT id,value_text FROM participant_result_cell_observations WHERE id IN (?, ?, ?) ORDER BY id",
+            (sector_sources["sector_1"], sector_sources["sector_2"], sector_sources["sector_3"]),
+        ).fetchall()
+        self.assertEqual({row["value_text"] for row in source_sectors}, {"34500000", "35500000", "34552000"})
+        source_cell = self.connection.execute(
+            "SELECT value_text FROM participant_result_cell_observations WHERE id = ?",
+            (first["duration_source_cell_observation_id"],),
+        ).fetchone()
+        self.assertEqual(source_cell["value_text"], "107491000")
+        self.assertIsNone(second["duration_ms"])
+        self.assertIsNone(second["duration_source_cell_observation_id"])
+
+    def test_no_laps_tracker_boundary_requires_last_in_the_same_frame(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 56_000_000
+        self.apply(
+            [
+                ["s_i", 56_000_000],
+                ["t_i", {"l": [[0, False, 0], [500, False, 1]], "d": []}],
+                [
+                    "r_i",
+                    {
+                        "l": {"h": [{"n": "NR"}, {"n": "TEAM"}, {"n": "CLS"}, {"n": "STATE"}, {"n": "LAST"}]},
+                        "r": [[0, 0, "21"], [0, 1, "BALCHUG Racing"], [0, 2, "CN PRO"], [0, 3, "E56000000"], [0, 4, "108000000"]],
+                    },
+                ],
+            ],
+            received_at_us=received,
+        )
+        self.apply([["r_c", [[0, 4, "107491000"]]]], received_at_us=received + 10_000)
+        self.apply(
+            [["t_p", [[42, "21", 0, 500, 0, 47000, False, 56_110_000]]]],
+            received_at_us=received + 110_000,
+        )
+        lap = self.connection.execute(
+            "SELECT duration_ms,duration_source_cell_observation_id FROM laps"
+        ).fetchone()
+        self.assertEqual(tuple(lap), (None, None))
+
+    def test_same_frame_last_marks_pit_entry_lap_non_clean_when_tracker_arrives_first(self):
+        received = TIME_SERVICE_EPOCH_UNIX_US + 57_000_000
+        self.apply(
+            [
+                ["s_i", 57_000_000],
+                ["t_i", {"l": [[0, False, 0], [500, False, 1]], "d": []}],
+                [
+                    "r_i",
+                    {
+                        "l": {
+                            "h": [
+                                {"n": "NR"},
+                                {"n": "TEAM"},
+                                {"n": "CLS"},
+                                {"n": "STATE"},
+                                {"n": "PIT"},
+                                {"n": "LAST"},
+                            ]
+                        },
+                        "r": [
+                            [0, 0, "21"],
+                            [0, 1, "BALCHUG Racing"],
+                            [0, 2, "CN PRO"],
+                            [0, 3, "E57000000"],
+                            [0, 4, "0"],
+                            [0, 5, "108000000"],
+                        ],
+                    },
+                ],
+            ],
+            received_at_us=received,
+        )
+        self.apply(
+            [
+                ["t_p", [[42, "21", 0, 500, 0, 47000, True, 57_110_000]]],
+                ["r_c", [[0, 3, "SIn Pit"], [0, 4, "1"], [0, 5, "255104000"]]],
+            ],
+            received_at_us=received + 110_000,
+        )
+        lap = self.connection.execute(
+            "SELECT duration_ms,is_in_lap,is_out_lap,crosses_pit,is_clean FROM laps"
+        ).fetchone()
+        self.assertEqual(tuple(lap), (255104, 1, 0, 1, 0))
+
     def test_explicit_laps_create_known_and_skipped_lap_rows_without_guessing_missing_times(self):
         received = TIME_SERVICE_EPOCH_UNIX_US + 60_000_000
         self.apply(
@@ -598,8 +1218,11 @@ class TimingNormalizerWriterTests(unittest.TestCase):
                                 {"n": "CLS"},
                                 {"n": "STATE"},
                                 {"n": "LAPS"},
-                                {"n": "SECT 1"},
-                                {"n": "SECT 2"},
+                                {"n": "LAST"},
+                                # Time Service sends the ordinal in `p`; the
+                                # display caption is not the canonical key.
+                                {"n": "SectorTimes", "p": "1", "c": "SECT 1"},
+                                {"n": "SectorTimes", "p": "2", "c": "SECT 2"},
                             ]
                         },
                         "r": [
@@ -608,8 +1231,9 @@ class TimingNormalizerWriterTests(unittest.TestCase):
                             [0, 2, "CN PRO"],
                             [0, 3, "E65000000"],
                             [0, 4, "5"],
-                            [0, 5, "35000000"],
-                            [0, 6, "36000000"],
+                            [0, 5, "110000000"],
+                            [0, 6, "35000000"],
+                            [0, 7, "36000000"],
                         ],
                     },
                 ]
@@ -617,13 +1241,20 @@ class TimingNormalizerWriterTests(unittest.TestCase):
             received_at_us=received,
         )
         self.apply(
-            [["r_c", [[0, 4, "6"], [0, 5, "34000000"], [0, 6, "35500000"]]]],
+            [
+                [
+                    "r_c",
+                    [[0, 4, "6"], [0, 6, "34000000"], [0, 7, "9223372036854775807"], [0, 5, "108000000"]],
+                ]
+            ],
             received_at_us=received + 1_000_000,
         )
-        sectors = json.loads(
-            self.connection.execute("SELECT sectors_json FROM laps WHERE lap_number = 6").fetchone()[0]
-        )
-        self.assertEqual(sectors, {"sector_1": "34000000", "sector_2": "35500000"})
+        lap = self.connection.execute(
+            "SELECT sectors_json,sectors_source_cell_observation_ids_json FROM laps WHERE lap_number = 6"
+        ).fetchone()
+        sectors = json.loads(lap["sectors_json"])
+        self.assertEqual(sectors, {"sector_1": "34000000", "sector_2": None})
+        self.assertEqual(set(json.loads(lap["sectors_source_cell_observation_ids_json"])), {"sector_1", "sector_2"})
 
     def test_missing_nr_reuses_team_identity_and_conflicting_nr_21_does_not_replace_ours(self):
         received = TIME_SERVICE_EPOCH_UNIX_US + 70_000_000

@@ -33,11 +33,50 @@ class ResultGrid:
     rows: dict[int, dict[int, ResultCell]] = field(default_factory=dict)
     metadata_changes: list[tuple[Any, ...]] = field(default_factory=list)
     layout_generation: int = 0
+    schema_pending: bool = True
+    schema_conflicts: dict[str, tuple[int, ...]] = field(default_factory=dict)
+
+    @staticmethod
+    def _schema_conflicts(columns: Mapping[int, ResultColumn]) -> dict[str, tuple[int, ...]]:
+        """Return duplicate canonical headers that would make a row ambiguous.
+
+        The provider can move columns at runtime.  Two recognized aliases for
+        the same canonical field are not safe to choose between, because the
+        later sparse cell would silently overwrite the earlier one in
+        :meth:`row_values`.  Unknown fields remain lossless and are therefore
+        not a conflict.
+        """
+
+        indexes_by_key: dict[str, list[int]] = {}
+        for index, column in columns.items():
+            if column.key is not None:
+                indexes_by_key.setdefault(column.key, []).append(index)
+        return {
+            key: tuple(indexes)
+            for key, indexes in indexes_by_key.items()
+            if len(indexes) > 1
+        }
+
+    @property
+    def schema_ready(self) -> bool:
+        """Whether cells can safely be materialized using the current layout."""
+
+        return self.layout is not None and not self.schema_pending and not self.schema_conflicts
 
     def set_layout(self, layout: Any) -> None:
-        """Install a new layout while retaining sparse cells only when explicit."""
+        """Install a new layout and require a fresh snapshot before deltas.
+
+        ``r_l`` can remap an existing column index (notably ``POS``/``PIC``).
+        Retaining old sparse cells across that boundary would reinterpret a
+        factual absolute position as a class position, or vice versa.  Clear
+        the materialized state and wait for the next authoritative ``r_i``.
+        """
+
         self.layout = copy.deepcopy(layout)
         self.columns = result_columns(layout)
+        self.rows.clear()
+        self.schema_pending = True
+        self.schema_conflicts = self._schema_conflicts(self.columns)
         self.layout_generation += 1
 
     @staticmethod
@@ -55,6 +94,12 @@ class ResultGrid:
             self.set_layout(layout)
         self.rows.clear()
         self.metadata_changes.clear()
+        if self.layout is None:
+            self.schema_pending = True
+            return
+        # A snapshot is the only message that can make a new r_l schema live.
+        # Conflicting canonical headers remain fail-closed even after r_i.
+        self.schema_pending = False
         self.apply_changes(payload.get("r"))
 
     def apply_changes(self, payload: Any) -> None:
@@ -66,6 +111,12 @@ class ResultGrid:
             row_index, column_index = change[0], change[1]
             if row_index < 0 or column_index < 0:
                 self.metadata_changes.append(tuple(copy.deepcopy(change)))
+                continue
+            # Do not retain a delta that arrived between a layout change and
+            # its full r_i snapshot, or under an ambiguous duplicate header.
+            # The writer still persists the raw message independently; this
+            # reducer simply refuses to turn it into live tactical facts.
+            if not self.schema_ready:
                 continue
             values = tuple(copy.deepcopy(value) for value in change[2:])
             self.rows.setdefault(row_index, {})[column_index] = ResultCell(
@@ -83,6 +134,8 @@ class ResultGrid:
 
     def row_values(self, row_index: int) -> dict[str, Any]:
         """Materialize recognized keys and raw unknown columns for one source row."""
+        if not self.schema_ready:
+            return {}
         result: dict[str, Any] = {}
         for column_index, cell in self.rows.get(row_index, {}).items():
             column = self.columns.get(column_index)
@@ -94,6 +147,8 @@ class ResultGrid:
         return result
 
     def all_rows(self) -> dict[int, dict[str, Any]]:
+        if not self.schema_ready:
+            return {}
         return {row_index: self.row_values(row_index) for row_index in sorted(self.rows)}
 
     def snapshot(self) -> dict[str, Any]:
@@ -109,4 +164,8 @@ class ResultGrid:
             },
             "metadata_changes": [list(change) for change in self.metadata_changes],
             "layout_generation": self.layout_generation,
+            "schema_pending": self.schema_pending,
+            "schema_conflicts": {
+                key: list(indexes) for key, indexes in sorted(self.schema_conflicts.items())
+            },
         }

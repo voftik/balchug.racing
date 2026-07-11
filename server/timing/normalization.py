@@ -232,13 +232,23 @@ _RESULT_FIELD_ALIASES = {
 }
 
 
-def _result_field_key(source_name: str) -> str | None:
+def _result_field_key(source_name: str, source_parameter: str | None = None) -> str | None:
     token = _header_token(source_name)
     known = _RESULT_FIELD_ALIASES.get(token)
     if known is not None:
         return known
     sector = re.fullmatch(r"(?:sectortimes?|sector|sect)([1-9][0-9]*)", token)
-    return f"sector_{sector.group(1)}" if sector else None
+    if sector is not None:
+        return f"sector_{sector.group(1)}"
+    # The live Time Service layout names each sector column ``SectorTimes``
+    # and carries its ordinal separately in the header parameter (``p``).
+    # A generic sector header without a positive numeric ordinal remains raw
+    # rather than being assigned an invented timing dimension.
+    if token in {"sectortime", "sectortimes", "sector", "sect"} and source_parameter is not None:
+        parameter = source_parameter.strip()
+        if re.fullmatch(r"[1-9][0-9]*", parameter):
+            return f"sector_{parameter}"
+    return None
 
 
 def result_columns(layout: Any) -> dict[int, ResultColumn]:
@@ -269,7 +279,7 @@ def result_columns(layout: Any) -> dict[int, ResultColumn]:
             index=index,
             source_name=source_name,
             source_parameter=source_parameter,
-            key=_result_field_key(source_name),
+            key=_result_field_key(source_name, source_parameter),
         )
     return columns
 
