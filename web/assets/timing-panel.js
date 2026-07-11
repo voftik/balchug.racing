@@ -5,6 +5,7 @@
   var ADMIN_TOKEN_KEY = "balchug_admin";
   var ENGINEER_TOKEN_KEY = "balchug_engineer_token";
   var PANEL_STATE_KEY = "balchug_timing_panel";
+  var LIVE_HISTORY_OVERLAP_US = 300000000;
   var TAB_TITLES = {
     overview: "Тактический обзор",
     pace: "Темп по кругам",
@@ -197,6 +198,10 @@
     historyTimer: null,
     historyRequestSerial: 0,
     historyRequestKey: null,
+    historyRequestInFlight: false,
+    historyRefreshPending: false,
+    historyForceFullPending: false,
+    historyTimerForceFull: false,
     history: null,
     clockTimer: null,
     lastSnapshotAt: 0,
@@ -1588,6 +1593,9 @@
     closeStream();
     state.history = null;
     state.historyRequestKey = null;
+    state.historyRefreshPending = false;
+    state.historyForceFullPending = false;
+    state.historyTimerForceFull = false;
     state.viewReady = {};
     resetComparisonViews();
     if (state.demo) {
@@ -1658,40 +1666,221 @@
     return sessionId + ":" + participantIds.join(",");
   }
 
-  function loadDashboardHistory() {
+  function mergeHistoryItems(previous, incoming, key, compare, merge) {
+    var result = [];
+    var indexes = Object.create(null);
+    (previous || []).forEach(function (item) {
+      var itemKey = key(item);
+      if (itemKey == null || indexes[itemKey] != null) return;
+      indexes[itemKey] = result.length;
+      result.push(item);
+    });
+    (incoming || []).forEach(function (item) {
+      var itemKey = key(item);
+      if (itemKey == null) return;
+      var index = indexes[itemKey];
+      if (index == null) {
+        indexes[itemKey] = result.length;
+        result.push(item);
+      } else {
+        result[index] = merge ? merge(result[index], item) : item;
+      }
+    });
+    if (compare) result.sort(compare);
+    return result;
+  }
+
+  function lapHistoryKey(point) {
+    if (point && point.source && point.source.cell_observation_id != null) {
+      return "cell:" + point.source.cell_observation_id;
+    }
+    if (point && point.canonical_lap_id) return "canonical:" + point.canonical_lap_id;
+    return point ? [point.capture_at_us, point.lap_number, point.duration_ms].join(":") : null;
+  }
+
+  function intervalHistoryKey(point) {
+    return point ? [point.participant_id, point.relation, point.observed_at_us].join(":") : null;
+  }
+
+  function mergeFlagHistory(previous, incoming) {
+    var result = (previous || []).slice();
+    (incoming || []).forEach(function (next) {
+      var nextEnd = isNumber(next.ended_at_us) ? next.ended_at_us : Infinity;
+      var match = result.findIndex(function (current) {
+        var currentEnd = isNumber(current.ended_at_us) ? current.ended_at_us : Infinity;
+        return current.flag === next.flag && current.started_at_us <= nextEnd && next.started_at_us <= currentEnd;
+      });
+      if (match === -1) {
+        result.push(next);
+        return;
+      }
+      var current = result[match];
+      result[match] = Object.assign({}, current, next, {
+        started_at_us: Math.min(current.started_at_us, next.started_at_us),
+        ended_at_us: next.ended_at_us == null ? null :
+          (current.ended_at_us == null ? next.ended_at_us : Math.max(current.ended_at_us, next.ended_at_us)),
+        carried_into_range: Boolean(current.carried_into_range && next.carried_into_range)
+      });
+    });
+    result.sort(function (left, right) { return left.started_at_us - right.started_at_us; });
+    return result;
+  }
+
+  function mergeTimeAxes(previous, incoming) {
+    if (!previous) return incoming;
+    if (!incoming) return previous;
+    var previousSource = previous.source || {};
+    var incomingSource = incoming.source || {};
+    var anchors = mergeHistoryItems(
+      previousSource.anchors,
+      incomingSource.anchors,
+      function (anchor) { return anchor ? [anchor.connection_id, anchor.capture_at_us].join(":") : null; },
+      function (left, right) { return left.capture_at_us - right.capture_at_us; }
+    );
+    return {
+      playback: previous.playback || incoming.playback,
+      source: Object.assign({}, previousSource, incomingSource, {
+        session_origin: previousSource.session_origin || incomingSource.session_origin,
+        anchors: anchors
+      })
+    };
+  }
+
+  function mergeDashboardHistory(previous, incoming) {
+    if (!previous || previous.session_id !== incoming.session_id) return incoming;
+    var merged = Object.assign({}, previous, incoming);
+    merged.range = Object.assign({}, previous.range, incoming.range, {
+      first_at_us: Math.min(previous.range.first_at_us, incoming.range.first_at_us),
+      last_at_us: Math.max(previous.range.last_at_us, incoming.range.last_at_us)
+    });
+    merged.participants = incoming.participants || previous.participants;
+    merged.lap_series = {};
+    var participantIds = Object.keys(previous.lap_series || {}).concat(Object.keys(incoming.lap_series || {}));
+    participantIds.filter(function (id, index, values) { return values.indexOf(id) === index; }).forEach(function (id) {
+      var oldSeries = previous.lap_series && previous.lap_series[id] || {};
+      var nextSeries = incoming.lap_series && incoming.lap_series[id] || {};
+      var points = mergeHistoryItems(
+        oldSeries.points,
+        nextSeries.points,
+        lapHistoryKey,
+        function (left, right) { return left.capture_at_us - right.capture_at_us; }
+      );
+      merged.lap_series[id] = {
+        source_point_count: Math.max(oldSeries.source_point_count || 0, nextSeries.source_point_count || 0, points.length),
+        truncated: Boolean(oldSeries.truncated || nextSeries.truncated),
+        points: points
+      };
+    });
+    var intervalPoints = mergeHistoryItems(
+      previous.interval_series && previous.interval_series.points,
+      incoming.interval_series && incoming.interval_series.points,
+      intervalHistoryKey,
+      function (left, right) {
+        return left.observed_at_us - right.observed_at_us || String(left.participant_id).localeCompare(String(right.participant_id));
+      }
+    );
+    merged.interval_series = Object.assign({}, previous.interval_series, incoming.interval_series, {
+      source_point_count: Math.max(
+        previous.interval_series && previous.interval_series.source_point_count || 0,
+        incoming.interval_series && incoming.interval_series.source_point_count || 0,
+        intervalPoints.length
+      ),
+      downsampled: Boolean(
+        previous.interval_series && previous.interval_series.downsampled ||
+        incoming.interval_series && incoming.interval_series.downsampled
+      ),
+      points: intervalPoints
+    });
+    merged.pit_stops = mergeHistoryItems(
+      previous.pit_stops,
+      incoming.pit_stops,
+      function (pit) { return pit ? [pit.participant_id, pit.stop_number].join(":") : null; },
+      function (left, right) { return left.timeline_started_at_us - right.timeline_started_at_us; },
+      function (current, next) {
+        return Object.assign({}, current, next, {
+          carried_into_range: Boolean(current.carried_into_range && next.carried_into_range)
+        });
+      }
+    );
+    merged.flags = mergeFlagHistory(previous.flags, incoming.flags);
+    merged.ingest_gaps = mergeHistoryItems(
+      previous.ingest_gaps,
+      incoming.ingest_gaps,
+      function (gap) { return gap && gap.gap_id != null ? String(gap.gap_id) : null; },
+      function (left, right) { return left.started_at_us - right.started_at_us; },
+      function (current, next) {
+        return Object.assign({}, current, next, {
+          carried_into_range: Boolean(current.carried_into_range && next.carried_into_range)
+        });
+      }
+    );
+    merged.time_axes = mergeTimeAxes(previous.time_axes, incoming.time_axes);
+    return merged;
+  }
+
+  function loadDashboardHistory(forceFull) {
     if (state.demo || !state.activeSession || !state.view || !state.view.ours) return Promise.resolve(null);
+    if (state.historyRequestInFlight) {
+      state.historyRefreshPending = true;
+      state.historyForceFullPending = state.historyForceFullPending || Boolean(forceFull);
+      return Promise.resolve(null);
+    }
     var sessionId = state.activeSession.id;
     var participantIds = historyParticipantIds();
     if (!participantIds.length) return Promise.resolve(null);
     var requestKey = dashboardHistoryKey(sessionId, participantIds);
+    var incremental = !forceFull && state.history && state.historyRequestKey === requestKey &&
+      state.history.range && isNumber(state.history.range.last_at_us);
     var serial = ++state.historyRequestSerial;
     var queryString = participantIds.map(function (participantId) {
       return "participant_id=" + encodeURIComponent(participantId);
     }).join("&");
+    if (incremental) {
+      queryString += "&from_at_us=" + encodeURIComponent(Math.max(
+        state.history.range.first_at_us || 0,
+        state.history.range.last_at_us - LIVE_HISTORY_OVERLAP_US
+      ));
+    }
+    state.historyRequestInFlight = true;
     return fetchJson(API + "/sessions/" + encodeURIComponent(sessionId) + "/dashboard/history?" + queryString)
       .then(function (payload) {
         if (serial !== state.historyRequestSerial || !state.activeSession || state.activeSession.id !== sessionId) return null;
         if (dashboardHistoryKey(sessionId, historyParticipantIds()) !== requestKey) return null;
-        state.history = payload;
+        state.history = incremental ? mergeDashboardHistory(state.history, payload) : payload;
         state.historyRequestKey = requestKey;
-        if (state.view && state.view.sessionId === sessionId) state.view.history = payload;
+        if (state.view && state.view.sessionId === sessionId) state.view.history = state.history;
         renderView(false);
-        return payload;
+        return state.history;
       }).catch(function (error) {
         if (serial === state.historyRequestSerial) announce("История телеметрии временно недоступна: " + error.message);
         return null;
+      }).finally(function () {
+        state.historyRequestInFlight = false;
+        if (!state.historyRefreshPending) return;
+        var nextForceFull = state.historyForceFullPending;
+        state.historyRefreshPending = false;
+        state.historyForceFullPending = false;
+        scheduleHistoryRefresh(true, nextForceFull);
       });
   }
 
-  function scheduleHistoryRefresh(immediate) {
+  function scheduleHistoryRefresh(immediate, forceFull) {
     if (state.demo || !state.activeSession || !state.view || !state.view.ours) return;
     var participantIds = historyParticipantIds();
     var requestKey = dashboardHistoryKey(state.activeSession.id, participantIds);
-    if (!immediate && state.historyRequestKey === requestKey && state.history) return;
+    if (!forceFull && !immediate && state.historyRequestKey === requestKey && state.history) return;
+    if (state.historyRequestInFlight) {
+      state.historyRefreshPending = true;
+      state.historyForceFullPending = state.historyForceFullPending || Boolean(forceFull);
+      return;
+    }
     if (state.historyTimer) window.clearTimeout(state.historyTimer);
+    state.historyTimerForceFull = state.historyTimerForceFull || Boolean(forceFull);
     state.historyTimer = window.setTimeout(function () {
       state.historyTimer = null;
-      loadDashboardHistory();
+      var nextForceFull = state.historyTimerForceFull;
+      state.historyTimerForceFull = false;
+      loadDashboardHistory(nextForceFull);
     }, immediate ? 0 : 120);
   }
 
@@ -1707,18 +1896,31 @@
     closeStream();
     if (!window.EventSource || state.demo) return;
     state.stream = new EventSource(API + "/sessions/" + encodeURIComponent(sessionId) + "/stream");
-    ["snapshot", "reset"].forEach(function (type) {
-      state.stream.addEventListener(type, function (event) {
-        try { applySnapshot(JSON.parse(event.data)); } catch (error) { scheduleSnapshotRefresh(); }
-      });
+    state.stream.addEventListener("snapshot", function (event) {
+      try { applySnapshot(JSON.parse(event.data)); } catch (error) { scheduleSnapshotRefresh(); }
     });
-    ["state", "metric", "alert"].forEach(function (type) {
+    state.stream.addEventListener("reset", function (event) {
+      state.history = null;
+      state.historyRequestKey = null;
+      try { applySnapshot(JSON.parse(event.data)); } catch (error) { scheduleSnapshotRefresh(); }
+    });
+    ["state", "alert"].forEach(function (type) {
       state.stream.addEventListener(type, scheduleSnapshotRefresh);
     });
-    ["lap", "flag", "pit", "quality"].forEach(function (type) {
+    state.stream.addEventListener("metric", function () {
+      scheduleSnapshotRefresh();
+      scheduleHistoryRefresh(true, false);
+    });
+    ["lap", "pit"].forEach(function (type) {
       state.stream.addEventListener(type, function () {
         scheduleSnapshotRefresh();
-        scheduleHistoryRefresh(true);
+        scheduleHistoryRefresh(true, false);
+      });
+    });
+    ["flag", "quality"].forEach(function (type) {
+      state.stream.addEventListener(type, function () {
+        scheduleSnapshotRefresh();
+        scheduleHistoryRefresh(true, true);
       });
     });
     state.stream.onerror = function () {
@@ -1737,6 +1939,7 @@
     state.refreshTimer = null;
     if (state.historyTimer) window.clearTimeout(state.historyTimer);
     state.historyTimer = null;
+    state.historyTimerForceFull = false;
   }
 
   function startDemoClock() {

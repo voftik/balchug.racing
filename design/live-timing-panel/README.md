@@ -151,6 +151,22 @@ The lower axis keeps a tick for every BALCHUG lap. Labels use the requested
 five-lap step while it fits; a full 12/24-hour overview thins labels only by a
 multiple of five to prevent overlap, and zooming restores the five-lap labels.
 
+### Live history tail
+
+The first load and every comparison-selection change request the full bounded
+history. Subsequent SSE metric events request a five-minute overlapping tail,
+coalesce while one request is in flight, and merge laps, interval boundaries,
+pits, flags, ingest gaps and source-clock anchors by stable source identity.
+Flag/quality events can force a full reconciliation for late provider history.
+This keeps new interval points inside the two-second live budget without
+reading and transferring the entire 4/24-hour series every second.
+
+On the active four-hour production race, the full three-car payload measured
+284 KB and 305-436 ms. A five-minute tail measured about 10 KB and 27 ms at the
+API; the proxied browser cycle, including an artificial 120 ms delay, completed
+in 311 ms. Five events received during one delayed request coalesced into one
+follow-up request.
+
 ## Responsive matrix
 
 | Viewport | Public mode | Boris mode | Decision strip | Metric grid |
