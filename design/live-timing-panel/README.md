@@ -30,6 +30,7 @@ database.
 |                    interactive timing iframe                           |
 +-------------------------------------------------------------------------+
 | session: Practice | Qualifying | Race       lifecycle / time / Stop     |
+| operational warning / critical strip (hidden while healthy)             |
 | flag strip                                                               |
 | session / freshness / identity                                           |
 | PIC | ahead | behind | last lap | tyre age | pits                        |
@@ -67,15 +68,18 @@ The Race dialog contains only the two permitted race parameters:
 
 ## Information hierarchy
 
-1. Flag and source freshness lead the admin dashboard immediately below the
-   lifecycle bar.
-2. The decision strip exposes PIC/OA, confirmed gaps, source LAST, tyre age and pit
+1. A global operational strip appears below the lifecycle bar only for a
+   warning or critical condition; it stays absent while every subsystem is
+   healthy.
+2. Flag and source freshness lead the tactical dashboard immediately below
+   the operational strip.
+3. The decision strip exposes PIC/OA, confirmed gaps, source LAST, tyre age and pit
    obligation without scrolling.
-3. Tabs separate repeated decisions: Overview, Pace, Intervals, Pits, Class
+4. Tabs separate repeated decisions: Overview, Pace, Intervals, Pits, Class
    and Events.
-4. Overview uses full-width bands and bordered metric grids. It does not
+5. Overview uses full-width bands and bordered metric grids. It does not
    nest cards.
-5. Class view prioritizes `PIC | Team/Car | Pace5 | Tyres | Pits | Compare`.
+6. Class view prioritizes `PIC | Team/Car | Pace5 | Tyres | Pits | Compare`.
    `Last` is intentionally hidden in the compact panel because it duplicates a
    nearby pace decision and would remove the team identity column.
 
@@ -217,6 +221,7 @@ follow-up request.
 | alerts/events | session `alerts`, stream flag/pit/lap/alert events |
 | charts | bounded `dashboard/history` lap, source-linked sectors, interval, flag, pit and source-time axes |
 | stint timeline | `dashboard/history.pit_stops`, `flags`, participant `stint_summary/tyre_age_laps` |
+| operational strip | global `/health` alert codes, polled every five seconds in Boris mode only |
 
 Lifecycle calls use the existing contract: create draft, then start; stop is an
 explicit separate action. Each write carries `Authorization: Bearer` and a

@@ -17,6 +17,28 @@
     events: "События"
   };
   var MODE_LABELS = { practice: "Практика", qualifying: "Квалификация", race: "Гонка" };
+  var OPERATION_LABELS = {
+    WORKER_OFFLINE: "процесс записи телеметрии не работает",
+    WORKER_STALE: "процесс записи телеметрии не отвечает",
+    SOURCE_OFFLINE: "поток хронометража отключён",
+    SOURCE_STALE: "данные хронометража поступают с задержкой",
+    PROCESSING_QUEUE_LAG: "накопилась очередь необработанных кадров",
+    FRAME_DECODE_FAILURE: "обнаружен необработанный кадр источника",
+    RECONNECT_STORM: "источник слишком часто переподключается",
+    CHECKPOINT_INVALID: "точка восстановления повреждена",
+    CHECKPOINT_MISSING: "точка восстановления ещё не создана",
+    RESULT_SCHEMA_DEGRADED: "изменилась схема таблицы результатов",
+    RESULT_SCHEMA_PENDING: "схема таблицы результатов ещё не подтверждена",
+    UNKNOWN_SOURCE_HANDLE: "источник передал новый тип сообщения",
+    INGEST_RUN_FAILED: "последний цикл записи завершился с ошибкой",
+    DISK_SPACE_LOW: "заканчивается место для телеметрии",
+    DATABASE_SIZE_HIGH: "база телеметрии превысила рабочий объём",
+    DATABASE_SIZE_UNAVAILABLE: "не удалось определить объём базы телеметрии",
+    SCHEMA_MIGRATION_MISMATCH: "схема базы телеметрии неактуальна",
+    DATABASE_UNAVAILABLE: "база телеметрии недоступна",
+    DISK_STATUS_UNAVAILABLE: "не удалось проверить свободное место",
+    SESSION_HEALTH_UNAVAILABLE: "не удалось проверить текущую сессию"
+  };
   var SERIES_KEYS = ["blue", "teal", "amber", "violet"];
   var SERIES_COLORS = {
     ours: "#F0143D",
@@ -162,6 +184,8 @@
 
   var dom = {
     workspace: byId("timingWorkspace"), suite: byId("engineerSuite"), panel: byId("engineerPanel"), iframe: byId("lt"),
+    operationalAlerts: byId("operationalAlerts"), operationalAlertTitle: byId("operationalAlertTitle"),
+    operationalAlertText: byId("operationalAlertText"),
     sessionBadge: byId("sessionBadge"), sessionClock: byId("sessionClock"), stop: byId("sessionStop"),
     panelFlagStrip: byId("panelFlagStrip"), panelFlag: byId("panelFlag"), panelFlagElapsed: byId("panelFlagElapsed"),
     panelMode: byId("panelMode"), panelHeat: byId("panelHeat"), freshness: byId("freshnessBadge"),
@@ -209,6 +233,7 @@
     historyTimerForceFull: false,
     history: null,
     clockTimer: null,
+    operationsTimer: null,
     lastSnapshotAt: 0,
     busy: false,
     competitorMode: "auto",
@@ -1623,6 +1648,46 @@
     });
   }
 
+  function renderOperationalHealth(report, requestError) {
+    if (!dom.operationalAlerts) return;
+    var alerts = report && Array.isArray(report.alerts) ? report.alerts : [];
+    if (!requestError && (!report || report.status === "HEALTHY" || alerts.length === 0)) {
+      dom.operationalAlerts.hidden = true;
+      dom.operationalAlertText.textContent = "";
+      return;
+    }
+    var critical = Boolean(requestError) || report.status === "CRITICAL" || alerts.some(function (alert) {
+      return alert && alert.severity === "CRITICAL";
+    });
+    var messages = alerts.slice(0, 3).map(function (alert) {
+      return OPERATION_LABELS[alert.code] || "неизвестное состояние подсистемы телеметрии";
+    });
+    if (requestError) messages = ["глобальный контроль телеметрии недоступен"];
+    if (alerts.length > 3) messages.push("ещё проблем: " + String(alerts.length - 3));
+    dom.operationalAlerts.dataset.severity = critical ? "CRITICAL" : "WARNING";
+    dom.operationalAlerts.setAttribute("aria-live", critical ? "assertive" : "polite");
+    dom.operationalAlertTitle.textContent = critical ? "Критическая проблема" : "Требуется внимание";
+    dom.operationalAlertText.textContent = messages.join(" · ");
+    dom.operationalAlerts.hidden = false;
+  }
+
+  function refreshOperationalHealth() {
+    return fetchJson(API + "/health")
+      .then(function (report) { renderOperationalHealth(report, false); })
+      .catch(function () { renderOperationalHealth(null, true); });
+  }
+
+  function startOperationalHealth() {
+    refreshOperationalHealth();
+    if (state.operationsTimer) window.clearInterval(state.operationsTimer);
+    state.operationsTimer = window.setInterval(refreshOperationalHealth, 5000);
+  }
+
+  function stopOperationalHealth() {
+    if (state.operationsTimer) window.clearInterval(state.operationsTimer);
+    state.operationsTimer = null;
+  }
+
   function engineerToken() {
     try { return sessionStorage.getItem(ENGINEER_TOKEN_KEY) || ""; } catch (error) { return ""; }
   }
@@ -2243,9 +2308,13 @@
     state.track = nextTrack;
     loadActiveSession();
   });
-  window.addEventListener("beforeunload", closeStream);
+  window.addEventListener("beforeunload", function () {
+    closeStream();
+    stopOperationalHealth();
+  });
 
   setupTooltips();
   switchTab(state.tab, false);
+  startOperationalHealth();
   loadActiveSession();
 }());

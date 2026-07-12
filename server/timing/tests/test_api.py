@@ -11,7 +11,10 @@ import httpx
 from starlette.requests import Request
 
 from timing.api import app, timing_stream
+from timing.config import now_us
 from timing.db import connect, migrate
+from timing.operations import reconcile_health_report
+from timing.worker_heartbeat import write_worker_heartbeat
 
 
 class TimingApiTests(unittest.IsolatedAsyncioTestCase):
@@ -47,6 +50,74 @@ class TimingApiTests(unittest.IsolatedAsyncioTestCase):
             f"/sources/{source}/sessions",
             json=body,
             headers=self.write_headers(key),
+        )
+
+    async def test_global_health_readiness_and_incident_api_are_bounded(self):
+        connection = connect(self.database)
+        try:
+            write_worker_heartbeat(
+                connection,
+                instance_id="api-healthy",
+                state="READY",
+                active_session_count=0,
+                observed_at_us=now_us(),
+                pid=42,
+            )
+        finally:
+            connection.close()
+
+        healthy = await self.client.get("/health")
+        self.assertEqual(healthy.status_code, 200)
+        self.assertEqual(healthy.headers["cache-control"], "no-store")
+        self.assertEqual(healthy.json()["schema_version"], "timing-operations.v1")
+        self.assertEqual(healthy.json()["status"], "HEALTHY")
+        self.assertTrue(healthy.json()["engineer_access_configured"])
+        self.assertEqual((await self.client.get("/ready")).status_code, 200)
+
+        connection = connect(self.database)
+        try:
+            write_worker_heartbeat(
+                connection,
+                instance_id="api-offline",
+                state="READY",
+                active_session_count=0,
+                observed_at_us=now_us() - 11_000_000,
+                pid=43,
+            )
+        finally:
+            connection.close()
+        unavailable = await self.client.get("/ready")
+        self.assertEqual(unavailable.status_code, 503)
+        self.assertEqual(unavailable.json()["status"], "CRITICAL")
+        self.assertEqual(unavailable.json()["alerts"][0]["code"], "WORKER_OFFLINE")
+        reconcile_health_report(self.database, unavailable.json())
+
+        incidents = await self.client.get("/operations/incidents?open_only=true&limit=10")
+        self.assertEqual(incidents.status_code, 200)
+        self.assertEqual(incidents.headers["cache-control"], "no-store")
+        self.assertEqual(incidents.json()["items"][0]["code"], "WORKER_OFFLINE")
+        self.assertNotIn("test-engineer-token", incidents.text)
+        self.assertNotIn("raw_payload", incidents.text)
+        self.assertEqual((await self.client.get("/operations/incidents?limit=0")).status_code, 422)
+
+        connection = connect(self.database)
+        try:
+            write_worker_heartbeat(
+                connection,
+                instance_id="api-recovered",
+                state="READY",
+                active_session_count=0,
+                observed_at_us=now_us(),
+                pid=44,
+            )
+        finally:
+            connection.close()
+        recovered = await self.client.get("/ready")
+        self.assertEqual(recovered.status_code, 200)
+        reconcile_health_report(self.database, recovered.json())
+        self.assertEqual(
+            (await self.client.get("/operations/incidents?open_only=true")).json()["items"],
+            [],
         )
 
     async def test_write_contract_auth_and_idempotency(self):
