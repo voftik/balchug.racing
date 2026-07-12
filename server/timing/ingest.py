@@ -109,7 +109,10 @@ class TimingIngestSupervisor:
                         except asyncio.CancelledError:
                             pass
                         except Exception:
-                            LOGGER.exception("timing ingest task crashed", extra={"session_id": session_id})
+                            LOGGER.exception(
+                                "timing ingest task crashed",
+                                extra={"event": "ingest_task_crashed", "session_id": session_id},
+                            )
                         del self._tasks[session_id]
                     elif session_id not in desired:
                         # A stopped/aborted lifecycle is authoritative. Leave
@@ -243,7 +246,15 @@ class TimingIngestSupervisor:
                     raise
                 except Exception as error:
                     reason = f"error:{type(error).__name__}"
-                    LOGGER.warning("timing source connection failed: %s", error, extra={"session_id": session.id})
+                    LOGGER.warning(
+                        "timing source connection failed",
+                        extra={
+                            "event": "source_connection_failed",
+                            "session_id": session.id,
+                            "source_slug": session.source_slug,
+                            "error_type": type(error).__name__,
+                        },
+                    )
                 finally:
                     disconnect_started_at_us = now_us()
                     if upstream is not None:

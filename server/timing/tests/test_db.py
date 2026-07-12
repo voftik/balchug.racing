@@ -148,7 +148,7 @@ class TimingDatabaseTests(unittest.TestCase):
             path = Path(temporary) / "timing.db"
             self.assertEqual(
                 migrate(path),
-                ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018", "0019", "0020", "0021"],
+                ["0001", "0002", "0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018", "0019", "0020", "0021", "0022"],
             )
             self.assertEqual(migrate(path), [])
             connection = connect(path)
@@ -183,6 +183,7 @@ class TimingDatabaseTests(unittest.TestCase):
                         "gap_coordinate_snapshots",
                         "participant_gap_coordinates",
                         "timing_worker_heartbeats",
+                        "timing_operational_incidents",
                     }.issubset(tables)
                 )
             finally:
@@ -564,7 +565,7 @@ class TimingDatabaseTests(unittest.TestCase):
 
             self.assertEqual(
                 migrate(path),
-                ["0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018", "0019", "0020", "0021"],
+                ["0003", "0004", "0005", "0006", "0007", "0008", "0009", "0010", "0011", "0012", "0013", "0014", "0015", "0016", "0017", "0018", "0019", "0020", "0021", "0022"],
             )
             connection = connect(path)
             try:
@@ -680,7 +681,7 @@ class TimingDatabaseTests(unittest.TestCase):
             finally:
                 connection.close()
 
-            self.assertEqual(migrate(path), ["0013", "0014", "0015", "0016", "0017", "0018", "0019", "0020", "0021"])
+            self.assertEqual(migrate(path), ["0013", "0014", "0015", "0016", "0017", "0018", "0019", "0020", "0021", "0022"])
             connection = connect(path)
             try:
                 current = connection.execute(
@@ -792,7 +793,7 @@ class TimingDatabaseTests(unittest.TestCase):
             finally:
                 connection.close()
 
-            self.assertEqual(migrate(path), ["0014", "0015", "0016", "0017", "0018", "0019", "0020", "0021"])
+            self.assertEqual(migrate(path), ["0014", "0015", "0016", "0017", "0018", "0019", "0020", "0021", "0022"])
             connection = connect(path)
             try:
                 observation = connection.execute(
@@ -982,7 +983,7 @@ class TimingDatabaseTests(unittest.TestCase):
             finally:
                 connection.close()
 
-            self.assertEqual(migrate(path), ["0016", "0017", "0018", "0019", "0020", "0021"])
+            self.assertEqual(migrate(path), ["0016", "0017", "0018", "0019", "0020", "0021", "0022"])
             connection = connect(path)
             try:
                 row = connection.execute(

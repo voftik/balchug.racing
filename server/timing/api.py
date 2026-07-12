@@ -31,10 +31,10 @@ from .lifecycle import (
     create_session,
     get_active_session,
     get_session,
-    list_active_sessions,
     start_session,
     stop_session,
 )
+from .operations import collect_operational_health, read_operational_incidents
 from .read_api import (
     DEFAULT_FACT_LIMIT,
     MAX_CHART_POINTS,
@@ -292,17 +292,44 @@ def _raise_lifecycle_error(error: LifecycleError) -> None:
     raise HTTPException(status.HTTP_400_BAD_REQUEST, str(error)) from error
 
 
+def _operational_payload(payload: dict[str, Any], *, status_code: int = 200) -> JSONResponse:
+    return JSONResponse(
+        payload,
+        status_code=status_code,
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.get("/health")
-def health() -> dict[str, object]:
-    connection = connect()
-    try:
-        return {
-            "ok": True,
-            "active_sessions": len(list_active_sessions(connection)),
-            "engineer_access_configured": bool(_engineer_token()),
-        }
-    finally:
-        connection.close()
+def health() -> JSONResponse:
+    """Return a bounded diagnostic snapshot; degraded health remains readable."""
+
+    payload = collect_operational_health()
+    payload["engineer_access_configured"] = bool(_engineer_token())
+    return _operational_payload(payload)
+
+
+@app.get("/ready")
+def ready() -> JSONResponse:
+    """Fail readiness only for critical conditions, never for warnings."""
+
+    payload = collect_operational_health()
+    return _operational_payload(
+        payload,
+        status_code=200 if payload["ready"] else status.HTTP_503_SERVICE_UNAVAILABLE,
+    )
+
+
+@app.get("/operations/incidents")
+def operational_incidents(
+    open_only: bool = False,
+    limit: int = Query(100, ge=1, le=500),
+) -> JSONResponse:
+    """Expose only allowlisted operational incident metadata."""
+
+    return _operational_payload(
+        read_operational_incidents(open_only=open_only, limit=limit)
+    )
 
 
 @app.get("/sources/{source_slug}/sessions/active")

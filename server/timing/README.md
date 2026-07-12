@@ -263,6 +263,39 @@ An operator stop or abort is authoritative: the worker observes the lifecycle
 change, closes its connection, persists the final run state, and returns to the
 idle supervisor loop.
 
+### Global health and incidents
+
+The API and ingest worker share one bounded operational model:
+
+```text
+GET /api/timing/health
+GET /api/timing/ready
+GET /api/timing/operations/incidents?open_only=true&limit=100
+```
+
+`health` always returns the diagnostic snapshot with HTTP 200. `ready` returns
+HTTP 503 only when at least one condition is critical; warnings remain ready.
+Both expose database/migration and disk state, worker heartbeat, active-source
+age, processing queue lag, failed frames, runtime checkpoint validity, result
+schema drift, recent reconnects and unknown provider handles. Freshness is
+`LIVE` through 3 seconds, `STALE` through 10 seconds and `OFFLINE` after 10
+seconds. An open source gap is immediately offline.
+
+Low storage warns at either 10 GiB or 10% free and becomes critical at either
+2 GiB or 5% free. The byte and ratio thresholds, plus the 8/16 GiB database
+size thresholds, may be overridden with `TIMING_DISK_WARNING_FREE_BYTES`,
+`TIMING_DISK_CRITICAL_FREE_BYTES`, `TIMING_DISK_WARNING_FREE_RATIO`,
+`TIMING_DISK_CRITICAL_FREE_RATIO`, `TIMING_DATABASE_WARNING_BYTES` and
+`TIMING_DATABASE_CRITICAL_BYTES`.
+
+The worker reconciles each alert into one open `timing_operational_incidents`
+row per code/scope, updates it idempotently, records severity changes, and
+resolves it only after a complete healthy observation. Open/resolve/escalation
+transitions are JSON journald records. Monitoring runs outside the ingest hot
+path and a failed monitoring iteration cannot stop recording. API responses,
+incident details and JSON logs use explicit allowlists and never include RAW
+frames, SignalR tokens, team or driver fields.
+
 ### Long-session metric preflight
 
 Before a long race, run the disposable no-LAPS soak on the target host. It
