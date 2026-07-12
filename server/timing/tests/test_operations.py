@@ -122,6 +122,9 @@ class OperationalHealthTests(unittest.TestCase):
                 (self.at_us - 30_000_000, self.at_us - 30_000_000, self.at_us),
             )
             connection.execute(
+                "UPDATE timing_worker_heartbeats SET stop_reason='Private Driver Name'"
+            )
+            connection.execute(
                 """
                 INSERT INTO source_heats(analysis_session_id,generation,external_name,created_at_us)
                 VALUES ('session-1',1,'Private Driver Name',?)
@@ -236,7 +239,7 @@ class OperationalHealthTests(unittest.TestCase):
                 """
                 INSERT INTO ingest_runs(
                   id,analysis_session_id,reducer_version,started_at_us,stopped_at_us,stop_reason
-                ) VALUES ('run-failed','session-1','test',?,?,'error:ProviderFailure')
+                ) VALUES ('run-failed','session-1','test',?,?,'error:Private Driver Name')
                 """,
                 (self.at_us - 5_000_000, self.at_us - 4_000_000),
             )

@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import sqlite3
 from collections.abc import Callable, Mapping, Sequence
@@ -47,6 +48,7 @@ ALLOWED_DETAIL_FIELDS = frozenset(
         "pending_frame_count",
         "queue_lag_ms",
         "reconnect_count",
+        "rejected_checkpoint_count",
         "runtime_checkpoint_count",
         "state",
         "stopped_at_us",
@@ -55,6 +57,7 @@ ALLOWED_DETAIL_FIELDS = frozenset(
         "window_s",
     }
 )
+SAFE_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_.:-]{0,79}\Z")
 
 
 def _environment_int(name: str, default: int) -> int:
@@ -128,17 +131,23 @@ def _canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _safe_identifier(value: object, *, fallback: str = "UNKNOWN") -> str:
+    return value if isinstance(value, str) and SAFE_IDENTIFIER_PATTERN.fullmatch(value) else fallback
+
+
 def _safe_details(value: object) -> dict[str, int | float | str | bool | None]:
     """Keep incident storage bounded to non-sensitive operational metadata."""
 
     if not isinstance(value, Mapping):
         return {}
-    return {
-        str(key): item
-        for key, item in sorted(value.items())
-        if key in ALLOWED_DETAIL_FIELDS
-        and (item is None or isinstance(item, (int, float, str, bool)))
-    }
+    result: dict[str, int | float | str | bool | None] = {}
+    for key, item in sorted(value.items()):
+        if key not in ALLOWED_DETAIL_FIELDS or not (
+            item is None or isinstance(item, (int, float, str, bool))
+        ):
+            continue
+        result[str(key)] = _safe_identifier(item) if key == "error_type" else item
+    return result
 
 
 def _json_count(value: object) -> int:
@@ -376,7 +385,11 @@ def _worker_health(
         "ready_at_us": row["ready_at_us"],
         "heartbeat_at_us": int(row["heartbeat_at_us"]),
         "stopped_at_us": row["stopped_at_us"],
-        "stop_reason": row["stop_reason"],
+        "stop_reason": (
+            _safe_identifier(row["stop_reason"])
+            if row["stop_reason"] is not None
+            else None
+        ),
     }
 
 
@@ -432,7 +445,7 @@ def _unknown_handles(
     )
     return [
         {
-            "handle": row["handle"],
+            "handle": _safe_identifier(row["handle"], fallback="REDACTED"),
             "observation_count": int(row["observation_count"]),
             "latest_at_us": int(row["latest_at_us"]),
         }
@@ -576,6 +589,9 @@ def _session_health(
 
     checkpoint = ingest["runtime_checkpoints"]
     checkpoint_status = checkpoint["latest_validation"]["status"]
+    rejected_checkpoint_count = int(
+        checkpoint["latest_validation"]["rejected_newer_or_incompatible_checkpoint_count"]
+    )
     if processing["processed_frame_count"] and checkpoint["latest"] is None:
         code = "CHECKPOINT_INVALID" if checkpoint["runtime_checkpoint_count"] else "CHECKPOINT_MISSING"
         severity = "CRITICAL" if checkpoint["runtime_checkpoint_count"] else "WARNING"
@@ -587,6 +603,17 @@ def _session_health(
             session_id,
             at_us,
             runtime_checkpoint_count=int(checkpoint["runtime_checkpoint_count"]),
+            validation_status=checkpoint_status,
+        )
+    elif rejected_checkpoint_count:
+        _alert(
+            alerts,
+            "CHECKPOINT_INVALID",
+            "WARNING",
+            "session",
+            session_id,
+            at_us,
+            rejected_checkpoint_count=rejected_checkpoint_count,
             validation_status=checkpoint_status,
         )
 
@@ -679,7 +706,18 @@ def _session_health(
         "schema": schema,
         "reconnects": {"window_s": thresholds.reconnect_window_s, "count": reconnect_count},
         "unknown_handles": unknown,
-        "last_restore": ingest["last_restore"],
+        "last_restore": (
+            {
+                "outcome": _safe_identifier(ingest["last_restore"].get("outcome")),
+                "reason": _safe_identifier(ingest["last_restore"].get("reason")),
+                "replayed_tail_frames": int(
+                    ingest["last_restore"].get("replayed_tail_frames", 0)
+                ),
+                "created_at_us": int(ingest["last_restore"].get("created_at_us", 0)),
+            }
+            if isinstance(ingest["last_restore"], Mapping)
+            else None
+        ),
     }
 
 
@@ -930,8 +968,8 @@ def read_operational_incidents(
             SELECT id,incident_code,scope_kind,scope_key,severity,status,details_json,
                    opened_at_us,last_seen_at_us,resolved_at_us,occurrence_count
             FROM timing_operational_incidents {where}
-            ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 ELSE 1 END,
-                     CASE status WHEN 'OPEN' THEN 0 ELSE 1 END,
+            ORDER BY CASE status WHEN 'OPEN' THEN 0 ELSE 1 END,
+                     CASE severity WHEN 'CRITICAL' THEN 0 ELSE 1 END,
                      opened_at_us DESC,id DESC
             LIMIT ?
             """,
